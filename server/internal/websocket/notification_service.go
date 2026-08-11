@@ -61,15 +61,15 @@ func (s *NotificationWebSocketService) PushNotification(ctx context.Context, not
 
 	// Send the notification via WebSocket
 	if err := s.hub.BroadcastToUser(ctx, scope, notification.RecipientID, "notification", map[string]interface{}{
-		"id":             notificationData.ID,
-		"type":           notificationData.Type,
-		"title":          notificationData.Title,
-		"content":        notificationData.Content,
-		"priority":       notificationData.Priority,
-		"created_at":     notificationData.CreatedAt,
-		"is_read":        notificationData.IsRead,
-		"action_url":     notificationData.ActionURL,
-		"sender":         notificationData.Sender,
+		"id":         notificationData.ID,
+		"type":       notificationData.Type,
+		"title":      notificationData.Title,
+		"content":    notificationData.Content,
+		"priority":   notificationData.Priority,
+		"created_at": notificationData.CreatedAt,
+		"is_read":    notificationData.IsRead,
+		"action_url": notificationData.ActionURL,
+		"sender":     notificationData.Sender,
 	}); err != nil {
 		return err
 	}

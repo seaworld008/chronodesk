@@ -326,10 +326,10 @@ def test_attachment_rejection_name_safety_and_download_authorization(
             f"tickets/{ticket_id}/attachments/{attachment_id}/content"
         )
     )
-    assert_error_contract(
+    observer_private_pending = assert_error_contract(
         observer_pending,
-        403,
-        machine_codes={"attachment_visibility_denied"},
+        404,
+        machine_codes={"not_found"},
     )
     for forbidden_scan_detail in (
         "attachment_not_clean",
@@ -383,10 +383,10 @@ def test_attachment_rejection_name_safety_and_download_authorization(
             f"tickets/{ticket_id}/attachments/{attachment_id}/content"
         )
     )
-    assert_error_contract(
+    observer_private_clean = assert_error_contract(
         observer_clean,
-        403,
-        machine_codes={"attachment_visibility_denied"},
+        404,
+        machine_codes={"not_found"},
     )
     cross_download = other_customer.api.get_json(
         e2e_manager.project_path(
@@ -398,15 +398,36 @@ def test_attachment_rejection_name_safety_and_download_authorization(
         403,
         machine_codes={"ticket_access_denied"},
     )
-    guessed = owner.api.get_json(
+    guessed = observer.api.get_json(
         e2e_manager.project_path(f"tickets/{ticket_id}/attachments/4294967295/content")
     )
-    assert_error_contract(
+    observer_absent = assert_error_contract(
         guessed,
         404,
         machine_codes={"not_found"},
     )
     assert "storage_path" not in guessed.text
+
+    wrong_ticket = e2e_manager.create_ticket(owner, "wrong-ticket-attachment")
+    observer_wrong_ticket = observer.api.get_json(
+        e2e_manager.project_path(
+            f"tickets/{wrong_ticket['id']}/attachments/{attachment_id}/content"
+        )
+    )
+    observer_wrong_ticket_body = assert_error_contract(
+        observer_wrong_ticket,
+        404,
+        machine_codes={"not_found"},
+    )
+    expected_observer_unavailable = {
+        "code": "not_found",
+        "message": "资源不存在",
+        "success": False,
+    }
+    assert observer_private_pending == expected_observer_unavailable
+    assert observer_private_clean == expected_observer_unavailable
+    assert observer_absent == expected_observer_unavailable
+    assert observer_wrong_ticket_body == expected_observer_unavailable
 
 
 def test_notifications_are_strictly_recipient_scoped(
