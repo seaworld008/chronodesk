@@ -1,4 +1,4 @@
-import type { UpdateTicketRequest } from '@/types'
+import type { TicketSource, UpdateTicketRequest } from '@/types'
 import type { ProjectRole } from '@/lib/projectScope'
 import {
     normalizeCustomFieldsForSubmit,
@@ -6,7 +6,8 @@ import {
 } from './tagUtils'
 import { normalizeTicketDateTimeForSubmit } from './ticketDateTime'
 
-type TicketEditFormValues = UpdateTicketRequest & {
+type TicketEditFormValues = Omit<UpdateTicketRequest, 'source'> & {
+    source?: TicketSource
     tags?: unknown
     custom_fields?: unknown
     [key: string]: unknown
@@ -42,6 +43,9 @@ export const transformTicketUpdate = (
                 field === 'internal_notes'
             )
         ) {
+            continue
+        }
+        if (field === 'source' && data[field] === 'agent') {
             continue
         }
         if (typeof data[field] !== 'undefined') {

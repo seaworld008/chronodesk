@@ -170,20 +170,23 @@ func TestRequesterCreateTicketPrivilegeIsEnforcedByDomain(t *testing.T) {
 	open := models.TicketStatusOpen
 	assignedToID := requester.ID
 	for _, test := range []struct {
-		name   string
-		mutate func(*models.TicketCreateRequest)
+		name    string
+		mutate  func(*models.TicketCreateRequest)
+		wantErr error
 	}{
 		{
 			name: "status",
 			mutate: func(request *models.TicketCreateRequest) {
 				request.Status = &open
 			},
+			wantErr: ErrHumanTicketStatusRequiresWorkflow,
 		},
 		{
 			name: "assignee",
 			mutate: func(request *models.TicketCreateRequest) {
 				request.AssignedToID = &assignedToID
 			},
+			wantErr: ErrTicketCreateAccessDenied,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -193,10 +196,11 @@ func TestRequesterCreateTicketPrivilegeIsEnforcedByDomain(t *testing.T) {
 				ctx,
 				request,
 				requester.ID,
-			); !errors.Is(err, ErrTicketCreateAccessDenied) {
+			); !errors.Is(err, test.wantErr) {
 				t.Fatalf(
-					"requester privileged CreateTicket() error = %v",
+					"requester privileged CreateTicket() error = %v, want %v",
 					err,
+					test.wantErr,
 				)
 			}
 		})

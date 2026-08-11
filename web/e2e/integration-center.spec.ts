@@ -544,9 +544,23 @@ test.describe('企业集成中心', () => {
       main.getByRole('heading', { name: '集成中心', exact: true }),
     ).toBeVisible()
     const navigation = page.getByRole('menu', { name: '主导航' })
+    const runtimeEntry = navigation.locator(
+      '[data-navigation-id="integration-runtime"]',
+    )
+    await expect(runtimeEntry).toHaveRole('menuitem')
+    await expect(runtimeEntry).toHaveAccessibleName('集成运行')
+    await expect(runtimeEntry).toHaveAttribute(
+      'href',
+      /#\/integration-runtime$/u,
+    )
     await expect(
-      navigation.getByRole('menuitem', { name: '集成中心', exact: true }),
+      runtimeEntry.locator(
+        '[data-navigation-icon="integrationRuntime"]',
+      ),
     ).toBeVisible()
+    await expect(
+      navigation.locator('[data-navigation-id="integration-center"]'),
+    ).toHaveCount(0)
     await expect(
       navigation.getByRole('menuitem', { name: 'Webhook', exact: true }),
     ).toHaveCount(0)

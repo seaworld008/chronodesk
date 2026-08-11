@@ -26,6 +26,12 @@ var (
 	ErrTicketCreateAccessDenied = errors.New(
 		"human ticket creation requires an authorized active project membership",
 	)
+	ErrHumanTicketStatusRequiresWorkflow = errors.New(
+		"human ticket status writes require a workflow transition command",
+	)
+	ErrTrustedTicketSourceNotHumanWritable = errors.New(
+		"trusted ticket source is not human-writable",
+	)
 )
 
 // TicketServiceInterface defines the interface for ticket service
@@ -405,6 +411,12 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 			"human ticket actor does not match operation context",
 		)
 	}
+	if req.Status != nil {
+		return nil, ErrHumanTicketStatusRequiresWorkflow
+	}
+	if req.Source == models.TicketSourceAgent {
+		return nil, ErrTrustedTicketSourceNotHumanWritable
+	}
 	request := *req
 	if request.Source == "" {
 		request.Source = models.TicketSourceWeb
@@ -487,9 +499,23 @@ func (s *TicketService) UpdateTicketExpectedVersion(
 	if req == nil || userID == 0 {
 		return nil, fmt.Errorf("human ticket update request and actor are required")
 	}
+	if _, err := commandOperationContext(
+		ctx,
+		models.HumanActor(userID),
+	); err != nil {
+		return nil, err
+	}
+	if req.Status != nil {
+		return nil, ErrHumanTicketStatusRequiresWorkflow
+	}
 	current, err := s.GetTicket(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if req.Source != nil &&
+		(current.Source == models.TicketSourceAgent ||
+			*req.Source == models.TicketSourceAgent) {
+		return nil, ErrTrustedTicketSourceNotHumanWritable
 	}
 	if current.Version != expectedVersion {
 		return nil, ErrVersionConflict

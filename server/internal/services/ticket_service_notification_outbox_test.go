@@ -104,31 +104,27 @@ func newDurableNotificationFixture(t *testing.T, assigned bool) durableNotificat
 }
 
 func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
-	t.Run("update status and assignee", func(t *testing.T) {
+	t.Run("generic update assignee", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, false)
-		status := models.TicketStatusInProgress
 		assigneeID := fixture.assignee.ID
 		if _, err := fixture.service.UpdateTicketExpectedVersion(
 			fixture.ctx,
 			fixture.ticket.ID,
-			&models.TicketUpdateRequest{
-				Status:       &status,
-				AssignedToID: &assigneeID,
-			},
+			&models.TicketUpdateRequest{AssignedToID: &assigneeID},
 			fixture.actor.ID,
 			fixture.ticket.Version,
 		); err != nil {
-			t.Fatalf("update ticket: %v", err)
+			t.Fatalf("update ticket assignee: %v", err)
 		}
 		assertCommittedNotificationTargets(
 			t,
 			fixture.db,
 			"io.chronodesk.ticket.updated.v1",
-			[]string{
-				fmt.Sprintf("%s:%d", models.NotificationTypeTicketAssigned, fixture.assignee.ID),
-				fmt.Sprintf("%s:%d", models.NotificationTypeTicketStatusChanged, fixture.assignee.ID),
-				fmt.Sprintf("%s:%d", models.NotificationTypeTicketStatusChanged, fixture.creator.ID),
-			},
+			[]string{fmt.Sprintf(
+				"%s:%d",
+				models.NotificationTypeTicketAssigned,
+				fixture.assignee.ID,
+			)},
 		)
 	})
 

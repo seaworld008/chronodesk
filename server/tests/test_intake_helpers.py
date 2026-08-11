@@ -6,6 +6,7 @@ import copy
 
 import pytest
 
+from tests.utils.human import E2EResourceManager
 from tests.utils.intake import PublishedTicketIntake
 
 pytestmark = pytest.mark.unit
@@ -74,6 +75,13 @@ def test_ticket_create_payload_preserves_explicit_negative_test_versions() -> No
     assert prepared["request_type_version_id"] == explicit_request_type
     assert prepared["workflow_version_id"] == explicit_workflow
     assert prepared["type"] == "unknown"
+
+
+def test_human_create_helper_rejects_status_override() -> None:
+    manager = object.__new__(E2EResourceManager)
+
+    with pytest.raises(AssertionError, match="已发布工作流"):
+        manager.create_ticket(None, "invalid-status", status="open")
 
 
 @pytest.mark.parametrize(

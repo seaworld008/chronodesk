@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: 387f66a99cc8e34a9ca8d612f194e9f0fa2422abe88fe1a2e70c6338b1257afe.
+ * Contract SHA-256: b8524e8f0b7dfd79a8546f1393254ba63e21b7af4d46167d3eb6124c0fd97aea.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -606,6 +606,8 @@ export type TicketType = (typeof ticketTypeValues)[number]
 export const ticketSourceValues = ["web","email","phone","chat","api","mobile","agent"] as const
 export type TicketSource = (typeof ticketSourceValues)[number]
 
+export type HumanTicketSource = "web" | "email" | "phone" | "chat" | "api" | "mobile"
+
 export type TicketTrustLevel = "untrusted" | "verified" | "trusted" | "system"
 
 export type ActorType = "human" | "service_principal" | "system"
@@ -641,8 +643,7 @@ export type CreateTicketRequest = {
     description: string
     type: TicketType
     priority: TicketPriority
-    status?: TicketStatus
-    source: TicketSource
+    source: HumanTicketSource
     request_type_version_id: string
     workflow_version_id?: string
     assigned_to_id?: number | null
@@ -662,8 +663,7 @@ export type UpdateTicketRequest = {
     description?: string | null
     type?: TicketType
     priority?: TicketPriority
-    status?: TicketStatus
-    source?: TicketSource
+    source?: HumanTicketSource
     assigned_to_id?: number | null
     category_id?: number | null
     subcategory_id?: number | null
@@ -1871,7 +1871,7 @@ export type Problem = {
     title: string
     status: number
     detail?: string
-    code: "invalid_request" | "invalid_status_transition" | "precondition_required" | "unauthorized" | "invalid_actor" | "invalid_scope" | "principal_not_found" | "principal_disabled" | "principal_expired" | "invalid_credential" | "credential_expired" | "insufficient_scope" | "policy_denied" | "agent_emergency_stop" | "read_only" | "automation_loop" | "not_found" | "version_conflict" | "webhook_emergency_revoked" | "lease_conflict" | "lease_expired" | "lease_not_owned" | "idempotency_conflict" | "idempotency_in_progress" | "command_scope_mismatch" | "outbox_replay_conflict" | "outbox_replay_expired" | "rate_limited" | "concurrency_limit" | "attachment_rejected" | "attachment_too_large" | "attachment_not_clean" | "invalid_attachment_name" | "service_unavailable" | "internal_error"
+    code: "invalid_request" | "invalid_status_transition" | "ticket_form_validation_failed" | "workflow_transition_required" | "trusted_source_not_human_writable" | "precondition_required" | "unauthorized" | "invalid_actor" | "invalid_scope" | "principal_not_found" | "principal_disabled" | "principal_expired" | "invalid_credential" | "credential_expired" | "insufficient_scope" | "policy_denied" | "agent_emergency_stop" | "read_only" | "automation_loop" | "not_found" | "version_conflict" | "webhook_emergency_revoked" | "lease_conflict" | "lease_expired" | "lease_not_owned" | "idempotency_conflict" | "idempotency_in_progress" | "command_scope_mismatch" | "outbox_replay_conflict" | "outbox_replay_expired" | "rate_limited" | "concurrency_limit" | "attachment_rejected" | "attachment_too_large" | "attachment_not_clean" | "invalid_attachment_name" | "service_unavailable" | "internal_error"
     request_id: string
     retryable: boolean
     details?: unknown

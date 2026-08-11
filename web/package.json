@@ -16,8 +16,9 @@
     "test:attachment-preview": "node --test ./src/admin/tickets/attachmentPreviewPolicy.test.mjs",
     "test:audit-explorer": "node --test ./src/admin/audit/*.test.mjs",
     "test:layout": "node --test ./src/layout/*.test.mjs",
+    "test:navigation": "node --test --test-concurrency=1 ./src/navigation/*.test.mjs",
     "audit:security": "node ./scripts/audit-security.mjs",
-    "check": "npm run check:human-api && npm run test:human-api && npm run test:ticket-pagination && npm run test:attachment-preview && npm run test:audit-explorer && npm run test:layout && npm run typecheck && npm run lint && npm run audit:security && npm run build",
+    "check": "npm run check:human-api && npm run test:human-api && npm run test:ticket-pagination && npm run test:attachment-preview && npm run test:audit-explorer && npm run test:layout && npm run test:navigation && npm run typecheck && npm run lint && npm run audit:security && npm run build",
     "test:e2e": "playwright test",
     "test:e2e:list": "playwright test --list",
     "preview": "vite preview"

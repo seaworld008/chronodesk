@@ -4,7 +4,7 @@ import { createServer } from 'vite'
 
 const vite = await createServer({
     appType: 'custom',
-    server: { middlewareMode: true },
+    server: { hmr: false, middlewareMode: true },
 })
 const registryModule = await vite.ssrLoadModule(
     '/src/navigation/navigationRegistry.ts',
@@ -22,6 +22,76 @@ const platformProjectAdmin = {
     projectRole: 'project_admin',
     hasProject: true,
 }
+
+const expectedSidebarIcons = {
+    workbench: 'workspaceHub',
+    'workbench-dashboard': 'operationsDashboard',
+    'cross-project-workbench': 'crossProjectBoard',
+    'project-operations': 'projectOperations',
+    'project-overview': 'projectOverview',
+    tickets: 'ticketManagement',
+    'knowledge-management': 'knowledgeBase',
+    notifications: 'projectNotifications',
+    'intelligent-operations': 'intelligentOperations',
+    'agent-collaboration': 'humanAgentCollaboration',
+    automation: 'automationRules',
+    agents: 'agentManagement',
+    'integration-center': 'integrationCenter',
+    webhook: 'webhookSettings',
+    'integration-runtime': 'integrationRuntime',
+    'project-configuration': 'projectSettings',
+    'project-basic-settings': 'projectInformation',
+    memberships: 'projectMembers',
+    'project-intake-settings': 'ticketIntake',
+    'project-sla-settings': 'slaPolicies',
+    'project-queue-settings': 'intakeQueues',
+    'project-ticket-templates': 'ticketTemplates',
+    'project-quick-replies': 'quickReplies',
+    'project-notification-channels': 'notificationDelivery',
+    'governance-center': 'governanceCenter',
+    'platform-home': 'platformDashboard',
+    'platform-projects': 'projectGovernance',
+    users: 'identityAccess',
+    'platform-audit': 'auditCenter',
+    'emergency-controls': 'emergencyControls',
+    'system-settings': 'systemSettings',
+    'platform-config': 'publicConfiguration',
+    'platform-email-settings': 'emailDelivery',
+}
+
+test('侧栏每个功能使用唯一且语义明确的图标', () => {
+    const sidebarNodes = registryModule.navigationRegistry
+        .filter((node) => node.placement === 'sidebar')
+        .flatMap((node) => node.kind === 'leaf'
+            ? [node]
+            : [node, ...node.children])
+    const actual = Object.fromEntries(
+        sidebarNodes.map((node) => [node.id, node.icon]),
+    )
+
+    assert.deepEqual(actual, expectedSidebarIcons)
+    assert.equal(
+        new Set(Object.values(actual)).size,
+        Object.keys(actual).length,
+        '侧栏不同功能不能复用同一个图标',
+    )
+})
+
+test('单子项分组直接呈现真实功能而不是父分组', () => {
+    const observerNodes = registryModule.visibleNavigationNodes('sidebar', {
+        platformRole: 'member',
+        projectRole: 'observer',
+        hasProject: true,
+    })
+    const integration = observerNodes.find(
+        (node) => node.id === 'integration-center',
+    )
+    assert.equal(integration.children.length, 1)
+    assert.deepEqual(
+        registryModule.directNavigationEntry(integration),
+        integration.children[0],
+    )
+})
 
 test('连续功能树按产品顺序输出且不保留视觉分区节点', () => {
     const nodes = registryModule.visibleNavigationNodes(
@@ -162,7 +232,7 @@ test('registry validator 拒绝重复 ID/path、非法 scope、非法 children �
         kind: 'leaf',
         id: 'same',
         label: '叶子',
-        icon: 'home',
+        icon: 'projectOverview',
         order: 1,
         scope: 'global',
         capability: null,
@@ -181,7 +251,7 @@ test('registry validator 拒绝重复 ID/path、非法 scope、非法 children �
             kind: 'group',
             id: 'empty',
             label: '空组',
-            icon: 'home',
+            icon: 'workspaceHub',
             order: 2,
             scope: 'global',
             capability: null,
@@ -196,12 +266,13 @@ test('registry validator 拒绝重复 ID/path、非法 scope、非法 children �
     assert.ok(errors.some((error) => error.includes('scope 非法')))
     assert.ok(errors.some((error) => error.includes('不能包含 children')))
     assert.ok(errors.some((error) => error.includes('至少包含一个 leaf')))
+    assert.ok(errors.some((error) => error.includes('icon 重复')))
 
     const cyclic = {
         kind: 'group',
         id: 'cycle',
         label: '循环',
-        icon: 'home',
+        icon: 'workspaceHub',
         order: 1,
         scope: 'global',
         capability: null,
@@ -236,7 +307,7 @@ test('validator 检查 capability/role/icon/order/active path 与 parent taxonom
         kind: 'group',
         id: 'parent',
         label: '父级',
-        icon: 'home',
+        icon: 'workspaceHub',
         order: 1,
         scope: 'global',
         capability: null,
@@ -263,7 +334,7 @@ test('validator 检查 capability/role/icon/order/active path 与 parent taxonom
         {
             ...badLeaf,
             id: 'bad-subroutes',
-            icon: 'home',
+            icon: 'projectOverview',
             order: 1,
             scope: 'global',
             placement: 'sidebar',
@@ -556,7 +627,7 @@ test('未来新增 leaf 只登记 registry 数据即可进入通用过滤结果'
         kind: 'leaf',
         id: 'future-governance',
         label: '未来治理功能',
-        icon: 'settings',
+        icon: 'accountSecurity',
         order: 99,
         scope: 'platform',
         capability: { kind: 'platform', value: 'manage_platform_settings' },

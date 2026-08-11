@@ -562,6 +562,10 @@ class E2EResourceManager:
         label: str,
         **overrides: Any,
     ) -> dict[str, Any]:
+        assert "status" not in overrides, (
+            "Human REST create_ticket helper 不得绕过已发布工作流指定初始状态；"
+            "状态负例必须使用显式原始请求"
+        )
         payload: dict[str, Any] = {
             "title": self.unique(f"{label}-ticket"),
             "description": f"{self.prefix}Human REST black-box ticket",

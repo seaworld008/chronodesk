@@ -25,6 +25,12 @@ type TicketHandler struct {
 	response      *middleware.ResponseHelper
 }
 
+const humanTicketRequestBodyLimit int64 = 1 << 20
+
+var errHumanTicketRequestBodyTooLarge = errors.New(
+	"human ticket request body exceeds limit",
+)
+
 // NewTicketHandler 创建工单处理器
 func NewTicketHandler(ticketService services.TicketServiceInterface) *TicketHandler {
 	return &TicketHandler{
@@ -499,7 +505,16 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 
 	// 解析请求体
 	var req models.TicketCreateRequest
-	if err := decodeStrictJSON(c, &req); err != nil {
+	requestFields, err := decodeHumanTicketJSONObject(c, &req)
+	if err != nil {
+		if errors.Is(err, errHumanTicketRequestBodyTooLarge) {
+			h.response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"工单请求超过大小限制",
+			)
+			return
+		}
 		h.response.BadRequest(c, "请求格式错误")
 		return
 	}
@@ -527,6 +542,13 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 		)
 		return
 	}
+	_, statusPresent := requestFields["status"]
+	if rejectGenericHumanTicketStatus(c, statusPresent) {
+		return
+	}
+	if rejectHumanAgentSource(c, "", &req.Source) {
+		return
+	}
 	if isRequesterRole(normalizedProjectRole(c)) && (req.Status != nil || req.AssignedToID != nil) {
 		h.response.Forbidden(c, "客户创建工单时不能指定状态或处理人")
 		return
@@ -543,6 +565,18 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 	ticket, err := h.ticketService.CreateTicket(ctx, &req, userID.(uint))
 	if err != nil {
 		switch {
+		case errors.Is(
+			err,
+			services.ErrHumanTicketStatusRequiresWorkflow,
+		):
+			writeHumanTicketWorkflowRequired(c)
+			return
+		case errors.Is(
+			err,
+			services.ErrTrustedTicketSourceNotHumanWritable,
+		):
+			writeHumanTrustedSourceNotWritable(c)
+			return
 		case errors.Is(err, services.ErrInvalidTicketTags):
 			writeHumanTicketProblem(
 				c,
@@ -638,7 +672,21 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 
 	// 解析请求体
 	var req models.TicketUpdateRequest
-	if err := decodeStrictJSON(c, &req); err != nil {
+	requestFields, err := decodeHumanTicketJSONObject(c, &req)
+	if err != nil {
+		if errors.Is(err, errHumanTicketRequestBodyTooLarge) {
+			h.response.Error(
+				c,
+				http.StatusRequestEntityTooLarge,
+				"工单请求超过大小限制",
+			)
+			return
+		}
+		h.response.BadRequest(c, "请求格式错误")
+		return
+	}
+	if source, present := requestFields["source"]; present &&
+		bytes.Equal(bytes.TrimSpace(source), []byte("null")) {
 		h.response.BadRequest(c, "请求格式错误")
 		return
 	}
@@ -650,7 +698,7 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 		}
 	}
 
-	_, err = authorizeTicket(ctx, c, h.ticketService, uint(id), ticketAccessUpdate)
+	current, err := authorizeTicket(ctx, c, h.ticketService, uint(id), ticketAccessUpdate)
 	if err != nil {
 		if writeTicketAuthorizationError(c, err) {
 			return
@@ -661,6 +709,13 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 		}
 		logHandlerFailure(c, "ticket.authorize_update", err)
 		h.response.InternalServerError(c, "工单权限检查失败")
+		return
+	}
+	_, statusPresent := requestFields["status"]
+	if rejectGenericHumanTicketStatus(c, statusPresent) {
+		return
+	}
+	if rejectHumanAgentSource(c, current.Source, req.Source) {
 		return
 	}
 	if isRequesterRole(normalizedProjectRole(c)) &&
@@ -691,6 +746,20 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, services.ErrVersionConflict) {
 			writeTicketVersionConflict(c)
+			return
+		}
+		if errors.Is(
+			err,
+			services.ErrHumanTicketStatusRequiresWorkflow,
+		) {
+			writeHumanTicketWorkflowRequired(c)
+			return
+		}
+		if errors.Is(
+			err,
+			services.ErrTrustedTicketSourceNotHumanWritable,
+		) {
+			writeHumanTrustedSourceNotWritable(c)
 			return
 		}
 		if errors.Is(err, services.ErrInvalidTicketTags) {
@@ -742,6 +811,76 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 
 	setTicketETag(c, ticket.Version)
 	h.response.Success(c, ticketResponseForRole(ticket, normalizedProjectRole(c)), "工单更新成功")
+}
+
+func decodeHumanTicketJSONObject(
+	c *gin.Context,
+	target any,
+) (map[string]json.RawMessage, error) {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return nil, errors.New("request body is required")
+	}
+	if c.Request.ContentLength > humanTicketRequestBodyLimit {
+		return nil, errHumanTicketRequestBodyTooLarge
+	}
+	c.Request.Body = http.MaxBytesReader(
+		c.Writer,
+		c.Request.Body,
+		humanTicketRequestBodyLimit,
+	)
+	fields, err := decodeStrictJSONObject(c, target)
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		return nil, errHumanTicketRequestBodyTooLarge
+	}
+	return fields, err
+}
+
+func rejectGenericHumanTicketStatus(
+	c *gin.Context,
+	present bool,
+) bool {
+	if !present {
+		return false
+	}
+	writeHumanTicketWorkflowRequired(c)
+	return true
+}
+
+func writeHumanTicketWorkflowRequired(c *gin.Context) {
+	writeHumanTicketProblem(
+		c,
+		http.StatusUnprocessableEntity,
+		"workflow_transition_required",
+		"必须使用工单工作流变更状态",
+		"请通过工单状态流转接口执行已发布工作流允许的状态变更",
+		false,
+	)
+}
+
+func rejectHumanAgentSource(
+	c *gin.Context,
+	current models.TicketSource,
+	requested *models.TicketSource,
+) bool {
+	if requested == nil ||
+		(current != models.TicketSourceAgent &&
+			*requested != models.TicketSourceAgent) {
+		return false
+	}
+	writeHumanTrustedSourceNotWritable(c)
+	return true
+}
+
+func writeHumanTrustedSourceNotWritable(c *gin.Context) {
+	writeHumanTicketProblem(
+		c,
+		http.StatusUnprocessableEntity,
+		"trusted_source_not_human_writable",
+		"可信工单来源不可由人工修改",
+		"智能体来源由受信机器入口分配，人工接口不能声明或改写该来源",
+		false,
+	)
 }
 
 // DeleteTicket 删除工单

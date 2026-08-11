@@ -14,24 +14,47 @@ import {
 
 export type NavigationScope = 'global' | 'project' | 'platform'
 export type NavigationPlacement = 'sidebar' | 'account'
-export type NavigationIcon =
-    | 'home'
-    | 'workbench'
-    | 'tickets'
-    | 'notifications'
-    | 'automation'
-    | 'agents'
-    | 'collaboration'
-    | 'knowledge'
-    | 'webhook'
-    | 'integrationRuntime'
-    | 'memberships'
-    | 'users'
-    | 'projects'
-    | 'settings'
-    | 'audit'
-    | 'security'
-    | 'loginHistory'
+export const navigationIconValues = [
+    'workspaceHub',
+    'operationsDashboard',
+    'crossProjectBoard',
+    'projectOperations',
+    'projectOverview',
+    'ticketManagement',
+    'knowledgeBase',
+    'projectNotifications',
+    'intelligentOperations',
+    'humanAgentCollaboration',
+    'automationRules',
+    'agentManagement',
+    'integrationCenter',
+    'webhookSettings',
+    'integrationRuntime',
+    'projectSettings',
+    'projectInformation',
+    'projectMembers',
+    'ticketIntake',
+    'slaPolicies',
+    'intakeQueues',
+    'ticketTemplates',
+    'quickReplies',
+    'notificationDelivery',
+    'governanceCenter',
+    'platformDashboard',
+    'projectGovernance',
+    'identityAccess',
+    'auditCenter',
+    'emergencyControls',
+    'systemSettings',
+    'publicConfiguration',
+    'emailDelivery',
+    'accountHub',
+    'accountProfile',
+    'accountSecurity',
+    'trustedDevices',
+    'loginHistory',
+] as const
+export type NavigationIcon = (typeof navigationIconValues)[number]
 
 export type NavigationCapability =
     | { kind: 'platform'; value: PlatformCapability }
@@ -153,7 +176,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
         scope: 'global',
         capability: null,
         roles: null,
-        icon: 'workbench',
+        icon: 'workspaceHub',
         placement: 'sidebar',
         children: [
             leaf('sidebar', {
@@ -165,7 +188,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'global',
                 capability: null,
                 roles: null,
-                icon: 'workbench',
+                icon: 'operationsDashboard',
                 route: {
                     kind: 'custom',
                     component: 'workbenchDashboard',
@@ -181,7 +204,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'global',
                 capability: null,
                 roles: null,
-                icon: 'workbench',
+                icon: 'crossProjectBoard',
                 route: { kind: 'custom', component: 'workbench' },
             }),
         ],
@@ -190,7 +213,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
         kind: 'group',
         id: 'project-operations',
         label: '项目运营',
-        icon: 'tickets',
+        icon: 'projectOperations',
         order: 20,
         scope: 'project',
         capability: null,
@@ -207,7 +230,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'project',
                 capability: null,
                 roles: null,
-                icon: 'home',
+                icon: 'projectOverview',
             }),
             leaf('sidebar', {
                 id: 'tickets',
@@ -218,7 +241,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'project',
                 capability: null,
                 roles: null,
-                icon: 'tickets',
+                icon: 'ticketManagement',
             }),
             leaf('sidebar', {
                 id: 'knowledge-management',
@@ -232,7 +255,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'project',
                 capability: { kind: 'project', value: 'view_project' },
                 roles: null,
-                icon: 'knowledge',
+                icon: 'knowledgeBase',
                 route: {
                     kind: 'custom',
                     component: 'knowledgeManagement',
@@ -248,7 +271,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'project',
                 capability: null,
                 roles: null,
-                icon: 'notifications',
+                icon: 'projectNotifications',
             }),
         ],
     },
@@ -256,7 +279,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
         kind: 'group',
         id: 'intelligent-operations',
         label: '智能运营',
-        icon: 'agents',
+        icon: 'intelligentOperations',
         order: 30,
         scope: 'project',
         capability: null,
@@ -273,7 +296,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'project',
                 capability: { kind: 'project', value: 'view_project' },
                 roles: null,
-                icon: 'collaboration',
+                icon: 'humanAgentCollaboration',
                 route: {
                     kind: 'custom',
                     component: 'agentCollaboration',
@@ -292,7 +315,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'project',
                 capability: { kind: 'project', value: 'manage_automation' },
                 roles: null,
-                icon: 'automation',
+                icon: 'automationRules',
                 route: {
                     kind: 'custom',
                     component: 'automationIndex',
@@ -307,7 +330,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'project',
                 capability: { kind: 'project', value: 'manage_agents' },
                 roles: { kind: 'project', values: ['project_admin'] },
-                icon: 'agents',
+                icon: 'agentManagement',
                 route: { kind: 'custom', component: 'agentControl' },
             }),
         ],
@@ -316,7 +339,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
         kind: 'group',
         id: 'integration-center',
         label: '集成中心',
-        icon: 'webhook',
+        icon: 'integrationCenter',
         order: 40,
         scope: 'project',
         capability: null,
@@ -336,7 +359,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'webhook',
+                icon: 'webhookSettings',
                 route: { kind: 'custom', component: 'webhookSettings' },
             }),
             leaf('sidebar', {
@@ -360,7 +383,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
         kind: 'group',
         id: 'project-configuration',
         label: '项目设置',
-        icon: 'memberships',
+        icon: 'projectSettings',
         order: 50,
         scope: 'project',
         capability: null,
@@ -380,7 +403,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'settings',
+                icon: 'projectInformation',
                 route: {
                     kind: 'custom',
                     component: 'projectBasicSettings',
@@ -398,7 +421,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'memberships',
+                icon: 'projectMembers',
                 route: { kind: 'custom', component: 'projectMemberships' },
             }),
             leaf('sidebar', {
@@ -413,7 +436,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'settings',
+                icon: 'ticketIntake',
                 route: {
                     kind: 'custom',
                     component: 'projectIntakeSettings',
@@ -434,7 +457,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'automation',
+                icon: 'slaPolicies',
                 route: {
                     kind: 'custom',
                     component: 'automationSLA',
@@ -453,7 +476,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'integrationRuntime',
+                icon: 'intakeQueues',
                 route: {
                     kind: 'custom',
                     component: 'projectQueueSettings',
@@ -474,7 +497,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'settings',
+                icon: 'ticketTemplates',
                 route: {
                     kind: 'custom',
                     component: 'automationTemplates',
@@ -496,7 +519,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'settings',
+                icon: 'quickReplies',
                 route: {
                     kind: 'custom',
                     component: 'automationQuickReplies',
@@ -515,7 +538,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     kind: 'project',
                     values: ['project_admin', 'manager'],
                 },
-                icon: 'notifications',
+                icon: 'notificationDelivery',
                 route: {
                     kind: 'custom',
                     component: 'projectNotificationChannels',
@@ -527,7 +550,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
         kind: 'group',
         id: 'governance-center',
         label: '治理中心',
-        icon: 'settings',
+        icon: 'governanceCenter',
         order: 60,
         scope: 'platform',
         capability: null,
@@ -551,7 +574,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                         'emergency_operator',
                     ],
                 },
-                icon: 'workbench',
+                icon: 'platformDashboard',
                 route: { kind: 'custom', component: 'platformHome' },
             }),
             leaf('sidebar', {
@@ -563,7 +586,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'platform',
                 capability: null,
                 roles: { kind: 'platform', values: ['platform_admin'] },
-                icon: 'projects',
+                icon: 'projectGovernance',
                 route: { kind: 'custom', component: 'platformProjects' },
             }),
             leaf('sidebar', {
@@ -575,7 +598,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'platform',
                 capability: { kind: 'platform', value: 'manage_platform_users' },
                 roles: null,
-                icon: 'users',
+                icon: 'identityAccess',
             }),
             leaf('sidebar', {
                 id: 'platform-audit',
@@ -586,7 +609,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'platform',
                 capability: { kind: 'platform', value: 'view_platform_audit' },
                 roles: null,
-                icon: 'audit',
+                icon: 'auditCenter',
                 route: { kind: 'custom', component: 'platformAudit' },
             }),
             leaf('sidebar', {
@@ -601,7 +624,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                     value: 'operate_emergency_controls',
                 },
                 roles: null,
-                icon: 'security',
+                icon: 'emergencyControls',
                 route: {
                     kind: 'custom',
                     component: 'emergencyControls',
@@ -613,7 +636,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
         kind: 'group',
         id: 'system-settings',
         label: '系统设置',
-        icon: 'settings',
+        icon: 'systemSettings',
         order: 70,
         scope: 'platform',
         capability: null,
@@ -631,7 +654,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'platform',
                 capability: { kind: 'platform', value: 'manage_platform_settings' },
                 roles: null,
-                icon: 'settings',
+                icon: 'publicConfiguration',
                 route: {
                     kind: 'custom',
                     component: 'platformConfig',
@@ -647,7 +670,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'platform',
                 capability: { kind: 'platform', value: 'manage_email_settings' },
                 roles: null,
-                icon: 'notifications',
+                icon: 'emailDelivery',
                 route: {
                     kind: 'custom',
                     component: 'platformEmail',
@@ -660,7 +683,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
         kind: 'group',
         id: 'account',
         label: '账号',
-        icon: 'security',
+        icon: 'accountHub',
         order: 10,
         scope: 'global',
         capability: null,
@@ -677,7 +700,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'global',
                 capability: null,
                 roles: null,
-                icon: 'users',
+                icon: 'accountProfile',
                 route: { kind: 'custom', component: 'accountProfile' },
             }),
             leaf('account', {
@@ -689,7 +712,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'global',
                 capability: null,
                 roles: null,
-                icon: 'security',
+                icon: 'accountSecurity',
                 route: { kind: 'custom', component: 'accountSecurity' },
             }),
             leaf('account', {
@@ -701,7 +724,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 scope: 'global',
                 capability: null,
                 roles: null,
-                icon: 'security',
+                icon: 'trustedDevices',
                 route: { kind: 'custom', component: 'trustedDevices' },
             }),
             leaf('account', {
@@ -812,12 +835,7 @@ export const resourceViewNavigationNode = (
 
 const allowedScopes = new Set(['global', 'project', 'platform'])
 const allowedPlacements = new Set(['sidebar', 'account'])
-const allowedIcons = new Set<NavigationIcon>([
-    'home', 'workbench', 'tickets', 'notifications', 'automation', 'agents',
-    'collaboration', 'knowledge', 'webhook', 'integrationRuntime',
-    'memberships', 'users', 'projects',
-    'settings', 'audit', 'security', 'loginHistory',
-])
+const allowedIcons = new Set<NavigationIcon>(navigationIconValues)
 const allowedPlatformCapabilities = new Set<PlatformCapability>([
     'manage_platform_users',
     'manage_platform_settings',
@@ -885,6 +903,7 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
     const errors: string[] = []
     const ids = new Set<string>()
     const paths = new Set<string>()
+    const iconOwnersByPlacement = new Map<string, Map<string, string>>()
     const visiting = new WeakSet<object>()
 
     const visit = (
@@ -907,11 +926,24 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
         else ids.add(id)
         const scope = String(node.scope)
         if (!allowedScopes.has(scope)) errors.push(`导航节点 ${id} 的 scope 非法`)
-        if (!allowedPlacements.has(String(node.placement))) {
+        const placement = String(node.placement)
+        if (!allowedPlacements.has(placement)) {
             errors.push(`导航节点 ${id} 的 placement 非法`)
         }
         if (!allowedIcons.has(node.icon as NavigationIcon)) {
             errors.push(`导航节点 ${id} 的 icon 非法`)
+        } else if (allowedPlacements.has(placement)) {
+            const icon = String(node.icon)
+            const owners = iconOwnersByPlacement.get(placement) ?? new Map()
+            const existingOwner = owners.get(icon)
+            if (existingOwner) {
+                errors.push(
+                    `导航 ${placement} icon 重复：${existingOwner} 与 ${id} 共用 ${icon}`,
+                )
+            } else {
+                owners.set(icon, id)
+                iconOwnersByPlacement.set(placement, owners)
+            }
         }
         if (
             typeof node.order !== 'number' ||
@@ -1147,6 +1179,15 @@ export const visibleNavigationNodes = (
     context: NavigationAccessContext,
 ): NavigationNode[] =>
     filterNavigationRegistry(navigationRegistry, placement, context)
+
+export const directNavigationEntry = (
+    node: NavigationNode,
+): NavigationLeafNode | null =>
+    node.kind === 'leaf'
+        ? node
+        : node.children.length === 1
+            ? node.children[0]
+            : null
 
 export const visibleNavigationItems = (
     placement: NavigationPlacement,
