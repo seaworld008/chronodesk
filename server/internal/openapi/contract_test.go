@@ -12,6 +12,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/seaworld008/chronodesk/server/internal/agentcontract"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 func TestSpecificationIsStableAgentContract(t *testing.T) {
@@ -1882,6 +1883,52 @@ func assertNoStoreCredentialResponse(
 		if got := schema["const"]; got != value {
 			t.Errorf("%s %s response header %s const = %v, want %s", strings.ToUpper(method), path, name, got, value)
 		}
+	}
+}
+
+func TestProblemCodeEnumContainsRuntimeCatalogAndTransitionExample(t *testing.T) {
+	var document map[string]any
+	if err := yaml.Unmarshal(Specification(), &document); err != nil {
+		t.Fatal(err)
+	}
+	components := contractMap(t, document["components"], "components")
+	schemas := contractMap(t, components["schemas"], "components.schemas")
+	problem := contractMap(t, schemas["Problem"], "Problem")
+	properties := contractMap(t, problem["properties"], "Problem.properties")
+	code := contractMap(t, properties["code"], "Problem.code")
+	for _, runtimeCode := range services.AgentNativeErrorCodes() {
+		if !contractSliceContains(code["enum"], runtimeCode) {
+			t.Errorf("Problem.code enum omits runtime error %q", runtimeCode)
+		}
+	}
+
+	paths := contractMap(t, document["paths"], "paths")
+	operation := contractOperation(
+		t,
+		paths,
+		"/tickets/{ticketId}/commands/transition",
+		"post",
+	)
+	responses := contractMap(t, operation["responses"], "transition.responses")
+	badRequest := contractMap(t, responses["400"], "transition.responses.400")
+	content := contractMap(t, badRequest["content"], "transition.responses.400.content")
+	media := contractMap(
+		t,
+		content["application/problem+json"],
+		"transition.responses.400.application/problem+json",
+	)
+	schema := contractMap(t, media["schema"], "transition.responses.400.schema")
+	if schema["$ref"] != "#/components/schemas/Problem" {
+		t.Errorf("transition 400 schema = %v", schema["$ref"])
+	}
+	example := contractMap(t, media["example"], "transition.responses.400.example")
+	if got := example["code"]; got != services.AgentNativeErrorCode(
+		services.ErrInvalidTicketTransition,
+	) {
+		t.Errorf("transition 400 example code = %v", got)
+	}
+	if example["status"] != 400 || example["retryable"] != false {
+		t.Errorf("transition 400 example = %+v", example)
 	}
 }
 

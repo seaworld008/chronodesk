@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -523,15 +524,119 @@ func TestProjectConfigurationRejectsInvalidWorkflowMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := projectConfigurationTestContext(t, project)
-	states := configurationServiceWorkflowStates()
-	states[1].LifecycleCategory = "processing"
-	if _, err := service.CreateWorkflowDraft(ctx, WorkflowDraftInput{
-		Key:         "invalid",
-		Name:        "Invalid",
-		States:      states,
-		Transitions: configurationServiceWorkflowTransitions(),
-	}); err == nil {
-		t.Fatal("workflow with unsupported lifecycle category was created")
+	tests := []struct {
+		name        string
+		mutate      func([]models.WorkflowStateDefinition, []models.WorkflowTransitionDefinition)
+		wantMessage string
+	}{
+		{
+			name: "unsupported lifecycle category",
+			mutate: func(states []models.WorkflowStateDefinition, _ []models.WorkflowTransitionDefinition) {
+				states[1].LifecycleCategory = "processing"
+			},
+			wantMessage: `invalid lifecycle category "processing"`,
+		},
+		{
+			name: "same lifecycle category edge",
+			mutate: func(_ []models.WorkflowStateDefinition, transitions []models.WorkflowTransitionDefinition) {
+				transitions[0].To = "triage"
+			},
+			wantMessage: `connects lifecycle category "new" to itself`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			states := configurationServiceWorkflowStates()
+			transitions := configurationServiceWorkflowTransitions()
+			test.mutate(states, transitions)
+			_, createErr := service.CreateWorkflowDraft(ctx, WorkflowDraftInput{
+				Key:         "invalid-" + strings.ReplaceAll(test.name, " ", "-"),
+				Name:        "Invalid",
+				States:      states,
+				Transitions: transitions,
+			})
+			if createErr == nil || !strings.Contains(createErr.Error(), test.wantMessage) {
+				t.Fatalf(
+					"CreateWorkflowDraft() error = %v, want %q",
+					createErr,
+					test.wantMessage,
+				)
+			}
+		})
+	}
+}
+
+func TestConfigurationPublishRejectsWorkflowMutatedToSameCategoryEdge(
+	t *testing.T,
+) {
+	db, project, _ := newProjectConfigurationTestDB(t)
+	events := &configurationEventAppenderStub{}
+	service, err := NewProjectConfigurationService(db, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := projectConfigurationTestContext(t, project)
+	requestType, workflow := createConfigurationDraftVersions(t, service, ctx)
+	release, err := service.CreateConfigurationReleaseDraft(
+		ctx,
+		ConfigurationReleaseDraftInput{
+			Snapshot: models.ConfigurationSnapshot{
+				RequestTypeVersionIDs: []string{requestType.ID},
+				WorkflowVersionIDs:    []string{workflow.ID},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SimulateConfigurationRelease(ctx, release.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	transitions := configurationServiceWorkflowTransitions()
+	transitions[0].To = "triage"
+	encodedTransitions, err := json.Marshal(transitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := db.Exec(
+		"UPDATE workflow_versions SET transitions = ? WHERE id = ?",
+		string(encodedTransitions),
+		workflow.ID,
+	)
+	if result.Error != nil || result.RowsAffected != 1 {
+		t.Fatalf(
+			"mutate simulated workflow rows=%d error=%v",
+			result.RowsAffected,
+			result.Error,
+		)
+	}
+
+	if _, err := service.ApproveConfigurationRelease(
+		ctx,
+		release.ID,
+	); err == nil || !strings.Contains(
+		err.Error(),
+		`connects lifecycle category "new" to itself`,
+	) {
+		t.Fatalf("ApproveConfigurationRelease() error = %v", err)
+	}
+	assertConfigurationVersionStatus(
+		t,
+		db,
+		&models.WorkflowVersion{},
+		workflow.ID,
+		models.ConfigurationStatusSimulated,
+	)
+	assertConfigurationVersionStatus(
+		t,
+		db,
+		&models.ConfigurationRelease{},
+		release.ID,
+		models.ConfigurationStatusSimulated,
+	)
+	if events.calls != 0 {
+		t.Fatalf("configuration publish events = %d, want 0", events.calls)
 	}
 }
 

@@ -3823,7 +3823,31 @@
             "$ref": "#/components/responses/NotFound"
           },
           "409": {
-            "$ref": "#/components/responses/Conflict"
+            "description": "The Ticket version is stale or the requested canonical status is not valid in the bound workflow.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "example": {
+                  "type": "https://chronodesk.local/problems/invalid_status_transition",
+                  "title": "工单状态流转冲突",
+                  "status": 409,
+                  "detail": "当前工单状态不允许执行该流转",
+                  "code": "invalid_status_transition",
+                  "request_id": "req_01J00000000000000000000000",
+                  "retryable": false,
+                  "details": {
+                    "current_status": "open",
+                    "requested_status": "open",
+                    "allowed_next_statuses": [
+                      "in_progress",
+                      "cancelled"
+                    ]
+                  }
+                }
+              }
+            }
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
@@ -22001,6 +22025,7 @@
             "type": "string",
             "enum": [
               "invalid_request",
+              "invalid_status_transition",
               "precondition_required",
               "unauthorized",
               "invalid_actor",
@@ -22040,6 +22065,11 @@
           },
           "retryable": {
             "type": "boolean"
+          },
+          "details": {
+            "type": "object",
+            "description": "Bounded operation-specific conflict context.",
+            "additionalProperties": true
           }
         }
       },

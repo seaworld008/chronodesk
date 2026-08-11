@@ -1320,6 +1320,13 @@ func (service *ProjectConfigurationService) validateSnapshotReferencesTx(
 		if !version.Status.IsValid() {
 			return ErrConfigurationStateConflict
 		}
+		if err := version.Validate(); err != nil {
+			return fmt.Errorf(
+				"invalid workflow version %q: %w",
+				version.ID,
+				err,
+			)
+		}
 	}
 
 	for _, route := range snapshot.Routes {

@@ -40,6 +40,13 @@ OpenAPI `3.2.0` 和 CloudEvents `1.0`。不保留旧版兼容分支。
 - 一次性角色拆分在已完成项目范围切换后执行，checkpoint 为 `20260730_platform_roles_v1_cutover`。旧角色首先被映射为显式项目 Membership 和平台身份，随后移除旧列；来源不明、checkpoint 不匹配或旧列残留均 fail closed。
 - 历史 `admin` 映射为 `platform_admin`；可回填的项目职责为 `admin → project_admin`、`supervisor → manager`、`agent → agent`、`customer → requester`。既有 Membership 不会被覆盖，停用或删除用户不会被重新授予访问权。
 
+### 写入原子性与工作流兼容
+
+- 注册在单一后端事务内创建 User、Profile、refresh digest、LoginHistory、successful LoginAttempt、DomainEvent 与 welcome Outbox；任一写入失败都会回滚整个注册，不留下可登录的部分身份。
+- Workflow 定义允许多个不同 state key 映射到同一 lifecycle category，继续守住 state/transition key、端点、role、initial/terminal 和规模上限；由于当前 Ticket 与协议只持久化 canonical `TicketStatus`，定义和发布会拒绝 source/target 属于同一 category 的不可执行边。
+- 运行时将重复 category 状态之间合法的跨 category 边聚合为 canonical `(from, to)` edge union，并按 edge 合并允许角色；`AllowedTicketTransitions` 只返回去重后的 canonical status，不声称恢复或持久化 exact workflow state key。
+- Human REST、Agent REST、MCP 与 A2A 的同状态 transition 均进入同一领域规则并明确返回 invalid transition；失败不会修改 Ticket version/status/updated_at，也不会生成成功历史、领域事件、Outbox 或 receipt。
+
 ## 当前完成度与未闭环范围
 
 | 领域 | 已有基础 | 仍需在发布前或后续变更中验证/完成 |
@@ -82,18 +89,9 @@ OpenAPI `3.2.0` 和 CloudEvents `1.0`。不保留旧版兼容分支。
   显示封闭中文终态并隐藏 replay。ADR-0009 与运维 runbook 已记录普通删除、
   key rotation、发布/回滚及 backup/WAL/PITR 边界。
 
-### 明确未完成
+### 明确未验证或未完成
 
-1. **注册后端原子性**
-   - 前端已消费 verification-disabled 的完整 session，但后端仍应把
-     User、Profile、refresh digest、LoginHistory、successful LoginAttempt、
-     DomainEvent 与 welcome Outbox 收敛到一个
-     `AtomicRegistrationRepository` transaction。
-2. **Workflow 重复 lifecycle category 兼容**
-   - 后续应允许不同 state key 投影到相同 canonical category，同时继续拒绝
-     duplicate state/transition key、未知端点、非法/重复 role；运行时权限语义是
-     同一 canonical `(from, to)` 的 edge union。
-3. **真实恢复演练与发布证明**
+1. **真实恢复演练与发布证明**
    - ADR-0009 和 Webhook credential runbook 已定义迁移发布/回滚、
      backup/WAL/PITR 与物理擦除边界；仍需在隔离环境执行真实备份恢复、撤销重放
      和 egress 关闭条件下的零 HTTP 演练。
@@ -119,9 +117,9 @@ OpenAPI `3.2.0` 和 CloudEvents `1.0`。不保留旧版兼容分支。
    同时运行 loopback-only PostgreSQL lifecycle/DEK integration tests、
    Human API generation check、Web typecheck/lint/build；任何未配置或未执行的
    外部依赖门禁必须如实记录为未验证。
-3. emergency revoke 已进入实现检查点；继续完成注册原子性和 workflow 兼容。
-   每一项先写 mutation-sensitive RED，使用现有共享 domain interface，分别做
-   独立 code review 后再进入下一项。
+3. 后续修改 emergency revoke、注册事务或 workflow 兼容语义时，先写
+   mutation-sensitive RED，使用现有共享 domain interface，并分别完成独立
+   code review。
 4. Webhook 测试只允许 injectable client、mock route 或 loopback server；不得
    在开发/CI 中联系真实第三方 endpoint，也不得在命令、日志或报告中输出
    DSN、DEK、credential envelope 或 Webhook URL。

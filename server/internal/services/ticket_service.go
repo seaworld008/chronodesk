@@ -706,9 +706,6 @@ func (s *TicketService) UpdateTicketStatusExpectedVersion(
 	if !nextStatus.IsValid() {
 		return nil, fmt.Errorf("%w: %s to %s", ErrInvalidTicketTransition, ticket.Status, nextStatus)
 	}
-	if ticket.Status == nextStatus {
-		return ticket, nil
-	}
 	oldStatus := ticket.Status
 	description := fmt.Sprintf(
 		"状态从「%s」变更为「%s」",

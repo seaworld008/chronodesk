@@ -29,7 +29,8 @@
 - 统一企业列表、项目切换、设置范围和 Human Web 契约；跨项目聚合只来源于 active
   Membership，平台角色仍不构造 ProjectScope。
 - 工作流允许多个状态映射到同一 lifecycle category，以兼容合法的重复阶段配置，同时继续
-  通过状态标识符执行精确转换。
+  聚合合法的跨 category canonical 边并拒绝同 category 的不可执行边；当前不持久化或声称
+  exact workflow state key。
 - 注册流程在一个数据库事务内提交用户、Profile、验证记录与登录会话，任何后续写入失败都会
   回滚整个注册。
 - 统一构建、容器、Web、SDK 与 Agent OpenAPI 的产品版本为 `0.2.0`；运行时构建身份保持
@@ -39,8 +40,8 @@
 
 - 修复 MUI 9 Autocomplete slot 合并导致的原生输入引用丢失，并稳定工单创建、编辑和分类选择
   的浏览器交互契约。
-- 修复 same-status 请求伪造成功转换的问题；未发生状态变化时不再产生虚假的历史、事件或
-  版本递增。
+- 修复 same-status 请求伪造成功转换的问题；Human REST、Agent REST、MCP 与 A2A 统一拒绝
+  该请求，未发生状态变化时不再产生虚假的历史、事件、Outbox、receipt 或版本递增。
 - 修复注册失败后仍可能保留用户、Profile、验证记录或会话关联的问题，并拒绝不完整的事务
   仓储实现。
 - 修复 Webhook 紧急撤销在并发、过期凭据、终态投递、资源版本与锁顺序上的边界；已提交的

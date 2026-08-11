@@ -193,6 +193,55 @@ func AgentNativeErrorCode(err error) string {
 	}
 }
 
+// AgentNativeErrorCodes returns the finite stable error-code catalog shared by
+// Agent REST, MCP, and A2A adapters. Callers receive a copy so the published
+// contract cannot be mutated at runtime.
+func AgentNativeErrorCodes() []string {
+	return append([]string(nil), agentNativeErrorCodes...)
+}
+
+var agentNativeErrorCodes = []string{
+	"invalid_request",
+	"invalid_ticket_transition",
+	"invalid_assignee",
+	"assignee_not_found",
+	"assignee_policy_denied",
+	"invalid_actor",
+	"invalid_scope",
+	"principal_not_found",
+	"principal_disabled",
+	"principal_expired",
+	"invalid_credential",
+	"credential_expired",
+	"policy_denied",
+	"agent_emergency_stop",
+	"read_only",
+	"rate_limited",
+	"concurrency_limit",
+	"execution_guard_unavailable",
+	"automation_loop",
+	"idempotency_conflict",
+	"idempotency_in_progress",
+	"command_scope_mismatch",
+	"version_conflict",
+	"lease_conflict",
+	"lease_expired",
+	"lease_not_owned",
+	"attachment_too_large",
+	"attachment_not_clean",
+	"invalid_attachment",
+	"invalid_attachment_name",
+	"nested_comment_reply",
+	"invalid_comment",
+	"outbox_replay_conflict",
+	"outbox_replay_expired",
+	"ticket_configuration_unavailable",
+	"request_type_version_required",
+	"ticket_form_validation_failed",
+	"not_found",
+	"internal_error",
+}
+
 type OutboxTarget struct {
 	Type        string
 	ID          string
@@ -3550,12 +3599,13 @@ func (s *AgentNativeService) claimPendingOutbox(
 							applyCurrentProjectPolicy(updateQuery)
 						result := updateQuery.
 							Updates(map[string]any{
-								"status":     models.OutboxDeliveryProcessing,
-								"attempts":   gorm.Expr("attempts + 1"),
-								"locked_at":  claimNow,
-								"locked_by":  workerID,
-								"lock_token": lockToken,
-								"updated_at": claimNow,
+								"status":              models.OutboxDeliveryProcessing,
+								"attempts":            gorm.Expr("attempts + 1"),
+								"locked_at":           claimNow,
+								"locked_by":           workerID,
+								"lock_token":          lockToken,
+								"dispatch_started_at": nil,
+								"updated_at":          claimNow,
 							})
 						if result.Error != nil {
 							return result.Error

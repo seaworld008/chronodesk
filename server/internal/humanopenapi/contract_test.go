@@ -133,6 +133,49 @@ func TestHumanOutboxContractsPublishOnlySafeFiniteReplayState(
 	}
 }
 
+func TestHumanTicketStatusConflictMatchesDomainProblem(t *testing.T) {
+	document := decodeDocument(t)
+	components := objectAt(t, document, "components")
+	schemas := objectAt(t, components, "schemas")
+	problem := objectAt(t, schemas, "Problem")
+	properties := objectAt(t, problem, "properties")
+	code := objectAt(t, properties, "code")
+	enum, ok := code["enum"].([]any)
+	if !ok || !slices.Contains(enum, any("invalid_status_transition")) {
+		t.Fatal("Human Problem.code omits invalid_status_transition")
+	}
+	if _, ok := properties["details"]; !ok {
+		t.Fatal("Human Problem schema omits structured transition details")
+	}
+
+	paths := objectAt(t, document, "paths")
+	path := objectAt(
+		t,
+		paths,
+		"/projects/{projectKey}/tickets/{ticketID}/status",
+	)
+	operation := objectAt(t, path, "post")
+	responses := objectAt(t, operation, "responses")
+	conflict := objectAt(t, responses, "409")
+	content := objectAt(t, conflict, "content")
+	media := objectAt(t, content, "application/problem+json")
+	schema := objectAt(t, media, "schema")
+	if schema["$ref"] != "#/components/schemas/Problem" {
+		t.Errorf("Human status transition 409 schema = %v", schema["$ref"])
+	}
+	example := objectAt(t, media, "example")
+	if example["status"] != float64(http.StatusConflict) ||
+		example["code"] != "invalid_status_transition" ||
+		example["retryable"] != false {
+		t.Errorf("Human status transition 409 example = %+v", example)
+	}
+	details := objectAt(t, example, "details")
+	if details["current_status"] != "open" ||
+		details["requested_status"] != "open" {
+		t.Errorf("Human status transition 409 details = %+v", details)
+	}
+}
+
 func TestWebhookEmergencyRevokeContractIsExactAdminCASAndSecretFree(
 	t *testing.T,
 ) {

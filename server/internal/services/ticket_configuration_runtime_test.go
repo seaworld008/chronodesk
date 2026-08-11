@@ -564,7 +564,76 @@ func TestTicketWorkflowRuntimeRejectsSameCanonicalStatusWithoutStateKey(
 	}
 }
 
-func TestHumanTicketServiceSameStatusRemainsNoOp(t *testing.T) {
+func TestTicketWorkflowRuntimeRejectsSameCategoryDefinitionMutation(
+	t *testing.T,
+) {
+	db, ticketService, ctx, user, ticket := newWorkflowRuntimeTicket(
+		t,
+		models.ProjectRoleAgent,
+	)
+	forceHistoricalWorkflowDefinitions(
+		t,
+		db,
+		ticket.WorkflowVersionID,
+		[]models.WorkflowStateDefinition{
+			{
+				Key: "open", Name: "Open",
+				LifecycleCategory: models.LifecycleCategoryNew,
+				IsInitial:         true,
+			},
+			{
+				Key: "triage", Name: "Triage",
+				LifecycleCategory: models.LifecycleCategoryNew,
+			},
+			{
+				Key: "active", Name: "Active",
+				LifecycleCategory: models.LifecycleCategoryActive,
+			},
+		},
+		[]models.WorkflowTransitionDefinition{
+			{
+				Key: "triage", Name: "Triage",
+				From: "open", To: "triage",
+			},
+			{
+				Key: "start", Name: "Start",
+				From: "triage", To: "active",
+			},
+		},
+	)
+	before := *ticket
+
+	updated, err := ticketService.UpdateTicketStatusExpectedVersion(
+		ctx,
+		ticket.ID,
+		string(models.TicketStatusInProgress),
+		user.ID,
+		"",
+		"",
+		ticket.Version,
+	)
+	if !errors.Is(err, ErrInvalidTicketTransition) ||
+		!strings.Contains(err.Error(), `connects lifecycle category "new" to itself`) {
+		t.Fatalf(
+			"mutated same-category workflow error = %v, want invalid configuration",
+			err,
+		)
+	}
+	if updated != nil {
+		t.Fatalf("mutated workflow returned Ticket snapshot: %+v", updated)
+	}
+	var persisted models.Ticket
+	if err := db.First(&persisted, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Version != before.Version ||
+		persisted.Status != before.Status ||
+		!persisted.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("mutated workflow changed Ticket: before=%+v after=%+v", before, persisted)
+	}
+}
+
+func TestHumanTicketServiceRejectsSameStatusWithoutSideEffects(t *testing.T) {
 	db, ticketService, ctx, user, ticket := newWorkflowRuntimeTicket(
 		t,
 		models.ProjectRoleAgent,
@@ -599,13 +668,20 @@ func TestHumanTicketServiceSameStatusRemainsNoOp(t *testing.T) {
 		"",
 		ticket.Version,
 	)
-	if err != nil {
-		t.Fatalf("Human same-status no-op: %v", err)
+	if !errors.Is(err, ErrInvalidTicketTransition) {
+		t.Fatalf("Human same-status error = %v, want ErrInvalidTicketTransition", err)
 	}
-	if unchanged.Version != before.Version ||
-		unchanged.Status != before.Status ||
-		!unchanged.UpdatedAt.Equal(before.UpdatedAt) {
-		t.Fatalf("Human same-status no-op changed Ticket: before=%+v after=%+v", before, unchanged)
+	if unchanged != nil {
+		t.Fatalf("Human same-status returned successful Ticket snapshot: %+v", unchanged)
+	}
+	var persisted models.Ticket
+	if err := db.First(&persisted, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Version != before.Version ||
+		persisted.Status != before.Status ||
+		!persisted.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("Human same-status changed Ticket: before=%+v after=%+v", before, persisted)
 	}
 
 	var afterHistory, afterEvents, afterOutbox int64
@@ -631,7 +707,7 @@ func TestHumanTicketServiceSameStatusRemainsNoOp(t *testing.T) {
 		afterEvents != beforeEvents ||
 		afterOutbox != beforeOutbox {
 		t.Fatalf(
-			"Human same-status no-op side effects history/events/outbox = %d/%d/%d, want %d/%d/%d",
+			"Human same-status side effects history/events/outbox = %d/%d/%d, want %d/%d/%d",
 			afterHistory,
 			afterEvents,
 			afterOutbox,

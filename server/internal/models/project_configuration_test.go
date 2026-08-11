@@ -142,6 +142,13 @@ func TestWorkflowVersionRepeatedCategoriesPreserveDefinitionInvariants(t *testin
 			wantMessage: `references unknown target state "missing"`,
 		},
 		{
+			name: "same lifecycle category transition",
+			mutate: func(_ []WorkflowStateDefinition, transitions []WorkflowTransitionDefinition) {
+				transitions[0].To = "triage"
+			},
+			wantMessage: `connects lifecycle category "new" to itself`,
+		},
+		{
 			name: "invalid transition role",
 			mutate: func(_ []WorkflowStateDefinition, transitions []WorkflowTransitionDefinition) {
 				transitions[0].Roles = []ProjectRole{"workflow_owner"}

@@ -1700,18 +1700,27 @@ func validateWorkflowDefinitions(
 			return fmt.Errorf("duplicate workflow transition %q", transition.Key)
 		}
 		transitionKeys[transition.Key] = struct{}{}
-		if _, exists := stateKeys[transition.From]; !exists {
+		source, exists := stateKeys[transition.From]
+		if !exists {
 			return fmt.Errorf(
 				"workflow transition %q references unknown source state %q",
 				transition.Key,
 				transition.From,
 			)
 		}
-		if _, exists := stateKeys[transition.To]; !exists {
+		target, exists := stateKeys[transition.To]
+		if !exists {
 			return fmt.Errorf(
 				"workflow transition %q references unknown target state %q",
 				transition.Key,
 				transition.To,
+			)
+		}
+		if source.LifecycleCategory == target.LifecycleCategory {
+			return fmt.Errorf(
+				"workflow transition %q connects lifecycle category %q to itself",
+				transition.Key,
+				source.LifecycleCategory,
 			)
 		}
 		roles := make(map[ProjectRole]struct{}, len(transition.Roles))
