@@ -136,13 +136,16 @@ const encodeBase64URL = (value: unknown): string =>
         .replace(/\//g, '_')
         .replace(/=+$/u, '');
 
-const sessionToken = (identity: SessionIdentity): string => [
+const sessionToken = (
+    identity: SessionIdentity,
+    expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600,
+): string => [
     encodeBase64URL({ alg: 'none', typ: 'JWT' }),
     encodeBase64URL({
         sub: identity.subject,
         sid: identity.sessionID,
         platform_role: identity.platformRole,
-        exp: Math.floor(Date.now() / 1000) + 3600,
+        exp: expiresAtSeconds,
     }),
     'e2e-signature',
 ].join('.');
@@ -152,14 +155,15 @@ const installSession = async (
     identity: SessionIdentity,
     activeProject?: Project,
 ) => {
-    const token = sessionToken(identity);
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600;
+    const token = sessionToken(identity, expiresAtSeconds);
     await page.addInitScript(
-        ({ authToken, user, selectedProject }) => {
+        ({ authToken, user, selectedProject, expiresAt }) => {
             if (localStorage.getItem('token') === authToken) {
                 return;
             }
             localStorage.clear();
-            localStorage.setItem('token', authToken);
+            localStorage.setItem('refreshToken', 'e2e-refresh');
             localStorage.setItem(
                 'user',
                 JSON.stringify({
@@ -174,7 +178,7 @@ const installSession = async (
             );
             localStorage.setItem(
                 'tokenExpiresAt',
-                String(Date.now() + 3_600_000),
+                String(expiresAt),
             );
             if (selectedProject) {
                 localStorage.setItem(
@@ -186,11 +190,13 @@ const installSession = async (
                     }),
                 );
             }
+            localStorage.setItem('token', authToken);
         },
         {
             authToken: token,
             user: identity,
             selectedProject: activeProject,
+            expiresAt: expiresAtSeconds * 1000,
         },
     );
 };
