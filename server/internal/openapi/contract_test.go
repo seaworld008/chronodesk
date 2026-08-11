@@ -12,6 +12,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/seaworld008/chronodesk/server/internal/agentcontract"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 func TestSpecificationIsStableAgentContract(t *testing.T) {
@@ -1068,7 +1069,16 @@ func assertA2A10Contract(
 	if _, exists := paths["/a2a"]; exists {
 		t.Error("unversioned legacy /a2a path is still published")
 	}
-	serialized := string(Specification())
+	// Product and Human API releases may legitimately use numbers that were
+	// once A2A drafts. Keep the legacy-version search scoped to the A2A
+	// parameters, operation, and Agent Card instead of coupling the protocol
+	// gate to unrelated document metadata.
+	serialized := fmt.Sprint([]any{
+		versionHeader,
+		versionQuery,
+		post,
+		card,
+	})
 	for _, forbidden := range []string{"0.3", "0.2", "A2A-Version-Override"} {
 		if strings.Contains(serialized, forbidden) {
 			t.Errorf("OpenAPI still contains legacy A2A contract %q", forbidden)
@@ -1873,6 +1883,52 @@ func assertNoStoreCredentialResponse(
 		if got := schema["const"]; got != value {
 			t.Errorf("%s %s response header %s const = %v, want %s", strings.ToUpper(method), path, name, got, value)
 		}
+	}
+}
+
+func TestProblemCodeEnumContainsRuntimeCatalogAndTransitionExample(t *testing.T) {
+	var document map[string]any
+	if err := yaml.Unmarshal(Specification(), &document); err != nil {
+		t.Fatal(err)
+	}
+	components := contractMap(t, document["components"], "components")
+	schemas := contractMap(t, components["schemas"], "components.schemas")
+	problem := contractMap(t, schemas["Problem"], "Problem")
+	properties := contractMap(t, problem["properties"], "Problem.properties")
+	code := contractMap(t, properties["code"], "Problem.code")
+	for _, runtimeCode := range services.AgentNativeErrorCodes() {
+		if !contractSliceContains(code["enum"], runtimeCode) {
+			t.Errorf("Problem.code enum omits runtime error %q", runtimeCode)
+		}
+	}
+
+	paths := contractMap(t, document["paths"], "paths")
+	operation := contractOperation(
+		t,
+		paths,
+		"/tickets/{ticketId}/commands/transition",
+		"post",
+	)
+	responses := contractMap(t, operation["responses"], "transition.responses")
+	badRequest := contractMap(t, responses["400"], "transition.responses.400")
+	content := contractMap(t, badRequest["content"], "transition.responses.400.content")
+	media := contractMap(
+		t,
+		content["application/problem+json"],
+		"transition.responses.400.application/problem+json",
+	)
+	schema := contractMap(t, media["schema"], "transition.responses.400.schema")
+	if schema["$ref"] != "#/components/schemas/Problem" {
+		t.Errorf("transition 400 schema = %v", schema["$ref"])
+	}
+	example := contractMap(t, media["example"], "transition.responses.400.example")
+	if got := example["code"]; got != services.AgentNativeErrorCode(
+		services.ErrInvalidTicketTransition,
+	) {
+		t.Errorf("transition 400 example code = %v", got)
+	}
+	if example["status"] != 400 || example["retryable"] != false {
+		t.Errorf("transition 400 example = %+v", example)
 	}
 }
 

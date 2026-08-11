@@ -2,7 +2,7 @@ openapi: 3.2.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: ChronoDesk Agent-Native API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Stable machine contract for ChronoDesk service principals.
 
@@ -552,7 +552,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/TicketWriteEnvelope'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: The command is invalid, including a canonical status not allowed by the bound workflow.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://chronodesk.local/problems/invalid_ticket_transition
+                title: invalid ticket transition
+                status: 400
+                detail: The bound workflow does not allow the requested status transition.
+                code: invalid_ticket_transition
+                request_id: req_01J00000000000000000000000
+                retryable: false
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2005,7 +2017,7 @@ paths:
                   _meta:
                     io.modelcontextprotocol/serverInfo:
                       name: chronodesk
-                      version: 0.1.0
+                      version: 0.2.0
             text/event-stream:
               schema:
                 $ref: '#/components/schemas/MCPSSEStream'
@@ -2911,6 +2923,10 @@ components:
           type: string
           enum:
             - invalid_request
+            - invalid_ticket_transition
+            - invalid_assignee
+            - assignee_not_found
+            - assignee_policy_denied
             - precondition_required
             - unauthorized
             - invalid_actor
@@ -2937,10 +2953,17 @@ components:
             - outbox_replay_expired
             - rate_limited
             - concurrency_limit
+            - execution_guard_unavailable
             - attachment_rejected
             - attachment_too_large
             - attachment_not_clean
+            - invalid_attachment
             - invalid_attachment_name
+            - nested_comment_reply
+            - invalid_comment
+            - ticket_configuration_unavailable
+            - request_type_version_required
+            - ticket_form_validation_failed
             - service_unavailable
             - internal_error
         request_id:

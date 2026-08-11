@@ -85,7 +85,7 @@ services:
       context: ./server
       dockerfile: Dockerfile
       args:
-        VERSION: ${VERSION:-0.1.0}
+        VERSION: ${VERSION:-0.2.0}
         COMMIT: ${COMMIT:-development}
         BUILD_DATE: ${BUILD_DATE:-development}
     ports:

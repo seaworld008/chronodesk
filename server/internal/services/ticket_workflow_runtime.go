@@ -40,7 +40,11 @@ func validateTicketWorkflowTransitionTx(
 		)
 	}
 	if ticket.Status == next {
-		return nil
+		return fmt.Errorf(
+			"%w: source and target statuses are both %s",
+			ErrInvalidTicketTransition,
+			next,
+		)
 	}
 	if strings.TrimSpace(ticket.WorkflowVersionID) == "" {
 		return fmt.Errorf(

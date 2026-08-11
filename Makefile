@@ -12,7 +12,7 @@ PYTHON_REQUIREMENTS ?= server/requirements-test.txt
 VENV_PYTHON := $(VENV)/bin/python
 PYTHON_REQUIREMENTS_SNAPSHOT := $(VENV)/.requirements-test.txt
 NPM_TOOL_CACHE ?= $(CURDIR)/.cache/npm-tools
-VERSION ?= 0.1.0
+VERSION ?= 0.2.0
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 GO_LDFLAGS := -s -w \

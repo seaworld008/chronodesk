@@ -84,6 +84,9 @@ func validateRuntimeSchema(
 		if err := ValidateWebhookOutboxLifecycleFence(db); err != nil {
 			return err
 		}
+		if err := ValidateWebhookDispatchStartBoundary(db); err != nil {
+			return err
+		}
 		if err := ValidateWebhookOutboxLifecycleIndexes(db); err != nil {
 			return err
 		}
@@ -144,6 +147,9 @@ func validateRuntimeSchema(
 		}
 	}
 	if err := ValidateWebhookOutboxLifecycleFence(db); err != nil {
+		return err
+	}
+	if err := ValidateWebhookDispatchStartBoundary(db); err != nil {
 		return err
 	}
 	if err := ValidateWebhookOutboxLifecycleIndexes(db); err != nil {
@@ -331,7 +337,7 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.OutboxDelivery{}, "outbox_deliveries", []string{
 			"event_id", "destination_type", "destination_id", "status",
 			"attempts", "next_attempt_at", "locked_at", "locked_by",
-			"lock_token", "expires_at", "expired_at",
+			"lock_token", "dispatch_started_at", "expires_at", "expired_at",
 		}},
 		{&models.WebhookDeliverySnapshot{}, "webhook_delivery_snapshots", []string{
 			"id", "organization_id", "project_id", "config_id", "event_id",
@@ -772,6 +778,12 @@ func CreateIndexes(db *gorm.DB) error {
 		indexErrors = append(
 			indexErrors,
 			fmt.Errorf("webhook Outbox lifecycle fence: %w", err),
+		)
+	}
+	if err := MigrateWebhookDispatchStartBoundary(db); err != nil {
+		indexErrors = append(
+			indexErrors,
+			fmt.Errorf("Webhook dispatch-start boundary: %w", err),
 		)
 	}
 	if err := MigrateWebhookOutboxLifecycleIndexes(db); err != nil {
@@ -1312,6 +1324,9 @@ func runMigrationsFromModelLocked(
 	// 7. 自动迁移模型
 	if err := autoMigrateFromModel(db, firstModel); err != nil {
 		return fmt.Errorf("auto migration failed: %w", err)
+	}
+	if err := migrateSystemVersion(db, version.Version); err != nil {
+		return fmt.Errorf("system version migration failed: %w", err)
 	}
 	if err := MigrateAttachmentStorageIdentityContract(db); err != nil {
 		return fmt.Errorf(

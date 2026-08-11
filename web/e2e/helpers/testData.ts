@@ -120,6 +120,7 @@ type TicketIntakeConfiguration = {
 type HumanSessionBinding = {
     subject: string;
     sessionID: string;
+    expiresAt: number;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -146,6 +147,9 @@ const humanSessionBinding = (
             payload.sub.length === 0 ||
             typeof payload.sid !== 'string' ||
             payload.sid.length === 0 ||
+            typeof payload.exp !== 'number' ||
+            !Number.isSafeInteger(payload.exp) ||
+            payload.exp <= 0 ||
             payload.platform_role !== session.user.platform_role
         ) {
             throw new Error('JWT 主体、会话或 platform_role 与登录用户不一致');
@@ -153,6 +157,7 @@ const humanSessionBinding = (
         return {
             subject: payload.sub,
             sessionID: payload.sid,
+            expiresAt: payload.exp * 1000,
         };
     } catch (error) {
         throw new Error(
@@ -387,12 +392,10 @@ export const authenticatePage = async (
             localStorage.setItem('refreshToken', auth.refresh_token);
         }
         localStorage.setItem('user', JSON.stringify(auth.user));
-        if (auth.expires_in) {
-            localStorage.setItem(
-                'tokenExpiresAt',
-                String(Date.now() + auth.expires_in * 1000),
-            );
-        }
+        localStorage.setItem(
+            'tokenExpiresAt',
+            String(sessionBinding.expiresAt),
+        );
     }, {
         auth: session,
         activeProjectKey: projectKey,
@@ -1179,14 +1182,33 @@ const deleteNotifications = async (request: APIRequestContext, token: string) =>
 const deleteWebhooks = async (request: APIRequestContext, token: string) => {
     const projectKey = await resolveE2EProjectKey(request, token);
     for (const id of trackedIDs('webhooks')) {
+        const webhookPath = projectAPIPath(
+            projectKey,
+            `webhooks/${encodeURIComponent(id)}`,
+        );
+        const detailResponse = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            webhookPath,
+        );
+        const resourceVersion = extractData<Record<string, unknown>>(
+            detailResponse,
+        ).resource_version;
+        if (!positiveVersion(resourceVersion)) {
+            throw new Error(
+                `Webhook ${id} 清理响应缺少合法 resource_version`,
+            );
+        }
         await apiRequest(
             request,
             token,
-            projectAPIPath(
-                projectKey,
-                `webhooks/${encodeURIComponent(id)}`,
-            ),
-            { method: 'DELETE' },
+            webhookPath,
+            {
+                method: 'DELETE',
+                headers: {
+                    'If-Match': `"v${resourceVersion}"`,
+                },
+            },
         );
         untrackE2EResource('webhooks', id);
     }

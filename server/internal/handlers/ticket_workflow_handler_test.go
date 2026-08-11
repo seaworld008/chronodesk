@@ -256,6 +256,75 @@ func TestUpdateTicketStatusRejectsUnknownStatus(t *testing.T) {
 	}
 }
 
+func TestUpdateTicketStatusRejectsSameStatusAsDomainConflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, db, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", agent.ID)
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAgent))
+		c.Next()
+	})
+	router.Use(handlerTestProjectMiddleware(t, db))
+	router.POST("/tickets/:id/status", handler.UpdateTicketStatus)
+
+	var before models.Ticket
+	if err := db.First(&before, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var beforeHistory int64
+	if err := db.Model(&models.TicketHistory{}).
+		Where("ticket_id = ?", ticket.ID).
+		Count(&beforeHistory).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.NewBufferString(`{"status":"open"}`)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets/"+jsonNumber(ticket.ID)+"/status",
+		body,
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	assertHumanProblem(
+		t,
+		resp,
+		http.StatusConflict,
+		"invalid_status_transition",
+	)
+	var problem humanTicketProblem
+	if err := json.Unmarshal(resp.Body.Bytes(), &problem); err != nil {
+		t.Fatal(err)
+	}
+	if problem.Retryable ||
+		problem.Details["current_status"] != string(models.TicketStatusOpen) ||
+		problem.Details["requested_status"] != string(models.TicketStatusOpen) {
+		t.Fatalf("same-status problem = %+v", problem)
+	}
+	var persisted models.Ticket
+	if err := db.First(&persisted, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Version != before.Version ||
+		persisted.Status != before.Status ||
+		!persisted.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("same-status HTTP request changed Ticket: before=%+v after=%+v", before, persisted)
+	}
+	var afterHistory int64
+	if err := db.Model(&models.TicketHistory{}).
+		Where("ticket_id = ?", ticket.ID).
+		Count(&afterHistory).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterHistory != beforeHistory {
+		t.Fatalf("same-status HTTP history count = %d, want %d", afterHistory, beforeHistory)
+	}
+}
+
 func TestGetAllowedTicketTransitionsUsesVersionedWorkflowProjection(
 	t *testing.T,
 ) {

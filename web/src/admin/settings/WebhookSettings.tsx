@@ -41,19 +41,27 @@ import {
 } from '@mui/material'
 import {
   Add as AddIcon,
+  Block as RevokeIcon,
   Delete as DeleteIcon,
   Edit as EditIcon,
   Science as TestIcon,
   Refresh as RefreshIcon,
   ReceiptLong as DeliveryIcon,
 } from '@mui/icons-material'
-import { useNotify } from 'react-admin'
+import { useNotify, usePermissions } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
-import { resolveActiveProjectKey } from '@/lib/projectScope'
+import {
+  parseProjectRole,
+  resolveActiveProjectKey,
+} from '@/lib/projectScope'
 import { projectScopeChangedEvent } from '@/lib/projectScopeEvents'
+import type { AccessPermissions } from '@/lib/accessControl'
 import {
   humanApiRoutes,
   type WebhookConfig,
+  type WebhookEmergencyRevokePreflight,
+  type WebhookEmergencyRevokeResult,
+  type WebhookEmergencyTombstonePage,
   type WebhookEventType,
   type WebhookLog,
   type WebhookLogPage,
@@ -78,7 +86,7 @@ const webhookColumns: ResizableColumn[] = [
   { key: 'events', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
   { key: 'delivery', defaultWidth: 180, minWidth: 140, maxWidth: 280 },
   { key: 'last-success', defaultWidth: 188, minWidth: 150, maxWidth: 280 },
-  { key: 'actions', defaultWidth: 200, minWidth: 184, maxWidth: 280, sticky: 'right' },
+  { key: 'actions', defaultWidth: 240, minWidth: 220, maxWidth: 320, sticky: 'right' },
 ]
 
 const isQueuedWebhookTestReceipt = (
@@ -259,6 +267,12 @@ type PendingWebhookAction = {
   kind: 'delete' | 'test'
   id: number
   name: string
+  resourceVersion?: number
+}
+type WebhookEmergencyRevokeIntent = {
+  preflight: WebhookEmergencyRevokePreflight
+  idempotencyKey: string
+  projectKey: string
 }
 
 const maxWebhookDeliveryCursorPages = 100
@@ -267,21 +281,81 @@ const isAbortedRequest = (error: unknown, signal: AbortSignal) =>
   signal.aborted
   || (error instanceof DOMException && error.name === 'AbortError')
 
+const formatResourceVersion = (version: number) => `"v${version}"`
+
+const newIdempotencyKey = () => {
+  if (
+    typeof crypto !== 'undefined'
+    && typeof crypto.randomUUID === 'function'
+  ) return crypto.randomUUID()
+  return `webhook-emergency-revoke-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+const isWebhookEmergencyRevokeResult = (
+  value: unknown,
+  configID: number,
+): value is WebhookEmergencyRevokeResult => {
+  if (typeof value !== 'object' || value === null) return false
+  const result = value as Record<string, unknown>
+  return (
+    result.config_id === configID
+    && result.status === 'disabled'
+    && result.credential_shred_reason === 'revoked'
+    && [
+      result.expired_deliveries,
+      result.in_flight_deliveries,
+      result.shredded_snapshots,
+    ].every((count) => Number.isSafeInteger(count) && Number(count) >= 0)
+  )
+}
+
+const isWebhookEmergencyRevokePreflight = (
+  value: unknown,
+  configID: number,
+): value is WebhookEmergencyRevokePreflight => {
+  if (typeof value !== 'object' || value === null) return false
+  const preflight = value as Record<string, unknown>
+  return (
+    preflight.config_id === configID
+    && typeof preflight.status === 'string'
+    && typeof preflight.deleted === 'boolean'
+    && typeof preflight.emergency_revoked === 'boolean'
+    && Number.isSafeInteger(preflight.resource_version)
+    && Number(preflight.resource_version) > 0
+  )
+}
+
 const WebhookSettings: React.FC = () => {
   const notify = useNotify()
+  const { permissions } = usePermissions<AccessPermissions>()
+  const canEmergencyRevoke =
+    parseProjectRole(permissions?.project_role) === 'project_admin'
   const [loading, setLoading] = useState(false)
   const [items, setItems] = useState<WebhookConfig[]>([])
+  const [tombstones, setTombstones] =
+    useState<WebhookEmergencyRevokePreflight[]>([])
+  const [tombstoneTotal, setTombstoneTotal] = useState(0)
+  const [tombstonePage, setTombstonePage] = useState(0)
+  const [tombstonePageSize, setTombstonePageSize] = useState(25)
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(0)
   const [pageSize, setPageSize] = useState(25)
   const [listError, setListError] = useState('')
   const [formOpen, setFormOpen] = useState(false)
   const [currentId, setCurrentId] = useState<number | null>(null)
+  const [currentResourceVersion, setCurrentResourceVersion] =
+    useState<number | null>(null)
   const [form, setForm] = useState<WebhookForm>(defaultForm)
   const [errors, setErrors] = useState<FormErrors>({})
   const [testId, setTestId] = useState<number | null>(null)
   const [saving, setSaving] = useState(false)
   const [pendingAction, setPendingAction] = useState<PendingWebhookAction | null>(null)
+  const [emergencyRevokeIntent, setEmergencyRevokeIntent] =
+    useState<WebhookEmergencyRevokeIntent | null>(null)
+  const [emergencyPreflightID, setEmergencyPreflightID] =
+    useState<number | null>(null)
+  const [emergencyRevokingID, setEmergencyRevokingID] =
+    useState<number | null>(null)
   const [deliveryWebhook, setDeliveryWebhook] = useState<WebhookConfig | null>(null)
   const [deliveries, setDeliveries] = useState<WebhookLog[]>([])
   const [deliveryLoading, setDeliveryLoading] = useState(false)
@@ -296,6 +370,8 @@ const WebhookSettings: React.FC = () => {
   const [scopeVersion, setScopeVersion] = useState(0)
   const definitionController = useRef<AbortController | null>(null)
   const definitionSequence = useRef(0)
+  const emergencyPreflightController = useRef<AbortController | null>(null)
+  const emergencyPreflightSequence = useRef(0)
   const deliveryController = useRef<AbortController | null>(null)
   const deliverySequence = useRef(0)
   const deliveryRetryTarget = useRef({
@@ -329,12 +405,26 @@ const WebhookSettings: React.FC = () => {
         path,
         { signal: controller.signal },
       )
+      const tombstoneData = canEmergencyRevoke
+        ? await apiFetch<WebhookEmergencyTombstonePage>(
+            humanApiRoutes.listProjectWebhookEmergencyTombstones(
+              { projectKey },
+              {
+                page: tombstonePage + 1,
+                page_size: tombstonePageSize,
+              },
+            ),
+            { signal: controller.signal },
+          )
+        : null
       if (
         controller.signal.aborted
         || definitionSequence.current !== sequence
       ) return
       setItems(data.items ?? [])
       setTotal(data.total ?? 0)
+      setTombstones(tombstoneData?.items ?? [])
+      setTombstoneTotal(tombstoneData?.total ?? 0)
     } catch (error: unknown) {
       if (
         isAbortedRequest(error, controller.signal)
@@ -349,7 +439,14 @@ const WebhookSettings: React.FC = () => {
         setLoading(false)
       }
     }
-  }, [extractErrorMessage, page, pageSize])
+  }, [
+    canEmergencyRevoke,
+    extractErrorMessage,
+    page,
+    pageSize,
+    tombstonePage,
+    tombstonePageSize,
+  ])
 
   useEffect(() => {
     void fetchWebhooks()
@@ -495,16 +592,26 @@ const WebhookSettings: React.FC = () => {
     const handleProjectScopeChanged = () => {
       definitionController.current?.abort()
       definitionSequence.current += 1
+      emergencyPreflightController.current?.abort()
+      emergencyPreflightSequence.current += 1
       closeDeliveries()
+      setEmergencyRevokeIntent(null)
+      setEmergencyPreflightID(null)
+      setEmergencyRevokingID(null)
       setItems([])
+      setTombstones([])
+      setTombstoneTotal(0)
       setTotal(0)
       setPage(0)
+      setTombstonePage(0)
       setScopeVersion((version) => version + 1)
     }
     window.addEventListener(projectScopeChangedEvent, handleProjectScopeChanged)
     return () => {
       definitionController.current?.abort()
       definitionSequence.current += 1
+      emergencyPreflightController.current?.abort()
+      emergencyPreflightSequence.current += 1
       deliveryController.current?.abort()
       deliverySequence.current += 1
       window.removeEventListener(
@@ -516,6 +623,7 @@ const WebhookSettings: React.FC = () => {
 
   const openCreate = () => {
     setCurrentId(null)
+    setCurrentResourceVersion(null)
     setForm(defaultForm)
     setErrors({})
     setFormOpen(true)
@@ -523,6 +631,7 @@ const WebhookSettings: React.FC = () => {
 
   const openEdit = (webhook: WebhookConfig) => {
     setCurrentId(webhook.id)
+    setCurrentResourceVersion(webhook.resource_version)
     setForm({
       name: webhook.name,
       description: webhook.description || '',
@@ -548,6 +657,7 @@ const WebhookSettings: React.FC = () => {
   const closeForm = () => {
     setFormOpen(false)
     setCurrentId(null)
+    setCurrentResourceVersion(null)
     setForm(defaultForm)
     setErrors({})
   }
@@ -655,12 +765,18 @@ const WebhookSettings: React.FC = () => {
       const payload = buildPayload(currentId !== null)
       const projectKey = await resolveActiveProjectKey()
       if (currentId) {
+        if (currentResourceVersion === null) {
+          throw new Error('Webhook 版本信息缺失，请刷新后重试')
+        }
         const path = humanApiRoutes.updateProjectWebhook({
           projectKey,
           webhookID: currentId,
         })
         await apiFetch(path, {
           method: 'PUT',
+          headers: {
+            'If-Match': formatResourceVersion(currentResourceVersion),
+          },
           body: JSON.stringify(payload),
         })
         notify('Webhook 更新成功', { type: 'success' })
@@ -683,16 +799,24 @@ const WebhookSettings: React.FC = () => {
     }
   }
 
-  const executeDelete = async (id: number) => {
+  const executeDelete = async (id: number, resourceVersion?: number) => {
     try {
+      if (resourceVersion === undefined) {
+        throw new Error('Webhook 版本信息缺失，请刷新后重试')
+      }
       const projectKey = await resolveActiveProjectKey()
       const path = humanApiRoutes.deleteProjectWebhook({
         projectKey,
         webhookID: id,
       })
-      await apiFetch(path, { method: 'DELETE' })
+      await apiFetch(path, {
+        method: 'DELETE',
+        headers: {
+          'If-Match': formatResourceVersion(resourceVersion),
+        },
+      })
       notify('删除成功', { type: 'success' })
-      fetchWebhooks()
+      void fetchWebhooks()
     } catch (error: unknown) {
       notify(extractErrorMessage(error, '删除失败'), { type: 'error' })
     }
@@ -724,12 +848,113 @@ const WebhookSettings: React.FC = () => {
     }
   }
 
+  const executeEmergencyRevoke = async () => {
+    const intent = emergencyRevokeIntent
+    if (!intent || !canEmergencyRevoke) return
+    const { preflight, idempotencyKey } = intent
+    setEmergencyRevokingID(preflight.config_id)
+    try {
+      const path = humanApiRoutes.emergencyRevokeProjectWebhook({
+        projectKey: intent.projectKey,
+        webhookID: preflight.config_id,
+      })
+      const result = await apiFetch<WebhookEmergencyRevokeResult>(path, {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': idempotencyKey,
+          'If-Match': formatResourceVersion(preflight.resource_version),
+        },
+      })
+      if (!isWebhookEmergencyRevokeResult(result, preflight.config_id)) {
+        throw new Error('Webhook 紧急撤销响应无效，请刷新后核对投递状态')
+      }
+      const inFlightWarning = result.in_flight_deliveries > 0
+        ? `；仍有 ${result.in_flight_deliveries} 条投递正在执行，无法召回`
+        : ''
+      notify(
+        `紧急撤销完成：${result.expired_deliveries} 条投递已过期，`
+          + `${result.shredded_snapshots} 份凭据已粉碎${inFlightWarning}`,
+        { type: result.in_flight_deliveries > 0 ? 'warning' : 'success' },
+      )
+      setEmergencyRevokeIntent(null)
+      if (deliveryWebhook?.id === preflight.config_id) {
+        setDeliveries([])
+        setDeliveryPageIndex(0)
+        setDeliveryCursorHistory([''])
+        void fetchDeliveries(deliveryWebhook, '', 0)
+      }
+      void fetchWebhooks()
+    } catch (error: unknown) {
+      notify(extractErrorMessage(error, 'Webhook 紧急撤销失败'), {
+        type: 'error',
+      })
+    } finally {
+      setEmergencyRevokingID(null)
+    }
+  }
+
+  const prepareEmergencyRevoke = async (configID: number) => {
+    if (!canEmergencyRevoke) return
+    emergencyPreflightController.current?.abort()
+    const controller = new AbortController()
+    const sequence = emergencyPreflightSequence.current + 1
+    emergencyPreflightSequence.current = sequence
+    emergencyPreflightController.current = controller
+    setEmergencyPreflightID(configID)
+    try {
+      const projectKey = await resolveActiveProjectKey()
+      if (
+        controller.signal.aborted
+        || emergencyPreflightSequence.current !== sequence
+      ) return
+      const path = humanApiRoutes.getProjectWebhookEmergencyRevokePreflight({
+        projectKey,
+        webhookID: configID,
+      })
+      const preflight = await apiFetch<unknown>(path, {
+        signal: controller.signal,
+      })
+      if (
+        controller.signal.aborted
+        || emergencyPreflightSequence.current !== sequence
+      ) return
+      if (!isWebhookEmergencyRevokePreflight(preflight, configID)) {
+        throw new Error('Webhook 紧急撤销预检响应无效，请刷新后重试')
+      }
+      if (preflight.emergency_revoked) {
+        notify(`Webhook #${configID} 已完成紧急撤销`, { type: 'info' })
+        void fetchWebhooks()
+        return
+      }
+      setEmergencyRevokeIntent({
+        preflight,
+        idempotencyKey: newIdempotencyKey(),
+        projectKey,
+      })
+    } catch (error: unknown) {
+      if (
+        isAbortedRequest(error, controller.signal)
+        || emergencyPreflightSequence.current !== sequence
+      ) return
+      notify(extractErrorMessage(error, 'Webhook 紧急撤销预检失败'), {
+        type: 'error',
+      })
+    } finally {
+      if (
+        !controller.signal.aborted
+        && emergencyPreflightSequence.current === sequence
+      ) {
+        setEmergencyPreflightID(null)
+      }
+    }
+  }
+
   const confirmPendingAction = async () => {
     const action = pendingAction
     if (!action) return
     setPendingAction(null)
     if (action.kind === 'delete') {
-      await executeDelete(action.id)
+      await executeDelete(action.id, action.resourceVersion)
       return
     }
     await executeTest(action.id)
@@ -885,10 +1110,29 @@ const WebhookSettings: React.FC = () => {
                         kind: 'delete',
                         id: item.id,
                         name: item.name,
+                        resourceVersion: item.resource_version,
                       })}
                     >
                       <DeleteIcon fontSize="small" />
                     </IconButton>
+                    {canEmergencyRevoke && (
+                      <IconButton
+                        size="small"
+                        color="error"
+                        aria-label={`紧急撤销 Webhook：${item.name}`}
+                        title="紧急终止未完成投递并不可逆粉碎凭据"
+                        onClick={() => void prepareEmergencyRevoke(item.id)}
+                        disabled={
+                          emergencyRevokingID === item.id
+                          || emergencyPreflightID === item.id
+                        }
+                      >
+                        {emergencyRevokingID === item.id
+                          || emergencyPreflightID === item.id
+                          ? <CircularProgress size={16} color="inherit" />
+                          : <RevokeIcon fontSize="small" />}
+                      </IconButton>
+                    )}
                   </Stack>
                 </TableCell>
               </TableRow>
@@ -910,6 +1154,91 @@ const WebhookSettings: React.FC = () => {
           }}
         />
       </TableContainer>
+      {canEmergencyRevoke && tombstoneTotal > 0 && (
+        <Paper
+          component="section"
+          role="region"
+          aria-label="已删除 Webhook"
+          variant="outlined"
+          sx={{ mt: 3, p: 2 }}
+        >
+          <Typography component="h2" variant="h6" gutterBottom>
+            已删除 Webhook
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            普通删除保留已冻结投递。仅在需要立即终止时，单独执行不可逆的紧急撤销。
+          </Typography>
+          <Stack spacing={1}>
+            {tombstones.map((tombstone) => (
+              <Paper
+                key={tombstone.config_id}
+                variant="outlined"
+                sx={{
+                  alignItems: 'center',
+                  display: 'flex',
+                  gap: 1,
+                  justifyContent: 'space-between',
+                  p: 1.5,
+                }}
+              >
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{ alignItems: 'center', minWidth: 0 }}
+                >
+                  <Typography variant="body2">
+                    Webhook #{tombstone.config_id}
+                  </Typography>
+                  <Chip
+                    size="small"
+                    label={tombstone.emergency_revoked
+                      ? '已紧急撤销'
+                      : '已普通删除'}
+                    color={tombstone.emergency_revoked ? 'error' : 'default'}
+                  />
+                </Stack>
+                {!tombstone.emergency_revoked && (
+                  <Button
+                    color="error"
+                    size="small"
+                    startIcon={
+                      emergencyPreflightID === tombstone.config_id
+                        ? <CircularProgress size={14} color="inherit" />
+                        : <RevokeIcon fontSize="small" />
+                    }
+                    aria-label={
+                      `紧急撤销已删除 Webhook：#${tombstone.config_id}`
+                    }
+                    disabled={
+                      emergencyRevokingID === tombstone.config_id
+                      || emergencyPreflightID === tombstone.config_id
+                    }
+                    onClick={() =>
+                      void prepareEmergencyRevoke(tombstone.config_id)}
+                  >
+                    紧急撤销
+                  </Button>
+                )}
+              </Paper>
+            ))}
+          </Stack>
+          <TablePagination
+            component="div"
+            count={tombstoneTotal}
+            page={tombstonePage}
+            rowsPerPage={tombstonePageSize}
+            rowsPerPageOptions={[25, 50, 100]}
+            labelRowsPerPage="已删除项每页行数"
+            labelDisplayedRows={({ from, to, count }) =>
+              `${from}–${to} / ${count}`}
+            onPageChange={(_, nextPage) => setTombstonePage(nextPage)}
+            onRowsPerPageChange={(event) => {
+              setTombstonePage(0)
+              setTombstonePageSize(Number(event.target.value))
+            }}
+          />
+        </Paper>
+      )}
       </Box>
       <Drawer
         anchor="right"
@@ -1460,7 +1789,7 @@ const WebhookSettings: React.FC = () => {
         </DialogTitle>
         <DialogContent>
           {pendingAction?.kind === 'delete'
-            ? `确定删除“${pendingAction.name}”吗？删除后将停止对应事件投递。`
+            ? `确定删除“${pendingAction.name}”吗？删除后不再为新事件创建投递；已经冻结的投递仍会按原凭据继续到期完成。如需立即终止，请使用紧急撤销。`
             : `测试会将一条真实请求加入“${pendingAction?.name || ''}”的投递队列。入队不代表发送成功，请随后查看投递日志，确定继续吗？`}
         </DialogContent>
         <DialogActions>
@@ -1471,6 +1800,48 @@ const WebhookSettings: React.FC = () => {
             onClick={() => void confirmPendingAction()}
           >
             {pendingAction?.kind === 'delete' ? '确认删除' : '确认入队'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={Boolean(emergencyRevokeIntent)}
+        onClose={() => {
+          if (emergencyRevokingID === null) setEmergencyRevokeIntent(null)
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>紧急撤销 Webhook</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2}>
+            <Alert severity="error">
+              这是不可逆安全操作。凭据粉碎后不能恢复，也不能重新投递已终止的请求。
+            </Alert>
+            <Typography>
+              普通停用或删除不会撤回已经冻结的投递；紧急撤销会禁用 Webhook
+              {' '}#{emergencyRevokeIntent?.preflight.config_id || ''}，使待处理、失败、死信以及可确定尚未开始的投递立即过期，
+              并不可逆粉碎所有尚未终止的快照凭据。
+            </Typography>
+            <Typography color="text.secondary">
+              已提交发送授权的投递，以及旧版本留下、无法确认是否已开始的投递，均按不可召回处理；
+              操作完成后会单独报告这部分 in-flight 数量。
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => setEmergencyRevokeIntent(null)}
+            disabled={emergencyRevokingID !== null}
+          >
+            取消
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={() => void executeEmergencyRevoke()}
+            disabled={emergencyRevokingID !== null}
+          >
+            {emergencyRevokingID !== null ? '撤销中…' : '确认紧急撤销'}
           </Button>
         </DialogActions>
       </Dialog>

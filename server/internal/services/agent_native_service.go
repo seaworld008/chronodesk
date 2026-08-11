@@ -112,6 +112,8 @@ func AgentNativeErrorCode(err error) string {
 		errors.Is(err, ErrTicketCategoryScope),
 		errors.Is(err, ErrInvalidTicketCategorySelection):
 		return "invalid_request"
+	case errors.Is(err, ErrInvalidTicketTransition):
+		return "invalid_ticket_transition"
 	case errors.Is(err, ErrInvalidAssignee):
 		return "invalid_assignee"
 	case errors.Is(err, ErrAssigneeNotFound):
@@ -189,6 +191,55 @@ func AgentNativeErrorCode(err error) string {
 	default:
 		return "internal_error"
 	}
+}
+
+// AgentNativeErrorCodes returns the finite stable error-code catalog shared by
+// Agent REST, MCP, and A2A adapters. Callers receive a copy so the published
+// contract cannot be mutated at runtime.
+func AgentNativeErrorCodes() []string {
+	return append([]string(nil), agentNativeErrorCodes...)
+}
+
+var agentNativeErrorCodes = []string{
+	"invalid_request",
+	"invalid_ticket_transition",
+	"invalid_assignee",
+	"assignee_not_found",
+	"assignee_policy_denied",
+	"invalid_actor",
+	"invalid_scope",
+	"principal_not_found",
+	"principal_disabled",
+	"principal_expired",
+	"invalid_credential",
+	"credential_expired",
+	"policy_denied",
+	"agent_emergency_stop",
+	"read_only",
+	"rate_limited",
+	"concurrency_limit",
+	"execution_guard_unavailable",
+	"automation_loop",
+	"idempotency_conflict",
+	"idempotency_in_progress",
+	"command_scope_mismatch",
+	"version_conflict",
+	"lease_conflict",
+	"lease_expired",
+	"lease_not_owned",
+	"attachment_too_large",
+	"attachment_not_clean",
+	"invalid_attachment",
+	"invalid_attachment_name",
+	"nested_comment_reply",
+	"invalid_comment",
+	"outbox_replay_conflict",
+	"outbox_replay_expired",
+	"ticket_configuration_unavailable",
+	"request_type_version_required",
+	"ticket_form_validation_failed",
+	"not_found",
+	"internal_error",
 }
 
 type OutboxTarget struct {
@@ -3474,6 +3525,28 @@ func (s *AgentNativeService) claimPendingOutbox(
 						classStart,
 						limit,
 					)
+					if err := lockWebhookConfigsForDeliveryCandidates(
+						tx,
+						operation.Scope,
+						candidates,
+					); err != nil {
+						return err
+					}
+					if err := lockWebhookDeliveryCandidateRows(
+						tx,
+						operation.Scope,
+						candidates,
+					); err != nil {
+						return err
+					}
+					if err := lockWebhookSnapshotCandidateRows(
+						tx,
+						operation.Scope,
+						candidates,
+						batchCreatedBefore,
+					); err != nil {
+						return err
+					}
 					for index := range candidates {
 						candidate := &candidates[index]
 						claimNow := s.now().UTC()
@@ -3524,14 +3597,19 @@ func (s *AgentNativeService) claimPendingOutbox(
 						)
 						updateQuery =
 							applyCurrentProjectPolicy(updateQuery)
+						dispatchState := any(nil)
+						if candidate.DestinationType == "webhook" {
+							dispatchState = claimNow
+						}
 						result := updateQuery.
 							Updates(map[string]any{
-								"status":     models.OutboxDeliveryProcessing,
-								"attempts":   gorm.Expr("attempts + 1"),
-								"locked_at":  claimNow,
-								"locked_by":  workerID,
-								"lock_token": lockToken,
-								"updated_at": claimNow,
+								"status":              models.OutboxDeliveryProcessing,
+								"attempts":            gorm.Expr("attempts + 1"),
+								"locked_at":           claimNow,
+								"locked_by":           workerID,
+								"lock_token":          lockToken,
+								"dispatch_started_at": dispatchState,
+								"updated_at":          claimNow,
 							})
 						if result.Error != nil {
 							return result.Error
@@ -3556,6 +3634,14 @@ func (s *AgentNativeService) claimPendingOutbox(
 							return errors.New(
 								"outbox delivery event project scope mismatch",
 							)
+						}
+						if delivery.DestinationType == "webhook" {
+							if _, err := lockWebhookSnapshotForDelivery(
+								tx,
+								&delivery,
+							); err != nil {
+								return err
+							}
 						}
 						if _, err := OutboxClaimRefFromDelivery(
 							&delivery,
@@ -3762,6 +3848,31 @@ func (s *AgentNativeService) ReplayOutboxCommand(
 		if err := lockWebhookLifecycleProject(tx, projectScope); err != nil {
 			return err
 		}
+		anchor, err := loadOutboxDeliveryLockAnchor(
+			tx,
+			projectScope,
+			deliveryID,
+		)
+		if err != nil {
+			return err
+		}
+		if anchor.DestinationType == "webhook" {
+			if _, err := lockWebhookConfigForDestination(
+				tx,
+				projectScope,
+				anchor.DestinationID,
+			); err != nil {
+				if errors.Is(
+					err,
+					ErrWebhookOutboxLifecycleInvariant,
+				) {
+					commandResult.Disposition =
+						OutboxReplayExpired
+					return nil
+				}
+				return err
+			}
+		}
 		var delivery models.OutboxDelivery
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
 			"id = ? AND organization_id = ? AND project_id = ?",
@@ -3878,12 +3989,13 @@ func replayWebhookOutboxTx(
 			delivery,
 		).Where("expires_at <= ?", transactionNow).
 			Updates(map[string]any{
-				"status":       models.OutboxDeliveryExpired,
-				"expired_at":   transactionNow,
-				"delivered_at": nil,
-				"locked_at":    nil,
-				"locked_by":    "",
-				"lock_token":   nil,
+				"status":              models.OutboxDeliveryExpired,
+				"expired_at":          transactionNow,
+				"delivered_at":        nil,
+				"locked_at":           nil,
+				"locked_by":           "",
+				"lock_token":          nil,
+				"dispatch_started_at": nil,
 				"last_error": "webhook delivery credential deadline " +
 					"expired",
 				"updated_at": transactionNow,
@@ -3905,7 +4017,7 @@ func replayWebhookOutboxTx(
 		); err != nil {
 			return OutboxReplayResult{}, err
 		}
-		if err := clearOutboxEventPublication(
+		if err := preserveOutboxEventPublication(
 			tx,
 			scope,
 			delivery.EventID,
@@ -3920,16 +4032,17 @@ func replayWebhookOutboxTx(
 		delivery,
 	).Where("expires_at > ?", transactionNow).
 		Updates(map[string]any{
-			"status":          models.OutboxDeliveryPending,
-			"attempts":        0,
-			"next_attempt_at": transactionNow,
-			"locked_at":       nil,
-			"locked_by":       "",
-			"lock_token":      nil,
-			"last_error":      "",
-			"delivered_at":    nil,
-			"expired_at":      nil,
-			"updated_at":      transactionNow,
+			"status":              models.OutboxDeliveryPending,
+			"attempts":            0,
+			"next_attempt_at":     transactionNow,
+			"locked_at":           nil,
+			"locked_by":           "",
+			"lock_token":          nil,
+			"dispatch_started_at": nil,
+			"last_error":          "",
+			"delivered_at":        nil,
+			"expired_at":          nil,
+			"updated_at":          transactionNow,
 		})
 	if result.Error != nil {
 		return OutboxReplayResult{}, fmt.Errorf(
@@ -3987,6 +4100,11 @@ func exactOutboxReplayGeneration(
 	)
 	query = whereNullableReplayGeneration(
 		query,
+		"dispatch_started_at",
+		delivery.DispatchStartedAt,
+	)
+	query = whereNullableReplayGeneration(
+		query,
 		"delivered_at",
 		delivery.DeliveredAt,
 	)
@@ -4040,6 +4158,14 @@ type OutboxAttemptDeliverer interface {
 		delivery *models.OutboxDelivery,
 		event CloudEventEnvelope,
 	) OutboxAttemptResult
+}
+
+// WebhookDispatchStartBoundaryOwner marks a deliverer that performs the
+// durable prepared-to-started transition itself after its local preflight and
+// immediately before transport. Other deliverers receive a conservative
+// boundary immediately before their adapter invocation.
+type WebhookDispatchStartBoundaryOwner interface {
+	OwnsWebhookDispatchStartBoundary() bool
 }
 
 type OutboxDeliverFunc func(ctx context.Context, delivery *models.OutboxDelivery, event CloudEventEnvelope) error
@@ -4646,6 +4772,16 @@ func (s *AgentNativeService) performOutboxDeliveryAttempt(
 			release()
 		}()
 		event := CloudEventFromModel(delivery.Event)
+		if delivery.DestinationType == "webhook" &&
+			!delivererOwnsWebhookDispatchStart(deliverer) {
+			if err := s.beginGenericWebhookDispatch(
+				attemptCtx,
+				delivery,
+			); err != nil {
+				send(outboxAttemptNotStarted(err))
+				return
+			}
+		}
 		if richer, ok := deliverer.(OutboxAttemptDeliverer); ok {
 			result := richer.DeliverAttempt(
 				attemptCtx,
@@ -4701,6 +4837,53 @@ func (s *AgentNativeService) performOutboxDeliveryAttempt(
 			)
 		}
 	}
+}
+
+func delivererOwnsWebhookDispatchStart(
+	deliverer OutboxDeliverer,
+) bool {
+	owner, ok := deliverer.(WebhookDispatchStartBoundaryOwner)
+	return ok && owner.OwnsWebhookDispatchStartBoundary()
+}
+
+func (s *AgentNativeService) beginGenericWebhookDispatch(
+	ctx context.Context,
+	delivery *models.OutboxDelivery,
+) error {
+	if s == nil || s.db == nil || delivery == nil ||
+		delivery.Event == nil || delivery.ExpiresAt == nil {
+		return ErrWebhookOutboxAttemptRejected
+	}
+	claim, err := OutboxClaimRefFromDelivery(delivery)
+	if err != nil {
+		return ErrWebhookOutboxAttemptRejected
+	}
+	effectiveDeadline, ok := ctx.Deadline()
+	if !ok {
+		return ErrWebhookOutboxAttemptRejected
+	}
+	if delivery.ExpiresAt.Before(effectiveDeadline) {
+		effectiveDeadline = delivery.ExpiresAt.UTC()
+	}
+	gate := &NotificationService{db: s.db}
+	return gate.beginWebhookOutboxDispatch(
+		ctx,
+		WebhookOutboxAttemptClaim{
+			DeliveryID: delivery.ID,
+			EventID:    delivery.EventID,
+			Scope: models.ProjectScope{
+				OrganizationID: delivery.OrganizationID,
+				ProjectID:      delivery.ProjectID,
+			},
+			WorkerID:            claim.WorkerID,
+			LockToken:           claim.LockToken,
+			LockedAt:            claim.LockedAt,
+			AttemptGeneration:   claim.Attempts,
+			SnapshotDestination: delivery.DestinationID,
+			EffectiveDeadline:   effectiveDeadline.UTC(),
+			CredentialExpiresAt: delivery.ExpiresAt.UTC(),
+		},
+	)
 }
 
 func (s *AgentNativeService) normalizeLeaseTTL(ttl time.Duration) (time.Duration, error) {

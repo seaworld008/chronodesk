@@ -139,11 +139,31 @@ func (j *SimpleJWTManager) GenerateTokenPair(
 	platformRole PlatformRole,
 	sessionID string,
 ) (accessToken, refreshToken string, err error) {
-	return j.generateTokenPairAt(
+	return j.GenerateTokenPairAt(
 		userID,
 		platformRole,
 		sessionID,
 		time.Now(),
+	)
+}
+
+// GenerateTokenPairAt signs an initial human session at the caller-supplied
+// issue time. Registration uses this explicit timestamp to align JWT claims
+// with the durable refresh/history/attempt rows.
+func (j *SimpleJWTManager) GenerateTokenPairAt(
+	userID uint,
+	platformRole PlatformRole,
+	sessionID string,
+	issuedAt time.Time,
+) (accessToken, refreshToken string, err error) {
+	if issuedAt.IsZero() {
+		return "", "", errors.New("token issue time is required")
+	}
+	return j.generateTokenPairAt(
+		userID,
+		platformRole,
+		sessionID,
+		issuedAt.UTC(),
 		generateJTI(),
 		generateJTI(),
 	)
@@ -267,6 +287,7 @@ func (j *SimpleJWTManager) VerifyAccessToken(token string) (*Claims, error) {
 		Type:         payload.Type,
 		SessionID:    payload.SessionID,
 		Exp:          payload.Exp,
+		Nbf:          payload.Nbf,
 		Iat:          payload.Iat,
 		Jti:          payload.Jti,
 	}, nil
@@ -289,6 +310,7 @@ func (j *SimpleJWTManager) VerifyRefreshToken(token string) (*Claims, error) {
 		Type:         payload.Type,
 		SessionID:    payload.SessionID,
 		Exp:          payload.Exp,
+		Nbf:          payload.Nbf,
 		Iat:          payload.Iat,
 		Jti:          payload.Jti,
 	}, nil
@@ -430,6 +452,7 @@ func (j *SimpleJWTManager) ParseTokenClaims(token string) (*Claims, error) {
 		Type:         payload.Type,
 		SessionID:    payload.SessionID,
 		Exp:          payload.Exp,
+		Nbf:          payload.Nbf,
 		Iat:          payload.Iat,
 		Jti:          payload.Jti,
 	}, nil

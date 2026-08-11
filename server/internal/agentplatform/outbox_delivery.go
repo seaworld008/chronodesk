@@ -110,6 +110,10 @@ type NativeOutboxDeliverer struct {
 	a2aPushClient     a2aPushClientFactory
 }
 
+func (*NativeOutboxDeliverer) OwnsWebhookDispatchStartBoundary() bool {
+	return true
+}
+
 type a2aPushClientFactory func(
 	context.Context,
 	*url.URL,

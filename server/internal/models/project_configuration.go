@@ -1646,7 +1646,6 @@ func validateWorkflowDefinitions(
 		return errors.New("workflow must contain between 1 and 64 states")
 	}
 	stateKeys := make(map[string]WorkflowStateDefinition, len(states))
-	categoryStates := make(map[LifecycleCategory]string, len(states))
 	initialCount := 0
 	for _, state := range states {
 		if err := validateConfigurationKey(state.Key, "workflow state"); err != nil {
@@ -1666,15 +1665,6 @@ func validateWorkflowDefinitions(
 			return fmt.Errorf("duplicate workflow state %q", state.Key)
 		}
 		stateKeys[state.Key] = state
-		if existingState, exists := categoryStates[state.LifecycleCategory]; exists {
-			return fmt.Errorf(
-				"duplicate workflow lifecycle category %q in states %q and %q",
-				state.LifecycleCategory,
-				existingState,
-				state.Key,
-			)
-		}
-		categoryStates[state.LifecycleCategory] = state.Key
 		if state.IsInitial {
 			initialCount++
 		}
@@ -1710,18 +1700,27 @@ func validateWorkflowDefinitions(
 			return fmt.Errorf("duplicate workflow transition %q", transition.Key)
 		}
 		transitionKeys[transition.Key] = struct{}{}
-		if _, exists := stateKeys[transition.From]; !exists {
+		source, exists := stateKeys[transition.From]
+		if !exists {
 			return fmt.Errorf(
 				"workflow transition %q references unknown source state %q",
 				transition.Key,
 				transition.From,
 			)
 		}
-		if _, exists := stateKeys[transition.To]; !exists {
+		target, exists := stateKeys[transition.To]
+		if !exists {
 			return fmt.Errorf(
 				"workflow transition %q references unknown target state %q",
 				transition.Key,
 				transition.To,
+			)
+		}
+		if source.LifecycleCategory == target.LifecycleCategory {
+			return fmt.Errorf(
+				"workflow transition %q connects lifecycle category %q to itself",
+				transition.Key,
+				source.LifecycleCategory,
 			)
 		}
 		roles := make(map[ProjectRole]struct{}, len(transition.Roles))

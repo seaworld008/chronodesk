@@ -451,6 +451,55 @@ func TestPlatformConfigRejectsProtectedRuntimeControlKey(t *testing.T) {
 	}
 }
 
+func TestPlatformConfigGetHidesAdministratorVersionAnchor(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	const key = "agent.resource_version.handler-anchor"
+	if err := db.Create(&models.SystemConfig{
+		Key:       key,
+		Value:     "webhook/731",
+		ValueType: "string",
+		Category:  "security",
+		Version:   9,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	handler := NewConfigHandler(db)
+	router := gin.New()
+	router.GET("/configs/:key", handler.GetConfig)
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/configs/"+key,
+		nil,
+	)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"protected GET status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var payload struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+		Data    any    `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Success ||
+		payload.Error != "protected_config_key" ||
+		payload.Data != nil ||
+		strings.Contains(response.Body.String(), "webhook/731") {
+		t.Fatalf("protected GET response = %+v", payload)
+	}
+}
+
 func performConfigUpdate(
 	t *testing.T,
 	router http.Handler,

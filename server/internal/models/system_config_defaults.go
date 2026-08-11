@@ -1,11 +1,30 @@
 package models
 
+const SystemConfigKeySystemVersion = "system.version"
+
+// DefaultSystemVersionConfig returns the migration-owned build identity row.
+// It is deliberately separate from editable runtime configuration.
+func DefaultSystemVersionConfig(appVersion string) SystemConfig {
+	return SystemConfig{
+		Key:          SystemConfigKeySystemVersion,
+		Value:        appVersion,
+		ValueType:    "string",
+		Description:  "系统版本",
+		Category:     "system",
+		Group:        "basic",
+		IsRequired:   true,
+		IsActive:     true,
+		DefaultValue: appVersion,
+		Version:      1,
+	}
+}
+
 // DefaultSystemConfigs returns the required configuration catalog for a fresh
 // installation. Callers may safely mutate the returned slice.
 func DefaultSystemConfigs(appVersion string) []SystemConfig {
 	defaults := []SystemConfig{
 		{Key: "system.name", Value: "ChronoDesk", ValueType: "string", Description: "系统名称", Category: "system", Group: "basic"},
-		{Key: "system.version", Value: appVersion, ValueType: "string", Description: "系统版本", Category: "system", Group: "basic"},
+		DefaultSystemVersionConfig(appVersion),
 		{Key: "system.description", Value: "AI Agent 原生工单自动化平台", ValueType: "string", Description: "系统描述", Category: "system", Group: "basic"},
 		{Key: "system.timezone", Value: "Asia/Shanghai", ValueType: "string", Description: "系统时区", Category: "system", Group: "basic"},
 

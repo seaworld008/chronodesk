@@ -38,7 +38,6 @@ const (
 
 	adminIdempotencyRetention  = 24 * time.Hour
 	adminReplaySchema          = "chronodesk.admin-replay.v1"
-	adminVersionKeyPrefix      = "agent.resource_version."
 	adminRequestBodyContextKey = "chronodesk.admin.canonical_request_body"
 	adminMaximumRequestBytes   = 1 << 20
 )
@@ -718,6 +717,18 @@ func (h *AdminHandler) RegisterRoutes(group *gin.RouterGroup) {
 	group.GET("/events", h.ListDomainEventsPage)
 	group.GET("/outbox", h.ListOutboxPage)
 	group.POST("/outbox/:id/replay", h.ReplayOutbox)
+	group.GET(
+		"/webhooks/tombstones",
+		h.ListWebhookEmergencyTombstones,
+	)
+	group.GET(
+		"/webhooks/:webhookID/emergency-revoke",
+		h.GetWebhookEmergencyRevokePreflight,
+	)
+	group.POST(
+		"/webhooks/:webhookID/emergency-revoke",
+		h.EmergencyRevokeWebhook,
+	)
 	group.GET("/policy-decisions", h.ListPolicyDecisionsPage)
 }
 
@@ -1372,6 +1383,210 @@ func (h *AdminHandler) ReplayOutbox(c *gin.Context) {
 			}, nil
 		},
 	)
+}
+
+func (h *AdminHandler) EmergencyRevokeWebhook(c *gin.Context) {
+	webhookID, err := strconv.ParseUint(
+		strings.TrimSpace(c.Param("webhookID")),
+		10,
+		32,
+	)
+	if err != nil || webhookID == 0 {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Webhook ID must be a positive integer",
+			false,
+		)
+		return
+	}
+	configID := uint(webhookID)
+	subject := services.WebhookAdminSubject(configID)
+	h.executeAdminMutation(
+		c,
+		adminMutationOptions{
+			Status:              http.StatusOK,
+			PreconditionSubject: subject,
+			Request: gin.H{
+				"webhook_id": configID,
+			},
+		},
+		func(
+			txCtx context.Context,
+			_ *gorm.DB,
+		) (adminMutationResult, error) {
+			revoke, err := h.native.EmergencyRevokeWebhook(
+				txCtx,
+				configID,
+			)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			return adminMutationResult{
+				Data:       revoke,
+				EventName:  "webhook.emergency_revoked",
+				Subject:    subject,
+				ResourceID: strconv.FormatUint(webhookID, 10),
+				ChangedFields: []string{
+					"status",
+					"delivery_status",
+					"snapshot_credentials",
+				},
+				PublicValues: gin.H{
+					"config_id":               revoke.ConfigID,
+					"status":                  revoke.Status,
+					"expired_deliveries":      revoke.ExpiredDeliveries,
+					"in_flight_deliveries":    revoke.InFlightDeliveries,
+					"shredded_snapshots":      revoke.ShreddedSnapshots,
+					"credential_shred_reason": revoke.CredentialShredReason,
+				},
+			}, nil
+		},
+	)
+}
+
+func (h *AdminHandler) GetWebhookEmergencyRevokePreflight(
+	c *gin.Context,
+) {
+	webhookID, err := strconv.ParseUint(
+		strings.TrimSpace(c.Param("webhookID")),
+		10,
+		32,
+	)
+	if err != nil || webhookID == 0 {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Webhook ID must be a positive integer",
+			false,
+		)
+		return
+	}
+	if _, ok := h.requireProjectScope(c); !ok {
+		return
+	}
+	if h.native == nil {
+		WriteProblem(
+			c,
+			http.StatusServiceUnavailable,
+			ProblemServiceUnavailable,
+			"Agent-native service is unavailable",
+			true,
+		)
+		return
+	}
+	preflight, err := h.native.GetWebhookEmergencyRevokePreflight(
+		c.Request.Context(),
+		uint(webhookID),
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	c.Header(
+		"ETag",
+		httpcontract.FormatETag(preflight.ResourceVersion),
+	)
+	c.Header("Cache-Control", "no-store")
+	WriteData(c, http.StatusOK, preflight, Meta{})
+}
+
+func (h *AdminHandler) ListWebhookEmergencyTombstones(
+	c *gin.Context,
+) {
+	if _, ok := h.requireProjectScope(c); !ok {
+		return
+	}
+	page, pageSize, ok := parseWebhookEmergencyTombstonePage(c)
+	if !ok {
+		return
+	}
+	if h.native == nil {
+		WriteProblem(
+			c,
+			http.StatusServiceUnavailable,
+			ProblemServiceUnavailable,
+			"Agent-native service is unavailable",
+			true,
+		)
+		return
+	}
+	result, err := h.native.ListWebhookEmergencyTombstones(
+		c.Request.Context(),
+		page,
+		pageSize,
+	)
+	if err != nil {
+		if errors.Is(
+			err,
+			services.ErrInvalidWebhookEmergencyTombstoneQuery,
+		) {
+			WriteProblem(
+				c,
+				http.StatusBadRequest,
+				ProblemInvalidRequest,
+				"page must be positive and page_size must be between 1 and 100",
+				false,
+			)
+			return
+		}
+		h.writeNativeError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	WriteData(c, http.StatusOK, result, Meta{})
+}
+
+func parseWebhookEmergencyTombstonePage(
+	c *gin.Context,
+) (int, int, bool) {
+	for key, values := range c.Request.URL.Query() {
+		if (key != "page" && key != "page_size") ||
+			len(values) != 1 {
+			WriteProblem(
+				c,
+				http.StatusBadRequest,
+				ProblemInvalidRequest,
+				"Only page and page_size are supported",
+				false,
+			)
+			return 0, 0, false
+		}
+	}
+	page := 1
+	pageSize := DefaultAdminListSize
+	var err error
+	if value := strings.TrimSpace(c.Query("page")); value != "" {
+		page, err = strconv.Atoi(value)
+		if err != nil || page < 1 {
+			WriteProblem(
+				c,
+				http.StatusBadRequest,
+				ProblemInvalidRequest,
+				"page must be a positive integer",
+				false,
+			)
+			return 0, 0, false
+		}
+	}
+	if value := strings.TrimSpace(c.Query("page_size")); value != "" {
+		pageSize, err = strconv.Atoi(value)
+		if err != nil ||
+			pageSize < 1 ||
+			pageSize > services.MaxWebhookEmergencyTombstonePageSize {
+			WriteProblem(
+				c,
+				http.StatusBadRequest,
+				ProblemInvalidRequest,
+				"page_size must be between 1 and 100",
+				false,
+			)
+			return 0, 0, false
+		}
+	}
+	return page, pageSize, true
 }
 
 func (h *AdminHandler) ForceReleaseLease(c *gin.Context) {
@@ -2036,13 +2251,7 @@ func adminResourceVersionKey(
 	scope models.ProjectScope,
 	subject string,
 ) string {
-	scopeSubject := strconv.FormatUint(uint64(scope.OrganizationID), 10) +
-		"/" +
-		strconv.FormatUint(uint64(scope.ProjectID), 10) +
-		"/" +
-		strings.TrimSpace(subject)
-	sum := sha256.Sum256([]byte(scopeSubject))
-	return adminVersionKeyPrefix + base64.RawURLEncoding.EncodeToString(sum[:])
+	return services.AdminResourceVersionKey(scope, subject)
 }
 
 func (h *AdminHandler) currentAdminResourceVersion(
@@ -2270,6 +2479,7 @@ func adminNativeProblem(
 	switch {
 	case errors.Is(err, services.ErrPrincipalNotFound),
 		errors.Is(err, services.ErrProjectNotFound),
+		errors.Is(err, services.ErrWebhookConfigNotFound),
 		errors.Is(err, gorm.ErrRecordNotFound):
 		status, code = http.StatusNotFound, ProblemNotFound
 	case errors.Is(err, services.ErrProjectAccessDenied):

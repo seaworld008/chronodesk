@@ -78,6 +78,12 @@ func NewProjectRuntime(cfg *config.Config) (*Database, error) {
 			err,
 		))
 	}
+	if err := ValidateWebhookDispatchRuntimePrivileges(db); err != nil {
+		return closeOnError(fmt.Errorf(
+			"PostgreSQL Webhook dispatch runtime privilege validation failed: %w",
+			err,
+		))
+	}
 	if err := InstallProjectScopeTransactionRouting(db); err != nil {
 		return closeOnError(err)
 	}

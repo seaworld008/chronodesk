@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: 340d0cf947642aec27b46eaf826f2af3ecd3aeb3de4ccb2bf1bbb5d888d645a4.
+ * Contract SHA-256: 387f66a99cc8e34a9ca8d612f194e9f0fa2422abe88fe1a2e70c6338b1257afe.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -1555,6 +1555,45 @@ export type WebhookConfig = {
     total_failed: number
     created_by: number
     updated_by?: number
+    resource_version: ResourceVersion
+}
+
+export type WebhookEmergencyRevokeResult = {
+    config_id: number
+    status: "disabled"
+    expired_deliveries: number
+    in_flight_deliveries: number
+    shredded_snapshots: number
+    credential_shred_reason: "revoked"
+}
+
+export type WebhookEmergencyRevokePreflight = {
+    config_id: number
+    status: WebhookStatus
+    deleted: boolean
+    emergency_revoked: boolean
+    resource_version: ResourceVersion
+}
+
+export type WebhookEmergencyRevokePreflightEnvelope = Envelope & {
+    data?: WebhookEmergencyRevokePreflight
+}
+
+export type WebhookEmergencyTombstonePage = {
+    items: Array<WebhookEmergencyRevokePreflight>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type WebhookEmergencyTombstonePageEnvelope = Envelope & {
+    data?: WebhookEmergencyTombstonePage
+}
+
+export type WebhookEmergencyRevokeEnvelope = Envelope & {
+    data?: WebhookEmergencyRevokeResult
+    receipt: Receipt
 }
 
 export type WebhookPage = {
@@ -1832,9 +1871,10 @@ export type Problem = {
     title: string
     status: number
     detail?: string
-    code: "invalid_request" | "precondition_required" | "unauthorized" | "invalid_actor" | "invalid_scope" | "principal_not_found" | "principal_disabled" | "principal_expired" | "invalid_credential" | "credential_expired" | "insufficient_scope" | "policy_denied" | "agent_emergency_stop" | "read_only" | "automation_loop" | "not_found" | "version_conflict" | "lease_conflict" | "lease_expired" | "lease_not_owned" | "idempotency_conflict" | "idempotency_in_progress" | "command_scope_mismatch" | "outbox_replay_conflict" | "outbox_replay_expired" | "rate_limited" | "concurrency_limit" | "attachment_rejected" | "attachment_too_large" | "attachment_not_clean" | "invalid_attachment_name" | "service_unavailable" | "internal_error"
+    code: "invalid_request" | "invalid_status_transition" | "precondition_required" | "unauthorized" | "invalid_actor" | "invalid_scope" | "principal_not_found" | "principal_disabled" | "principal_expired" | "invalid_credential" | "credential_expired" | "insufficient_scope" | "policy_denied" | "agent_emergency_stop" | "read_only" | "automation_loop" | "not_found" | "version_conflict" | "webhook_emergency_revoked" | "lease_conflict" | "lease_expired" | "lease_not_owned" | "idempotency_conflict" | "idempotency_in_progress" | "command_scope_mismatch" | "outbox_replay_conflict" | "outbox_replay_expired" | "rate_limited" | "concurrency_limit" | "attachment_rejected" | "attachment_too_large" | "attachment_not_clean" | "invalid_attachment_name" | "service_unavailable" | "internal_error"
     request_id: string
     retryable: boolean
+    details?: unknown
 }
 
 export type ServicePrincipalCreate = {
@@ -4299,6 +4339,32 @@ export type ReplayOutboxDeliveryV2OperationQuery = Record<string, never>
 export type ReplayOutboxDeliveryV2OperationRequest = never
 export type ReplayOutboxDeliveryV2OperationResponse = ReplayEnvelope
 
+export type ListProjectWebhookEmergencyTombstonesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectWebhookEmergencyTombstonesOperationQuery = {
+    page?: number
+    page_size?: number
+}
+export type ListProjectWebhookEmergencyTombstonesOperationRequest = never
+export type ListProjectWebhookEmergencyTombstonesOperationResponse = WebhookEmergencyTombstonePageEnvelope
+
+export type GetProjectWebhookEmergencyRevokePreflightOperationPathParameters = {
+    projectKey: string
+    webhookID: number
+}
+export type GetProjectWebhookEmergencyRevokePreflightOperationQuery = Record<string, never>
+export type GetProjectWebhookEmergencyRevokePreflightOperationRequest = never
+export type GetProjectWebhookEmergencyRevokePreflightOperationResponse = WebhookEmergencyRevokePreflightEnvelope
+
+export type EmergencyRevokeProjectWebhookOperationPathParameters = {
+    projectKey: string
+    webhookID: number
+}
+export type EmergencyRevokeProjectWebhookOperationQuery = Record<string, never>
+export type EmergencyRevokeProjectWebhookOperationRequest = never
+export type EmergencyRevokeProjectWebhookOperationResponse = WebhookEmergencyRevokeEnvelope
+
 export type ListAgentDomainEventsOperationPathParameters = {
     projectKey: string
 }
@@ -5686,6 +5752,27 @@ export const humanApiOperations = {
         requestBody: "none",
         listStrategy: "bounded",
     },
+    listProjectWebhookEmergencyTombstones: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/agents/webhooks/tombstones",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    getProjectWebhookEmergencyRevokePreflight: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "bounded",
+    },
+    emergencyRevokeProjectWebhook: {
+        method: "POST",
+        path: "/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "bounded",
+    },
     listAgentDomainEvents: {
         method: "GET",
         path: "/projects/{projectKey}/admin/agents/events",
@@ -6761,6 +6848,24 @@ export interface HumanApiOperationTypes {
         request: ReplayOutboxDeliveryV2OperationRequest
         response: ReplayOutboxDeliveryV2OperationResponse
     }
+    listProjectWebhookEmergencyTombstones: {
+        pathParameters: ListProjectWebhookEmergencyTombstonesOperationPathParameters
+        query: ListProjectWebhookEmergencyTombstonesOperationQuery
+        request: ListProjectWebhookEmergencyTombstonesOperationRequest
+        response: ListProjectWebhookEmergencyTombstonesOperationResponse
+    }
+    getProjectWebhookEmergencyRevokePreflight: {
+        pathParameters: GetProjectWebhookEmergencyRevokePreflightOperationPathParameters
+        query: GetProjectWebhookEmergencyRevokePreflightOperationQuery
+        request: GetProjectWebhookEmergencyRevokePreflightOperationRequest
+        response: GetProjectWebhookEmergencyRevokePreflightOperationResponse
+    }
+    emergencyRevokeProjectWebhook: {
+        pathParameters: EmergencyRevokeProjectWebhookOperationPathParameters
+        query: EmergencyRevokeProjectWebhookOperationQuery
+        request: EmergencyRevokeProjectWebhookOperationRequest
+        response: EmergencyRevokeProjectWebhookOperationResponse
+    }
     listAgentDomainEvents: {
         pathParameters: ListAgentDomainEventsOperationPathParameters
         query: ListAgentDomainEventsOperationQuery
@@ -7430,6 +7535,12 @@ export const humanApiRoutes = {
         humanApiRoute("listAgentOutboxDeliveries", pathParameters, query),
     replayOutboxDeliveryV2: (pathParameters: ReplayOutboxDeliveryV2OperationPathParameters, query: ReplayOutboxDeliveryV2OperationQuery = {}) =>
         humanApiRoute("replayOutboxDeliveryV2", pathParameters, query),
+    listProjectWebhookEmergencyTombstones: (pathParameters: ListProjectWebhookEmergencyTombstonesOperationPathParameters, query: ListProjectWebhookEmergencyTombstonesOperationQuery = {}) =>
+        humanApiRoute("listProjectWebhookEmergencyTombstones", pathParameters, query),
+    getProjectWebhookEmergencyRevokePreflight: (pathParameters: GetProjectWebhookEmergencyRevokePreflightOperationPathParameters, query: GetProjectWebhookEmergencyRevokePreflightOperationQuery = {}) =>
+        humanApiRoute("getProjectWebhookEmergencyRevokePreflight", pathParameters, query),
+    emergencyRevokeProjectWebhook: (pathParameters: EmergencyRevokeProjectWebhookOperationPathParameters, query: EmergencyRevokeProjectWebhookOperationQuery = {}) =>
+        humanApiRoute("emergencyRevokeProjectWebhook", pathParameters, query),
     listAgentDomainEvents: (pathParameters: ListAgentDomainEventsOperationPathParameters, query: ListAgentDomainEventsOperationQuery = {}) =>
         humanApiRoute("listAgentDomainEvents", pathParameters, query),
     listAgentPolicyDecisions: (pathParameters: ListAgentPolicyDecisionsOperationPathParameters, query: ListAgentPolicyDecisionsOperationQuery = {}) =>

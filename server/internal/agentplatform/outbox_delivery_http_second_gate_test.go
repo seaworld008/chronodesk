@@ -92,6 +92,158 @@ func TestWebhookOutboxSecondGateRejectsShreddedSnapshotBeforeHTTP(
 	}
 }
 
+func TestWebhookOutboxImmutableSnapshotSurvivesOrdinarySoftDelete(
+	t *testing.T,
+) {
+	fixture := newHTTPSecondGateFixture(t, time.Now().Add(time.Minute))
+	deleteResult := fixture.db.Delete(
+		&models.WebhookConfig{},
+		fixture.snapshot.ConfigID,
+	)
+	if deleteResult.Error != nil || deleteResult.RowsAffected != 1 {
+		t.Fatalf(
+			"soft delete Webhook config: rows=%d err=%v",
+			deleteResult.RowsAffected,
+			deleteResult.Error,
+		)
+	}
+	var deleted models.WebhookConfig
+	if err := fixture.db.Unscoped().First(
+		&deleted,
+		fixture.snapshot.ConfigID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !deleted.DeletedAt.Valid {
+		t.Fatal("ordinary delete did not retain a soft-deleted lock anchor")
+	}
+
+	var (
+		clientCreations atomic.Int32
+		httpAttempts    atomic.Int32
+	)
+	deliverer := fixture.deliverer(t, func(
+		context.Context,
+		*url.URL,
+		time.Duration,
+	) (*http.Client, error) {
+		clientCreations.Add(1)
+		return &http.Client{Transport: httpSecondGateRoundTripper(
+			func(*http.Request) (*http.Response, error) {
+				httpAttempts.Add(1)
+				return httpSecondGateNoContentResponse(), nil
+			},
+		)}, nil
+	})
+
+	result := fixture.deliverAttempt(
+		t,
+		deliverer,
+		time.Now().Add(time.Minute),
+	)
+	if result.Kind != services.OutboxAttemptKnownSuccess ||
+		result.Err != nil ||
+		clientCreations.Load() != 1 ||
+		httpAttempts.Load() != 1 {
+		t.Fatalf(
+			"soft-deleted immutable delivery result=%+v clients=%d HTTP=%d",
+			result,
+			clientCreations.Load(),
+			httpAttempts.Load(),
+		)
+	}
+}
+
+func TestWebhookEmergencyRevokeBlocksBothHTTPGates(
+	t *testing.T,
+) {
+	fixture := newHTTPSecondGateFixture(t, time.Now().Add(time.Minute))
+	if err := fixture.db.AutoMigrate(
+		&models.ProjectMembership{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	var config models.WebhookConfig
+	if err := fixture.db.First(
+		&config,
+		fixture.snapshot.ConfigID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Create(&models.ProjectMembership{
+		ProjectID: fixture.scope.ProjectID,
+		UserID:    config.CreatedBy,
+		Role:      models.ProjectRoleAdmin,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	adminContext, err := services.WithOperationContext(
+		context.Background(),
+		services.OperationContext{
+			Scope:  fixture.scope,
+			Actor:  models.HumanActor(config.CreatedBy),
+			Source: services.SourceProtocolHumanREST,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoke, err := services.NewAgentNativeService(
+		fixture.db,
+	).EmergencyRevokeWebhook(
+		adminContext,
+		config.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoke.InFlightDeliveries != 0 ||
+		revoke.ShreddedSnapshots != 1 ||
+		revoke.ExpiredDeliveries != 1 {
+		t.Fatalf("emergency revoke result = %+v", revoke)
+	}
+
+	var (
+		clientCreations atomic.Int32
+		httpAttempts    atomic.Int32
+	)
+	deliverer := fixture.deliverer(t, func(
+		context.Context,
+		*url.URL,
+		time.Duration,
+	) (*http.Client, error) {
+		clientCreations.Add(1)
+		return &http.Client{Transport: httpSecondGateRoundTripper(
+			func(*http.Request) (*http.Response, error) {
+				httpAttempts.Add(1)
+				return httpSecondGateNoContentResponse(), nil
+			},
+		)}, nil
+	})
+
+	result := fixture.deliverAttempt(
+		t,
+		deliverer,
+		time.Now().Add(time.Minute),
+	)
+	if result.Kind != services.OutboxAttemptKnownFailure ||
+		!errors.Is(
+			result.Err,
+			services.ErrWebhookOutboxAttemptRejected,
+		) ||
+		clientCreations.Load() != 0 ||
+		httpAttempts.Load() != 0 {
+		t.Fatalf(
+			"revoked delivery result=%+v clients=%d HTTP=%d",
+			result,
+			clientCreations.Load(),
+			httpAttempts.Load(),
+		)
+	}
+}
+
 func TestWebhookOutboxFirstGateRejectsMismatchedPairBeforeClientCreation(
 	t *testing.T,
 ) {
@@ -523,7 +675,10 @@ func TestWebhookOutboxConfiguredDeadlineRejectsLateCleanEOF(
 	if finalizeErr != nil {
 		t.Fatalf("finalize late EOF: %v", finalizeErr)
 	}
-	attemptDeadline := <-requestDeadline
+	attemptDeadline := awaitHTTPSecondGateRequestDeadline(
+		t,
+		requestDeadline,
+	)
 	if result.Kind == services.OutboxAttemptKnownSuccess {
 		t.Fatalf(
 			"late EOF at %s returned known success: %+v",
@@ -576,7 +731,10 @@ func TestWebhookOutboxTimelyEOFSucceedsAfterLateFinalize(
 	})
 	workerDeadline := time.Now().Add(time.Minute)
 	result := fixture.deliverAttempt(t, deliverer, workerDeadline)
-	attemptDeadline := <-requestDeadline
+	attemptDeadline := awaitHTTPSecondGateRequestDeadline(
+		t,
+		requestDeadline,
+	)
 	if result.Kind != services.OutboxAttemptKnownSuccess ||
 		result.CompletedAt.IsZero() ||
 		result.CompletedAt.After(attemptDeadline) {
@@ -919,6 +1077,20 @@ func httpSecondGateNoContentResponse() *http.Response {
 	}
 }
 
+func awaitHTTPSecondGateRequestDeadline(
+	t *testing.T,
+	deadlines <-chan time.Time,
+) time.Time {
+	t.Helper()
+	select {
+	case deadline := <-deadlines:
+		return deadline
+	case <-time.After(time.Second):
+		t.Fatal("HTTP transport did not report its request deadline")
+		return time.Time{}
+	}
+}
+
 func newHTTPSecondGateFixture(
 	t *testing.T,
 	credentialDeadline time.Time,
@@ -1044,12 +1216,13 @@ func newHTTPSecondGateFixture(
 	if err := db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", delivery.ID).
 		Updates(map[string]any{
-			"status":     models.OutboxDeliveryProcessing,
-			"attempts":   1,
-			"locked_at":  lockedAt,
-			"locked_by":  "http-second-gate-worker",
-			"lock_token": lockToken,
-			"expires_at": credentialDeadline,
+			"status":              models.OutboxDeliveryProcessing,
+			"attempts":            1,
+			"locked_at":           lockedAt,
+			"locked_by":           "http-second-gate-worker",
+			"lock_token":          lockToken,
+			"dispatch_started_at": lockedAt,
+			"expires_at":          credentialDeadline,
 		}).Error; err != nil {
 		t.Fatal(err)
 	}

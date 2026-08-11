@@ -33,11 +33,12 @@ func TestWebhookOutboxClaimClassesRemainFairAtLimitOne(t *testing.T) {
 	if err := fixture.db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", processing.ID).
 		Updates(map[string]any{
-			"status":     models.OutboxDeliveryProcessing,
-			"attempts":   1,
-			"locked_at":  staleAt,
-			"locked_by":  "stale-claim-class-worker",
-			"lock_token": staleToken,
+			"status":              models.OutboxDeliveryProcessing,
+			"attempts":            1,
+			"locked_at":           staleAt,
+			"locked_by":           "stale-claim-class-worker",
+			"lock_token":          staleToken,
+			"dispatch_started_at": staleAt,
 		}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -257,12 +258,13 @@ func TestProcessOutboxBatchPreservesCommittedPartialClaimsAfterProjectError(
 	if err := fixture.db.Exec(
 		`UPDATE outbox_deliveries
 		 SET status = ?, attempts = max_attempts, locked_at = ?,
-		     locked_by = ?, lock_token = ?
+		     locked_by = ?, lock_token = ?, dispatch_started_at = ?
 		 WHERE id = ?`,
 		models.OutboxDeliveryProcessing,
 		now.Add(-2*time.Minute),
 		"stale-partial-worker",
 		"0198a5d0-0000-7000-8000-000000000001",
+		now.Add(-2*time.Minute),
 		staleDelivery.ID,
 	).Error; err != nil {
 		t.Fatal(err)
@@ -518,6 +520,9 @@ func TestProcessOutboxBatchBoundsRawCandidatesAcrossProjects(
 					"locked_at": now.Add(
 						-2 * time.Minute,
 					),
+					"dispatch_started_at": now.Add(
+						-2 * time.Minute,
+					),
 					"locked_by": fmt.Sprintf(
 						"raw-budget-stale-%d",
 						index,
@@ -662,11 +667,12 @@ func TestProcessOutboxBatchBoundsRawCandidatesAcrossProjects(
 		if err := fixture.db.Model(&models.OutboxDelivery{}).
 			Where("id = ?", stale.ID).
 			Updates(map[string]any{
-				"status":     models.OutboxDeliveryProcessing,
-				"attempts":   stale.MaxAttempts,
-				"locked_at":  now.Add(-2 * time.Minute),
-				"locked_by":  "raw-budget-mixed-stale",
-				"lock_token": "0198a5d0-0000-7000-8000-000000000099",
+				"status":              models.OutboxDeliveryProcessing,
+				"attempts":            stale.MaxAttempts,
+				"locked_at":           now.Add(-2 * time.Minute),
+				"locked_by":           "raw-budget-mixed-stale",
+				"lock_token":          "0198a5d0-0000-7000-8000-000000000099",
+				"dispatch_started_at": now.Add(-2 * time.Minute),
 			}).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -863,7 +869,8 @@ func TestProcessOutboxBatchRepeatsStrictBatchCutoffInCandidateAndCAS(
 	var (
 		mu                   sync.Mutex
 		rawHasCutoff         bool
-		secondaryHasCutoff   bool
+		snapshotLockQueries  int
+		snapshotLockMissing  int
 		claimUpdateHasCutoff bool
 	)
 	const (
@@ -880,8 +887,10 @@ func TestProcessOutboxBatchRepeatsStrictBatchCutoffInCandidateAndCAS(
 			}
 			if strings.Contains(sql, "id in (") &&
 				strings.Contains(sql, "webhook_delivery_snapshots") {
-				secondaryHasCutoff =
-					strings.Contains(sql, "created_at < ?")
+				snapshotLockQueries++
+				if !strings.Contains(sql, "created_at < ?") {
+					snapshotLockMissing++
+				}
 			}
 		}); err != nil {
 		t.Fatal(err)
@@ -922,12 +931,14 @@ func TestProcessOutboxBatchRepeatsStrictBatchCutoffInCandidateAndCAS(
 	mu.Lock()
 	defer mu.Unlock()
 	if !rawHasCutoff ||
-		!secondaryHasCutoff ||
+		snapshotLockQueries == 0 ||
+		snapshotLockMissing != 0 ||
 		!claimUpdateHasCutoff {
 		t.Fatalf(
-			"strict cutoff raw=%t secondary=%t CAS=%t",
+			"strict cutoff raw=%t snapshot_locks=%d missing=%d CAS=%t",
 			rawHasCutoff,
-			secondaryHasCutoff,
+			snapshotLockQueries,
+			snapshotLockMissing,
 			claimUpdateHasCutoff,
 		)
 	}

@@ -187,6 +187,155 @@ func (fixture *webhookOutboxLifecycleFixture) claim(
 	return claimed[0], ref
 }
 
+func (fixture *webhookOutboxLifecycleFixture) startDispatch(
+	t *testing.T,
+	deliveryID string,
+) time.Time {
+	t.Helper()
+	var delivery models.OutboxDelivery
+	if err := fixture.db.Where(
+		"id = ?",
+		deliveryID,
+	).Take(&delivery).Error; err != nil {
+		t.Fatal(err)
+	}
+	if delivery.LockedAt == nil {
+		t.Fatalf("dispatch start delivery has no claim lock: %+v", delivery)
+	}
+	startedAt := webhookDispatchStartedAt(
+		fixture.service.now().UTC().Add(time.Millisecond),
+		delivery.LockedAt.UTC(),
+	)
+	result := fixture.db.Model(&models.OutboxDelivery{}).
+		Where(
+			"id = ? AND dispatch_started_at = locked_at",
+			deliveryID,
+		).
+		Update("dispatch_started_at", startedAt)
+	if result.Error != nil {
+		t.Fatal(result.Error)
+	}
+	if result.RowsAffected != 1 {
+		t.Fatalf(
+			"dispatch start rows = %d for %s",
+			result.RowsAffected,
+			deliveryID,
+		)
+	}
+	return startedAt
+}
+
+func TestWebhookFinalizeNotStartedRequiresPreparedDispatch(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name    string
+		marker  func(*time.Time) *time.Time
+		wantErr bool
+	}{
+		{
+			name: "prepared",
+			marker: func(lockedAt *time.Time) *time.Time {
+				value := lockedAt.UTC()
+				return &value
+			},
+		},
+		{
+			name: "legacy_unknown",
+			marker: func(*time.Time) *time.Time {
+				return nil
+			},
+			wantErr: true,
+		},
+		{
+			name: "started",
+			marker: func(lockedAt *time.Time) *time.Time {
+				value := lockedAt.UTC().Add(time.Millisecond)
+				return &value
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			fixture := newWebhookOutboxLifecycleFixture(t, now)
+			claimed, claim := fixture.claim(t, "not-started-"+test.name)
+			marker := test.marker(claimed.LockedAt)
+			if err := fixture.db.Model(&models.OutboxDelivery{}).
+				Where("id = ?", claimed.ID).
+				Update("dispatch_started_at", marker).Error; err != nil {
+				t.Fatal(err)
+			}
+			result, err := fixture.service.FinalizeOutboxAttempt(
+				fixture.worker,
+				claim,
+				outboxAttemptNotStarted(
+					errors.New("transport was not entered"),
+				),
+			)
+			if test.wantErr {
+				if !errors.Is(
+					err,
+					ErrWebhookOutboxLifecycleInvariant,
+				) {
+					t.Fatalf("not-started error = %v", err)
+				}
+			} else if err != nil ||
+				result.Status != models.OutboxDeliveryFailed {
+				t.Fatalf(
+					"prepared not-started result=%+v err=%v",
+					result,
+					err,
+				)
+			}
+			var current models.OutboxDelivery
+			if err := fixture.db.First(
+				&current,
+				"id = ?",
+				claimed.ID,
+			).Error; err != nil {
+				t.Fatal(err)
+			}
+			if test.wantErr {
+				if current.Status != models.OutboxDeliveryProcessing ||
+					current.Attempts != 1 {
+					t.Fatalf(
+						"rejected not-started mutated delivery: %+v",
+						current,
+					)
+				}
+				if marker == nil {
+					if current.DispatchStartedAt != nil {
+						t.Fatalf(
+							"legacy marker changed: %+v",
+							current,
+						)
+					}
+				} else if current.DispatchStartedAt == nil ||
+					!current.DispatchStartedAt.Equal(
+						marker.UTC(),
+					) {
+					t.Fatalf(
+						"dispatch marker changed: %+v",
+						current,
+					)
+				}
+				return
+			}
+			if current.Status != models.OutboxDeliveryFailed ||
+				current.Attempts != 0 ||
+				current.DispatchStartedAt != nil ||
+				current.LockedAt != nil ||
+				current.LockToken != nil {
+				t.Fatalf(
+					"prepared not-started was not safely released: %+v",
+					current,
+				)
+			}
+		})
+	}
+}
+
 func loadWebhookLifecycleRows(
 	t *testing.T,
 	fixture *webhookOutboxLifecycleFixture,
@@ -222,6 +371,200 @@ func assertSnapshotShredded(
 	}
 }
 
+func setWebhookLifecyclePublicationHistory(
+	t *testing.T,
+	fixture *webhookOutboxLifecycleFixture,
+	publishedAt *time.Time,
+) {
+	t.Helper()
+	if publishedAt != nil {
+		deliveredAt := publishedAt.UTC()
+		mixed := models.OutboxDelivery{
+			ID: "00000000-0000-7000-8001-" +
+				fixture.event.ID[len(fixture.event.ID)-12:],
+			OrganizationID:  fixture.scope.OrganizationID,
+			ProjectID:       fixture.scope.ProjectID,
+			EventID:         fixture.event.ID,
+			DestinationType: "event_stream",
+			DestinationID:   "immutable-publication-history",
+			Status:          models.OutboxDeliverySucceeded,
+			MaxAttempts:     1,
+			NextAttemptAt:   deliveredAt,
+			DeliveredAt:     &deliveredAt,
+		}
+		if err := fixture.db.Create(&mixed).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fixture.db.Model(&models.DomainEvent{}).
+		Where("id = ?", fixture.event.ID).
+		Update("published_at", publishedAt).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertWebhookLifecyclePublicationHistory(
+	t *testing.T,
+	fixture *webhookOutboxLifecycleFixture,
+	want *time.Time,
+) {
+	t.Helper()
+	var event models.DomainEvent
+	if err := fixture.db.First(
+		&event,
+		"id = ?",
+		fixture.event.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if want == nil {
+		if event.PublishedAt != nil {
+			t.Fatalf("unpublished event gained published_at %v", event.PublishedAt)
+		}
+		return
+	}
+	if event.PublishedAt == nil || !event.PublishedAt.Equal(want.UTC()) {
+		t.Fatalf(
+			"published event history = %v, want %v",
+			event.PublishedAt,
+			want.UTC(),
+		)
+	}
+}
+
+func TestPostRevokeProcessingFinalizePreservesDomainEventPublicationHistory(
+	t *testing.T,
+) {
+	for _, published := range []bool{false, true} {
+		t.Run(fmt.Sprintf("published_%t", published), func(t *testing.T) {
+			now := time.Date(2026, time.August, 11, 12, 0, 0, 0, time.UTC)
+			fixture := newWebhookOutboxLifecycleFixture(t, now)
+			claimed, claim := fixture.claim(t, "post-revoke-finalize")
+			fixture.startDispatch(t, claimed.ID)
+			var publishedAt *time.Time
+			if published {
+				value := now.Add(-time.Hour)
+				publishedAt = &value
+			}
+			setWebhookLifecyclePublicationHistory(t, fixture, publishedAt)
+			if _, err := fixture.service.EmergencyRevokeWebhook(
+				webhookEmergencyAdminContext(
+					t,
+					fixture,
+					models.ProjectRoleAdmin,
+				),
+				fixture.config.ID,
+			); err != nil {
+				t.Fatal(err)
+			}
+			result, err := fixture.service.FinalizeOutboxAttempt(
+				fixture.worker,
+				claim,
+				OutboxKnownFailure(errors.New("safe post-revoke failure")),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != models.OutboxDeliveryExpired {
+				t.Fatalf("post-revoke finalize status = %s", result.Status)
+			}
+			assertWebhookLifecyclePublicationHistory(
+				t,
+				fixture,
+				publishedAt,
+			)
+		})
+	}
+}
+
+func TestPostRevokeProcessingCleanupPreservesDomainEventPublicationHistory(
+	t *testing.T,
+) {
+	for _, published := range []bool{false, true} {
+		t.Run(fmt.Sprintf("published_%t", published), func(t *testing.T) {
+			now := time.Date(2026, time.August, 11, 13, 0, 0, 0, time.UTC)
+			fixture := newWebhookOutboxLifecycleFixture(t, now)
+			claimed, _ := fixture.claim(t, "post-revoke-cleanup")
+			fixture.startDispatch(t, claimed.ID)
+			var publishedAt *time.Time
+			if published {
+				value := now.Add(-time.Hour)
+				publishedAt = &value
+			}
+			setWebhookLifecyclePublicationHistory(t, fixture, publishedAt)
+			if _, err := fixture.service.EmergencyRevokeWebhook(
+				webhookEmergencyAdminContext(
+					t,
+					fixture,
+					models.ProjectRoleAdmin,
+				),
+				fixture.config.ID,
+			); err != nil {
+				t.Fatal(err)
+			}
+			fixture.setNow(fixture.snapshot.CredentialExpiresAt.Add(time.Second))
+			result, err := fixture.service.ExpireWebhookDeliveriesBatch(
+				context.Background(),
+				10,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Expired != 1 {
+				t.Fatalf("post-revoke cleanup = %+v, want one expiry", result)
+			}
+			assertWebhookLifecyclePublicationHistory(
+				t,
+				fixture,
+				publishedAt,
+			)
+		})
+	}
+}
+
+func TestWebhookReplayExpirationPreservesDomainEventPublicationHistory(
+	t *testing.T,
+) {
+	for _, published := range []bool{false, true} {
+		t.Run(fmt.Sprintf("published_%t", published), func(t *testing.T) {
+			now := time.Date(2026, time.August, 11, 14, 0, 0, 0, time.UTC)
+			fixture := newWebhookOutboxLifecycleFixture(t, now)
+			if err := fixture.db.Model(&models.OutboxDelivery{}).
+				Where("id = ?", fixture.delivery.ID).
+				Update("status", models.OutboxDeliveryFailed).Error; err != nil {
+				t.Fatal(err)
+			}
+			var publishedAt *time.Time
+			if published {
+				value := now.Add(-time.Hour)
+				publishedAt = &value
+			}
+			setWebhookLifecyclePublicationHistory(t, fixture, publishedAt)
+			fixture.setNow(fixture.snapshot.CredentialExpiresAt.Add(time.Second))
+			result, err := fixture.service.ReplayOutboxCommand(
+				webhookEmergencyAdminContext(
+					t,
+					fixture,
+					models.ProjectRoleAdmin,
+				),
+				fixture.delivery.ID,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Disposition != OutboxReplayExpired ||
+				!result.Materialized {
+				t.Fatalf("expired replay result = %+v", result)
+			}
+			assertWebhookLifecyclePublicationHistory(
+				t,
+				fixture,
+				publishedAt,
+			)
+		})
+	}
+}
+
 func TestWebhookOutboxClaimRejectsExpiredCandidateAndCAS(t *testing.T) {
 	now := time.Date(2026, time.August, 10, 8, 0, 0, 0, time.UTC)
 	fixture := newWebhookOutboxLifecycleFixture(t, now)
@@ -247,6 +590,100 @@ func TestWebhookOutboxClaimRejectsExpiredCandidateAndCAS(t *testing.T) {
 		current.Attempts != 0 ||
 		current.LockedAt != nil {
 		t.Fatalf("expired claim CAS mutated delivery: %+v", current)
+	}
+}
+
+func TestWebhookStaleClaimReclaimsOnlyPreparedDispatch(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	fixture := newWebhookOutboxLifecycleFixture(t, now)
+	prepared := fixture.delivery
+	legacy, _, _ := fixture.createIntent(t, "stale-legacy-unknown")
+	started, _, _ := fixture.createIntent(t, "stale-started")
+	lockedAt := now.Add(-2 * time.Minute)
+	startedAt := now.Add(-90 * time.Second)
+	for index, row := range []struct {
+		delivery models.OutboxDelivery
+		marker   *time.Time
+	}{
+		{
+			delivery: prepared,
+			marker: func() *time.Time {
+				value := lockedAt
+				return &value
+			}(),
+		},
+		{delivery: legacy},
+		{delivery: started, marker: &startedAt},
+	} {
+		token := fmt.Sprintf(
+			"00000000-0000-7000-8000-%012d",
+			index+1,
+		)
+		if err := fixture.db.Model(&models.OutboxDelivery{}).
+			Where("id = ?", row.delivery.ID).
+			Updates(map[string]any{
+				"status":              models.OutboxDeliveryProcessing,
+				"attempts":            1,
+				"locked_at":           lockedAt,
+				"locked_by":           "stale-worker",
+				"lock_token":          token,
+				"dispatch_started_at": row.marker,
+			}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixture.setNow(now.Add(10 * time.Minute))
+	claimed, err := fixture.service.ClaimPendingOutbox(
+		fixture.worker,
+		"replacement-worker",
+		10,
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 ||
+		claimed[0].ID != prepared.ID ||
+		claimed[0].Attempts != 2 ||
+		!isWebhookDispatchPrepared(
+			claimed[0].DispatchStartedAt,
+			claimed[0].LockedAt,
+		) {
+		t.Fatalf("stale dispatch claims = %+v", claimed)
+	}
+	for _, protected := range []struct {
+		delivery models.OutboxDelivery
+		marker   *time.Time
+	}{
+		{delivery: legacy},
+		{delivery: started, marker: &startedAt},
+	} {
+		var current models.OutboxDelivery
+		if err := fixture.db.First(
+			&current,
+			"id = ?",
+			protected.delivery.ID,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+		if current.Status != models.OutboxDeliveryProcessing ||
+			current.Attempts != 1 ||
+			current.LockedBy != "stale-worker" {
+			t.Fatalf(
+				"unknown/started dispatch was reclaimed: %+v",
+				current,
+			)
+		}
+		if protected.marker == nil {
+			if current.DispatchStartedAt != nil {
+				t.Fatalf("legacy marker changed: %+v", current)
+			}
+		} else if !isWebhookDispatchStarted(
+			current.DispatchStartedAt,
+			current.LockedAt,
+		) {
+			t.Fatalf("started marker changed: %+v", current)
+		}
 	}
 }
 
@@ -427,7 +864,8 @@ func TestWebhookOutboxClaimCASRechecksDeadlineAfterSecondarySelection(
 func TestWebhookOutboxSuccessAndShredAreAtomic(t *testing.T) {
 	now := time.Date(2026, time.August, 10, 8, 0, 0, 0, time.UTC)
 	fixture := newWebhookOutboxLifecycleFixture(t, now)
-	_, claim := fixture.claim(t, "atomic-success-worker")
+	claimed, claim := fixture.claim(t, "atomic-success-worker")
+	fixture.startDispatch(t, claimed.ID)
 	injected := errors.New("injected snapshot shred failure")
 	const callbackName = "test:webhook_lifecycle_shred_failure"
 	if err := fixture.db.Callback().Update().Before("gorm:update").
@@ -459,6 +897,10 @@ func TestWebhookOutboxSuccessAndShredAreAtomic(t *testing.T) {
 	)
 	if delivery.Status != models.OutboxDeliveryProcessing ||
 		delivery.DeliveredAt != nil ||
+		!isWebhookDispatchStarted(
+			delivery.DispatchStartedAt,
+			delivery.LockedAt,
+		) ||
 		snapshot.CredentialShreddedAt != nil {
 		t.Fatalf(
 			"failed shred partially committed delivery=%+v snapshot=%+v",
@@ -474,7 +916,8 @@ func TestWebhookOutboxKnownTimelySuccessUsesActualCompletionAfterDeadline(
 	now := time.Date(2026, time.August, 10, 8, 0, 0, 0, time.UTC)
 	fixture := newWebhookOutboxLifecycleFixture(t, now)
 	fixture.setNow(fixture.snapshot.CredentialExpiresAt.Add(-time.Second))
-	_, claim := fixture.claim(t, "timely-success-worker")
+	claimed, claim := fixture.claim(t, "timely-success-worker")
+	fixture.startDispatch(t, claimed.ID)
 	completedAt := fixture.snapshot.CredentialExpiresAt.Add(-time.Millisecond)
 	finalizedAt := fixture.snapshot.CredentialExpiresAt.Add(time.Minute)
 	fixture.setNow(finalizedAt)
@@ -498,6 +941,10 @@ func TestWebhookOutboxKnownTimelySuccessUsesActualCompletionAfterDeadline(
 	)
 	if delivery.DeliveredAt == nil ||
 		!delivery.DeliveredAt.Equal(completedAt) ||
+		!isWebhookDispatchStarted(
+			delivery.DispatchStartedAt,
+			delivery.LockedAt,
+		) ||
 		!delivery.UpdatedAt.Equal(finalizedAt) {
 		t.Fatalf(
 			"completion/finalize timestamps drifted: delivered=%v updated=%v",
@@ -535,7 +982,8 @@ func TestWebhookOutboxLateOrUnknownSuccessExpires(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Date(2026, time.August, 10, 8, 0, 0, 0, time.UTC)
 			fixture := newWebhookOutboxLifecycleFixture(t, now)
-			_, claim := fixture.claim(t, "unsafe-success-worker")
+			claimed, claim := fixture.claim(t, "unsafe-success-worker")
+			fixture.startDispatch(t, claimed.ID)
 			fixture.setNow(fixture.snapshot.CredentialExpiresAt.Add(time.Minute))
 			result, err := fixture.service.FinalizeOutboxAttempt(
 				fixture.worker,
@@ -556,7 +1004,11 @@ func TestWebhookOutboxLateOrUnknownSuccessExpires(t *testing.T) {
 			)
 			if delivery.Status != models.OutboxDeliveryExpired ||
 				delivery.ExpiredAt == nil ||
-				delivery.DeliveredAt != nil {
+				delivery.DeliveredAt != nil ||
+				!isWebhookDispatchStarted(
+					delivery.DispatchStartedAt,
+					delivery.LockedAt,
+				) {
 				t.Fatalf("unsafe success was not expired: %+v", delivery)
 			}
 			assertSnapshotShredded(
@@ -566,6 +1018,133 @@ func TestWebhookOutboxLateOrUnknownSuccessExpires(t *testing.T) {
 			)
 		})
 	}
+}
+
+func TestWebhookOutboxKnownFailureClearsPreparedGenerationForRetry(
+	t *testing.T,
+) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	fixture := newWebhookOutboxLifecycleFixture(t, now)
+	claimed, claim := fixture.claim(t, "known-failure-worker")
+	result, err := fixture.service.FinalizeOutboxAttempt(
+		fixture.worker,
+		claim,
+		OutboxKnownFailure(errors.New("destination rejected safely")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != models.OutboxDeliveryFailed {
+		t.Fatalf("known failure result = %+v", result)
+	}
+	current, snapshot := loadWebhookLifecycleRows(
+		t,
+		fixture,
+		claimed.ID,
+		fixture.snapshot.ID,
+	)
+	if current.DispatchStartedAt != nil ||
+		current.Status != models.OutboxDeliveryFailed ||
+		current.LockedAt != nil ||
+		current.LockToken != nil ||
+		snapshot.CredentialShreddedAt != nil {
+		t.Fatalf(
+			"known failure did not release retry generation: delivery=%+v snapshot=%+v",
+			current,
+			snapshot,
+		)
+	}
+}
+
+func TestWebhookPreparedDispatchRejectsSuccessAndUncertainFinalize(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name    string
+		attempt func(time.Time) OutboxAttemptResult
+	}{
+		{
+			name: "success",
+			attempt: func(now time.Time) OutboxAttemptResult {
+				return OutboxKnownSuccess(now)
+			},
+		},
+		{
+			name: "uncertain",
+			attempt: func(time.Time) OutboxAttemptResult {
+				return OutboxUncertain(context.DeadlineExceeded)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			fixture := newWebhookOutboxLifecycleFixture(t, now)
+			claimed, claim := fixture.claim(
+				t,
+				"prepared-finalize-"+test.name,
+			)
+			_, err := fixture.service.FinalizeOutboxAttempt(
+				fixture.worker,
+				claim,
+				test.attempt(now.Add(time.Millisecond)),
+			)
+			if !errors.Is(err, ErrWebhookOutboxLifecycleInvariant) {
+				t.Fatalf("prepared %s finalize error = %v", test.name, err)
+			}
+			var current models.OutboxDelivery
+			if err := fixture.db.First(
+				&current,
+				"id = ?",
+				claimed.ID,
+			).Error; err != nil {
+				t.Fatal(err)
+			}
+			if current.Status != models.OutboxDeliveryProcessing ||
+				!isWebhookDispatchPrepared(
+					current.DispatchStartedAt,
+					current.LockedAt,
+				) {
+				t.Fatalf(
+					"rejected prepared finalize mutated delivery: %+v",
+					current,
+				)
+			}
+		})
+	}
+}
+
+func TestWebhookOutboxUncertainPreservesStartedDispatch(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	fixture := newWebhookOutboxLifecycleFixture(t, now)
+	claimed, claim := fixture.claim(t, "uncertain-worker")
+	startedAt := fixture.startDispatch(t, claimed.ID)
+	result, err := fixture.service.FinalizeOutboxAttempt(
+		fixture.worker,
+		claim,
+		OutboxUncertain(context.DeadlineExceeded),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != models.OutboxDeliveryExpired {
+		t.Fatalf("uncertain result = %+v", result)
+	}
+	current, snapshot := loadWebhookLifecycleRows(
+		t,
+		fixture,
+		claimed.ID,
+		fixture.snapshot.ID,
+	)
+	if current.Status != models.OutboxDeliveryExpired ||
+		current.DispatchStartedAt == nil ||
+		!current.DispatchStartedAt.Equal(startedAt) {
+		t.Fatalf("uncertain dispatch history changed: %+v", current)
+	}
+	assertSnapshotShredded(
+		t,
+		snapshot,
+		models.WebhookCredentialShredReasonExpired,
+	)
 }
 
 func TestWebhookOutboxCleanupExpiresDueStatesAtomically(t *testing.T) {
@@ -712,7 +1291,8 @@ func TestWebhookOutboxFailureNeverSchedulesAtOrAfterDeadline(t *testing.T) {
 	now := time.Date(2026, time.August, 10, 8, 0, 0, 0, time.UTC)
 	fixture := newWebhookOutboxLifecycleFixture(t, now)
 	fixture.setNow(fixture.snapshot.CredentialExpiresAt.Add(-time.Second))
-	_, claim := fixture.claim(t, "deadline-failure-worker")
+	claimed, claim := fixture.claim(t, "deadline-failure-worker")
+	fixture.startDispatch(t, claimed.ID)
 
 	result, err := fixture.service.FinalizeOutboxAttempt(
 		fixture.worker,
@@ -753,7 +1333,8 @@ func TestWebhookOutboxExhaustedAttemptBecomesDeadBeforeDeadline(
 		t.Fatal(err)
 	}
 	fixture.setNow(fixture.snapshot.CredentialExpiresAt.Add(-time.Second))
-	_, claim := fixture.claim(t, "final-attempt-worker")
+	claimed, claim := fixture.claim(t, "final-attempt-worker")
+	fixture.startDispatch(t, claimed.ID)
 
 	result, err := fixture.service.FinalizeOutboxAttempt(
 		fixture.worker,
@@ -963,7 +1544,11 @@ func TestWebhookOutboxFinalizerRejectsPairMutationAfterValidClaim(
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Date(2026, time.August, 10, 8, 0, 0, 0, time.UTC)
 			fixture := newWebhookOutboxLifecycleFixture(t, now)
-			_, claim := fixture.claim(t, "post-claim-mismatch-"+test.name)
+			claimed, claim := fixture.claim(
+				t,
+				"post-claim-mismatch-"+test.name,
+			)
+			fixture.startDispatch(t, claimed.ID)
 			if err := fixture.db.Exec("PRAGMA foreign_keys = OFF").Error; err != nil {
 				t.Fatal(err)
 			}
@@ -1067,8 +1652,10 @@ func TestWebhookOutboxClaimRefRejectsSameWorkerABA(t *testing.T) {
 	if err := fixture.db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", fixture.delivery.ID).
 		Updates(map[string]any{
-			"locked_at": newLock,
-			"attempts":  gorm.Expr("attempts + 1"),
+			"locked_at":           newLock,
+			"lock_token":          "019fee69-720c-7023-ae63-fcaf437562ab",
+			"dispatch_started_at": newLock,
+			"attempts":            gorm.Expr("attempts + 1"),
 		}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -1123,7 +1710,8 @@ func TestWebhookOutboxSuccessCompletionMustBelongToClaimWindow(t *testing.T) {
 				time.UTC,
 			)
 			fixture := newWebhookOutboxLifecycleFixture(t, now)
-			_, claim := fixture.claim(t, "claim-window-worker")
+			claimed, claim := fixture.claim(t, "claim-window-worker")
+			fixture.startDispatch(t, claimed.ID)
 			claim.EffectiveDeadline = claim.LockedAt.Add(time.Second)
 			result, err := fixture.service.FinalizeOutboxAttempt(
 				fixture.worker,

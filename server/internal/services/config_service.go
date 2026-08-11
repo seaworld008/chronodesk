@@ -26,11 +26,11 @@ var (
 	// key invariant without depending on a persistence error.
 	ErrInvalidSystemConfigKey = errors.New("配置键无效")
 	// ErrProtectedSystemConfigKey prevents the generic configuration surface
-	// from bypassing the Agent platform's audited runtime-control workflow. It
-	// wraps ErrInvalidSystemConfigKey so existing transports fail closed as a
-	// bad generic-config request while callers can still match this sentinel.
+	// from bypassing migration-owned identity or audited runtime-control
+	// workflows. It wraps ErrInvalidSystemConfigKey so existing transports fail
+	// closed while callers can still match this sentinel.
 	ErrProtectedSystemConfigKey = fmt.Errorf(
-		"%w: Agent 全局安全控制必须通过专用接口修改",
+		"%w: 受保护系统配置必须通过专用流程修改",
 		ErrInvalidSystemConfigKey,
 	)
 	ErrConfigExportTooLarge = errors.New("系统配置导出超过大小限制")
@@ -80,7 +80,7 @@ const (
 const (
 	// 系统基础信息
 	KeySystemName        = "system.name"
-	KeySystemVersion     = "system.version"
+	KeySystemVersion     = models.SystemConfigKeySystemVersion
 	KeySystemDescription = "system.description"
 	KeySystemLogo        = "system.logo"
 	KeySystemCopyright   = "system.copyright"
@@ -167,6 +167,9 @@ func (s *ConfigService) InitDefaultConfigs() error {
 
 // GetConfig 获取配置值
 func (s *ConfigService) GetConfig(key string) (string, error) {
+	if err := validateMutableSystemConfigKey(key); err != nil {
+		return "", err
+	}
 	var config models.SystemConfig
 	if err := s.db.Where("key = ?", key).First(&config).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -367,7 +370,8 @@ func (s *ConfigService) BatchUpdateConfigs(configs []models.SystemConfig) error 
 
 			operation := "BATCH_UPDATE"
 			if err == gorm.ErrRecordNotFound {
-				if err := tx.Create(&config).Error; err != nil {
+				created := mutableSystemConfigFromInput(config)
+				if err := tx.Create(&created).Error; err != nil {
 					return err
 				}
 				operation = "BATCH_CREATE"
@@ -481,7 +485,7 @@ func (s *ConfigService) ImportConfigs(data []byte) error {
 	changes := make([]configAuditChange, 0, len(configs))
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
 		for _, config := range configs {
-			if err := tx.Save(&config).Error; err != nil {
+			if err := importMutableSystemConfigTx(tx, config); err != nil {
 				return fmt.Errorf("导入配置失败 %s: %v", config.Key, err)
 			}
 			changes = append(changes, configAuditChange{
@@ -559,8 +563,11 @@ func validateMutableSystemConfigKeys(configs []models.SystemConfig) error {
 }
 
 func isProtectedSystemConfigKey(key string) bool {
+	if strings.HasPrefix(key, adminResourceVersionKeyPrefix) {
+		return true
+	}
 	switch key {
-	case KeyAgentGlobalReadOnly, KeyAgentEmergencyStop:
+	case KeySystemVersion, KeyAgentGlobalReadOnly, KeyAgentEmergencyStop:
 		return true
 	default:
 		return false
@@ -570,8 +577,70 @@ func isProtectedSystemConfigKey(key string) bool {
 func editableSystemConfigs(query *gorm.DB) *gorm.DB {
 	return query.Where(
 		"key NOT IN ?",
-		[]string{KeyAgentGlobalReadOnly, KeyAgentEmergencyStop},
+		[]string{
+			KeySystemVersion,
+			KeyAgentGlobalReadOnly,
+			KeyAgentEmergencyStop,
+		},
+	).Where(
+		"SUBSTR(key, 1, ?) <> ?",
+		len(adminResourceVersionKeyPrefix),
+		adminResourceVersionKeyPrefix,
 	)
+}
+
+func mutableSystemConfigFromInput(
+	config models.SystemConfig,
+) models.SystemConfig {
+	return models.SystemConfig{
+		Key:          config.Key,
+		Value:        config.Value,
+		ValueType:    config.ValueType,
+		Description:  config.Description,
+		Category:     config.Category,
+		Group:        config.Group,
+		IsRequired:   config.IsRequired,
+		IsActive:     config.IsActive,
+		DefaultValue: config.DefaultValue,
+		MinValue:     config.MinValue,
+		MaxValue:     config.MaxValue,
+		ValidValues:  config.ValidValues,
+	}
+}
+
+func importMutableSystemConfigTx(
+	tx *gorm.DB,
+	input models.SystemConfig,
+) error {
+	if tx == nil {
+		return errors.New("配置导入事务不可用")
+	}
+	if err := validateMutableSystemConfigKey(input.Key); err != nil {
+		return err
+	}
+	var existing models.SystemConfig
+	err := tx.Where("key = ?", input.Key).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		created := mutableSystemConfigFromInput(input)
+		return tx.Create(&created).Error
+	}
+	if err != nil {
+		return err
+	}
+	safe := mutableSystemConfigFromInput(input)
+	return tx.Model(&existing).Updates(map[string]any{
+		"value":         safe.Value,
+		"value_type":    safe.ValueType,
+		"description":   safe.Description,
+		"category":      safe.Category,
+		"group":         safe.Group,
+		"is_required":   safe.IsRequired,
+		"is_active":     safe.IsActive,
+		"default_value": safe.DefaultValue,
+		"min_value":     safe.MinValue,
+		"max_value":     safe.MaxValue,
+		"valid_values":  safe.ValidValues,
+	}).Error
 }
 
 // GetSecurityPolicy 获取安全策略配置

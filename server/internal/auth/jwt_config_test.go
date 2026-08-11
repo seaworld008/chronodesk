@@ -128,6 +128,55 @@ func TestJWTManagerIssuesCanonicalHumanRESTClaims(t *testing.T) {
 	}
 }
 
+func TestJWTManagerGenerateTokenPairAtUsesExplicitIssueTime(t *testing.T) {
+	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
+	issuedAt := time.Now().UTC().Truncate(time.Microsecond)
+	accessToken, refreshToken, err := manager.GenerateTokenPairAt(
+		42,
+		PlatformRoleMember,
+		"explicit-issue-session",
+		issuedAt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accessClaims, err := manager.VerifyAccessToken(accessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshClaims, err := manager.VerifyRefreshToken(refreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for tokenType, claims := range map[string]*Claims{
+		"access":  accessClaims,
+		"refresh": refreshClaims,
+	} {
+		expectedExpiry := issuedAt.Add(time.Hour).Unix()
+		if tokenType == "refresh" {
+			expectedExpiry = issuedAt.Add(24 * time.Hour).Unix()
+		}
+		if claims.Type != tokenType ||
+			claims.Iat != issuedAt.Unix() ||
+			claims.Nbf != issuedAt.Unix() ||
+			claims.Exp != expectedExpiry ||
+			claims.SessionID != "explicit-issue-session" ||
+			claims.UserID != 42 ||
+			claims.PlatformRole != PlatformRoleMember ||
+			claims.Jti == "" {
+			t.Fatalf("%s explicit issue claims = %+v", tokenType, claims)
+		}
+	}
+	if _, _, err := manager.GenerateTokenPairAt(
+		42,
+		PlatformRoleMember,
+		"explicit-issue-session",
+		time.Time{},
+	); err == nil {
+		t.Fatal("zero explicit issue time was accepted")
+	}
+}
+
 func TestJWTManagerRejectsLegacyRoleClaimsForBothTokenTypes(t *testing.T) {
 	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
 	tests := []struct {

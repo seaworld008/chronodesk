@@ -266,6 +266,18 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	appVersion := version.Version
+	if appVersion == "" || strings.TrimSpace(appVersion) != appVersion {
+		return nil, errors.New("build version is invalid")
+	}
+	if configuredVersion := os.Getenv("APP_VERSION"); configuredVersion != "" &&
+		configuredVersion != appVersion {
+		return nil, fmt.Errorf(
+			"APP_VERSION %q does not match build version %q",
+			configuredVersion,
+			appVersion,
+		)
+	}
 	config := &Config{
 		Server: ServerConfig{
 			Port:           getEnv("PORT", "8081"),
@@ -313,7 +325,7 @@ func Load() (*Config, error) {
 		},
 		App: AppConfig{
 			Name:    getEnv("APP_NAME", "ChronoDesk"),
-			Version: getEnv("APP_VERSION", version.Version),
+			Version: appVersion,
 			URL:     appURL,
 			WebURL:  getEnv("WEB_URL", "http://localhost:3000"),
 		},

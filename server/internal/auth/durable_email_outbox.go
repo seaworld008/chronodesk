@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -16,16 +17,10 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type AuthEmailOutboxRepository interface {
-	Register(
-		context.Context,
-		*User,
-		*UserProfile,
-		*EmailVerification,
-		*EmailVerificationPolicySnapshot,
-	) error
 	QueueEmailVerification(context.Context, *EmailVerification, string) error
 	QueuePasswordReset(context.Context, *PasswordReset) error
 	VerifyEmailAndQueueWelcome(context.Context, string, time.Time) (uint, error)
@@ -127,42 +122,39 @@ func (r *GormAuthEmailOutboxRepository) withProjectTransaction(
 	)
 }
 
-func (r *GormAuthEmailOutboxRepository) Register(
+func (r *GormAuthEmailOutboxRepository) CommitRegistration(
 	ctx context.Context,
-	user *User,
-	profile *UserProfile,
-	verification *EmailVerification,
-	emailPolicy *EmailVerificationPolicySnapshot,
-) error {
-	if user == nil || profile == nil {
-		return errors.New("user and profile are required")
+	command *RegistrationCommit,
+) (*RegistrationCommitResult, error) {
+	if err := validateRegistrationCommit(command); err != nil {
+		return nil, err
 	}
-	if emailPolicy == nil ||
-		user.EmailVerified == emailPolicy.Enabled ||
-		(verification != nil) != emailPolicy.Enabled {
-		return ErrEmailVerificationPolicyChanged
+	if ctx == nil {
+		return nil, ErrAtomicRegistrationUnavailable
 	}
-	if !user.PlatformRole.IsValid() || !isValidUserStatus(user.Status) {
-		return ErrInvalidAccountState
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	if verification != nil && strings.TrimSpace(verification.Token) == "" {
-		return ErrInvalidToken
+	if scopeddb.HasTransaction(ctx) {
+		return nil, ErrAtomicRegistrationUnavailable
 	}
 
-	modelUser := authUserToModel(user, profile)
-	modelProfile := authProfileToModel(profile)
+	modelUser := authUserToModel(command.User, command.Profile)
+	modelProfile := authProfileToModel(command.Profile)
 	var storedVerification *EmailVerification
+	var builtSession *RegistrationSession
+	var storedSession *preparedLoginSessionRows
 	err := r.withProjectTransaction(
 		ctx,
 		models.SystemActor("auth-registration"),
 		func(txCtx context.Context, tx *gorm.DB) error {
 			if err := lockAndMatchEmailVerificationPolicyTx(
 				tx,
-				emailPolicy,
+				command.ExpectedEmailPolicy,
 			); err != nil {
 				return err
 			}
-			if err := tx.Create(&modelUser).Error; err != nil {
+			if err := createRegistrationUserTx(tx, &modelUser); err != nil {
 				return err
 			}
 			modelProfile.UserID = modelUser.ID
@@ -170,8 +162,8 @@ func (r *GormAuthEmailOutboxRepository) Register(
 				return err
 			}
 
-			if verification != nil {
-				verificationCopy := *verification
+			if command.Verification != nil {
+				verificationCopy := *command.Verification
 				verificationCopy.UserID = modelUser.ID
 				if verificationCopy.Email == "" {
 					verificationCopy.Email = modelUser.Email
@@ -204,7 +196,46 @@ func (r *GormAuthEmailOutboxRepository) Register(
 				return err
 			}
 
-			_, err := services.AppendEmailOutboxTx(txCtx, tx, services.EmailOutboxEventInput{
+			session, err := command.BuildSession(
+				modelUser.ID,
+				*command.SessionIssuedAt,
+			)
+			if err != nil {
+				return err
+			}
+			if session == nil ||
+				strings.TrimSpace(session.AccessToken) == "" ||
+				strings.TrimSpace(session.RefreshToken) == "" ||
+				strings.TrimSpace(session.SessionID) == "" ||
+				session.RefreshAuthority == nil ||
+				session.RefreshAuthority.Token != session.RefreshToken ||
+				session.RefreshAuthority.SessionID != session.SessionID {
+				return ErrInvalidToken
+			}
+			if err := validateRegistrationSession(
+				command.User,
+				session,
+				*command.SessionIssuedAt,
+			); err != nil {
+				return err
+			}
+			prepared, err := prepareLoginSessionRows(
+				modelUser.ID,
+				*command.SessionIssuedAt,
+				session.RefreshAuthority,
+				session.LoginHistory,
+				session.SuccessfulAttempt,
+			)
+			if err != nil {
+				return err
+			}
+			if err := createLoginSessionRowsTx(tx, prepared); err != nil {
+				return err
+			}
+			builtSession = session
+			storedSession = prepared
+
+			_, err = services.AppendEmailOutboxTx(txCtx, tx, services.EmailOutboxEventInput{
 				Scope:   r.scope,
 				Source:  r.eventSource,
 				Type:    eventcontract.UserRegisteredEventType,
@@ -220,18 +251,181 @@ func (r *GormAuthEmailOutboxRepository) Register(
 		},
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	copyCreatedAuthUser(user, &modelUser)
-	copyCreatedAuthProfile(profile, &modelProfile)
-	if verification != nil && storedVerification != nil {
-		verification.ID = storedVerification.ID
-		verification.UserID = storedVerification.UserID
-		verification.CreatedAt = storedVerification.CreatedAt
-		verification.UpdatedAt = storedVerification.UpdatedAt
+	copyCreatedAuthUser(command.User, &modelUser)
+	copyCreatedAuthProfile(command.Profile, &modelProfile)
+	if command.Verification != nil && storedVerification != nil {
+		command.Verification.ID = storedVerification.ID
+		command.Verification.UserID = storedVerification.UserID
+		command.Verification.CreatedAt = storedVerification.CreatedAt
+		command.Verification.UpdatedAt = storedVerification.UpdatedAt
+	}
+	if builtSession != nil && storedSession != nil {
+		copyPreparedLoginSessionRowIDs(
+			builtSession.RefreshAuthority,
+			builtSession.LoginHistory,
+			builtSession.SuccessfulAttempt,
+			storedSession,
+		)
+	}
+	return &RegistrationCommitResult{Session: builtSession}, nil
+}
+
+func validateRegistrationCommit(command *RegistrationCommit) error {
+	if command == nil ||
+		command.User == nil ||
+		command.Profile == nil ||
+		command.ExpectedEmailPolicy == nil ||
+		command.CommittedAt.IsZero() {
+		return ErrAtomicRegistrationUnavailable
+	}
+	user := command.User
+	policy := command.ExpectedEmailPolicy
+	if !user.PlatformRole.IsValid() || !isValidUserStatus(user.Status) {
+		return ErrInvalidAccountState
+	}
+	if user.ID != 0 || command.Profile.ID != 0 ||
+		command.Profile.UserID != 0 {
+		return ErrInvalidToken
+	}
+	if user.EmailVerified == policy.Enabled ||
+		(command.Verification != nil) != policy.Enabled {
+		return ErrEmailVerificationPolicyChanged
+	}
+	if user.PasswordChangedAt == nil ||
+		user.PasswordChangedAt.After(command.CommittedAt) {
+		return ErrInvalidToken
+	}
+	if policy.Enabled {
+		if command.BuildSession != nil ||
+			command.SessionIssuedAt != nil ||
+			user.EmailVerifiedAt != nil ||
+			user.LastLoginAt != nil ||
+			strings.TrimSpace(command.Verification.Token) == "" {
+			return ErrEmailVerificationPolicyChanged
+		}
+		return nil
+	}
+	if command.BuildSession == nil ||
+		command.SessionIssuedAt == nil ||
+		command.SessionIssuedAt.IsZero() ||
+		!command.SessionIssuedAt.Equal(command.CommittedAt) ||
+		user.EmailVerifiedAt == nil ||
+		user.LastLoginAt == nil ||
+		!user.PasswordChangedAt.Before(*command.SessionIssuedAt) ||
+		!user.EmailVerifiedAt.Equal(*command.SessionIssuedAt) ||
+		!user.LastLoginAt.Equal(*command.SessionIssuedAt) {
+		return ErrEmailVerificationPolicyChanged
 	}
 	return nil
+}
+
+var errRegistrationUserInsertConflict = errors.New(
+	"registration user insert conflicted outside identity keys",
+)
+
+func createRegistrationUserTx(tx *gorm.DB, user *models.User) error {
+	if tx == nil || user == nil || user.ID != 0 {
+		return ErrInvalidToken
+	}
+	result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(user)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 1 {
+		return nil
+	}
+	if result.RowsAffected != 0 {
+		return errRegistrationUserInsertConflict
+	}
+	var identity models.User
+	identityResult := tx.Unscoped().
+		Select("id").
+		Where("email = ? OR username = ?", user.Email, user.Username).
+		Limit(1).
+		Find(&identity)
+	if identityResult.Error != nil {
+		return identityResult.Error
+	}
+	if identityResult.RowsAffected == 1 {
+		return ErrUserExists
+	}
+	return errRegistrationUserInsertConflict
+}
+
+func validateRegistrationSession(
+	user *User,
+	session *RegistrationSession,
+	issuedAt time.Time,
+) error {
+	if user == nil ||
+		user.ID != 0 ||
+		user.LastLoginAt == nil ||
+		!user.LastLoginAt.Equal(issuedAt) ||
+		user.PasswordChangedAt == nil ||
+		!user.PasswordChangedAt.Before(issuedAt) ||
+		session == nil ||
+		session.RefreshAuthority == nil ||
+		session.LoginHistory == nil ||
+		session.SuccessfulAttempt == nil ||
+		strings.TrimSpace(session.AccessToken) == "" ||
+		strings.TrimSpace(session.AccessToken) != session.AccessToken ||
+		strings.TrimSpace(session.RefreshToken) == "" ||
+		strings.TrimSpace(session.RefreshToken) != session.RefreshToken ||
+		session.AccessToken == session.RefreshToken ||
+		strings.TrimSpace(session.SessionID) == "" ||
+		strings.TrimSpace(session.SessionID) != session.SessionID {
+		return ErrInvalidToken
+	}
+	refresh := session.RefreshAuthority
+	history := session.LoginHistory
+	attempt := session.SuccessfulAttempt
+	if refresh.ID != 0 ||
+		!isZeroRegistrationUserAssociation(refresh.User) ||
+		refresh.Token != session.RefreshToken ||
+		refresh.SessionID != session.SessionID ||
+		refresh.Revoked ||
+		refresh.RevokedAt != nil ||
+		refresh.RotatedAt != nil ||
+		strings.TrimSpace(refresh.ReplacedByToken) != "" ||
+		!refresh.CreatedAt.Equal(issuedAt) {
+		return ErrInvalidToken
+	}
+	if history.ID != 0 ||
+		!isZeroRegistrationUserAssociation(history.User) ||
+		history.Username != user.Username ||
+		history.Email != user.Email ||
+		history.IPAddress != refresh.IPAddress ||
+		history.UserAgent != refresh.UserAgent ||
+		history.SessionID != session.SessionID ||
+		history.LoginMethod != models.LoginMethodPassword ||
+		history.LoginStatus != models.LoginStatusSuccess ||
+		!history.IsActive ||
+		history.LogoutTime != nil ||
+		history.SessionDuration != nil ||
+		strings.TrimSpace(history.FailureReason) != "" ||
+		!history.LoginTime.Equal(issuedAt) ||
+		history.LastActivityAt == nil ||
+		!history.LastActivityAt.Equal(issuedAt) {
+		return ErrInvalidToken
+	}
+	if attempt.ID != 0 ||
+		attempt.User != nil ||
+		attempt.Email != user.Email ||
+		attempt.IPAddress != refresh.IPAddress ||
+		attempt.UserAgent != refresh.UserAgent ||
+		!attempt.Success ||
+		strings.TrimSpace(attempt.FailReason) != "" ||
+		!attempt.CreatedAt.Equal(issuedAt) {
+		return ErrInvalidToken
+	}
+	return nil
+}
+
+func isZeroRegistrationUserAssociation(user models.User) bool {
+	return reflect.ValueOf(user).IsZero()
 }
 
 func (r *GormAuthEmailOutboxRepository) QueueEmailVerification(

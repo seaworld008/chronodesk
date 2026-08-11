@@ -119,6 +119,14 @@ func (h *ConfigHandler) GetConfig(c *gin.Context) {
 
 	value, err := h.configService.GetConfig(key)
 	if err != nil {
+		if errors.Is(err, services.ErrProtectedSystemConfigKey) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "受保护的系统配置不能通过通用配置接口读取",
+				"error":   "protected_config_key",
+			})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{
 			"success": false,
 			"message": "配置不存在",

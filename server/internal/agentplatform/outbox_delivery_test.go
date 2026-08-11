@@ -1659,11 +1659,12 @@ func claimWebhookDeliveryForAdapterTest(
 	result := db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", delivery.ID).
 		Updates(map[string]any{
-			"status":     models.OutboxDeliveryProcessing,
-			"attempts":   1,
-			"locked_at":  lockedAt,
-			"locked_by":  "adapter-webhook-test-worker",
-			"lock_token": lockToken,
+			"status":              models.OutboxDeliveryProcessing,
+			"attempts":            1,
+			"locked_at":           lockedAt,
+			"locked_by":           "adapter-webhook-test-worker",
+			"lock_token":          lockToken,
+			"dispatch_started_at": lockedAt,
 		})
 	if result.Error != nil || result.RowsAffected != 1 {
 		t.Fatalf("claim adapter webhook delivery: %v", result.Error)

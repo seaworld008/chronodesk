@@ -129,10 +129,14 @@ func authLogReason(err error) string {
 		return "backup_codes_changed"
 	case errors.Is(err, ErrAtomicBackupCodeRotationUnavailable):
 		return "atomic_backup_code_rotation_unavailable"
+	case errors.Is(err, ErrAtomicRegistrationUnavailable):
+		return "atomic_registration_unavailable"
 	case errors.Is(err, ErrEmailNotVerified):
 		return "email_not_verified"
 	case errors.Is(err, ErrEmailVerificationPolicyUnavailable):
 		return "email_verification_policy_unavailable"
+	case errors.Is(err, ErrEmailVerificationPolicyChanged):
+		return "email_verification_policy_changed"
 	case errors.Is(err, ErrAccountLocked):
 		return "account_locked"
 	case errors.Is(err, ErrPasswordTooWeak):
@@ -329,25 +333,7 @@ func (h *AuthHandler) Register(c HTTPContext) {
 			"reason", authLogReason(err),
 		)
 
-		message := "注册失败"
-		status := http.StatusInternalServerError
-
-		switch {
-		case errors.Is(err, ErrUserExists):
-			message = "该用户已存在"
-			status = http.StatusConflict
-		case errors.Is(err, ErrPasswordTooWeak):
-			message = "密码强度不符合要求"
-			status = http.StatusBadRequest
-		case errors.Is(err, ErrEmailVerificationPolicyUnavailable):
-			message = "注册服务暂时不可用"
-			status = http.StatusServiceUnavailable
-		default:
-			if strings.Contains(err.Error(), "password") {
-				message = "密码强度不符合要求"
-				status = http.StatusBadRequest
-			}
-		}
+		status, message := registrationFailureHTTPResponse(err)
 
 		c.JSON(status, map[string]interface{}{
 			"code": 1, // 错误码设为1
@@ -369,6 +355,23 @@ func (h *AuthHandler) Register(c HTTPContext) {
 		"msg":  "注册成功",
 		"data": resp,
 	})
+}
+
+func registrationFailureHTTPResponse(err error) (int, string) {
+	switch {
+	case errors.Is(err, ErrUserExists):
+		return http.StatusConflict, "该用户已存在"
+	case errors.Is(err, ErrPasswordTooWeak):
+		return http.StatusBadRequest, "密码强度不符合要求"
+	case errors.Is(err, ErrEmailVerificationPolicyUnavailable),
+		errors.Is(err, ErrEmailVerificationPolicyChanged),
+		errors.Is(err, ErrAtomicRegistrationUnavailable):
+		return http.StatusServiceUnavailable, "注册服务暂时不可用"
+	case err != nil && strings.Contains(err.Error(), "password"):
+		return http.StatusBadRequest, "密码强度不符合要求"
+	default:
+		return http.StatusInternalServerError, "注册失败"
+	}
 }
 
 // Login 用户登录

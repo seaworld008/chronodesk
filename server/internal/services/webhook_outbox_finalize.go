@@ -205,6 +205,26 @@ func (s *AgentNativeService) FinalizeOutboxAttempt(
 					); err != nil {
 						return err
 					}
+					anchor, err := loadOutboxDeliveryLockAnchor(
+						tx,
+						operation.Scope,
+						claim.DeliveryID,
+					)
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						return ErrOutboxLockLost
+					}
+					if err != nil {
+						return err
+					}
+					if anchor.DestinationType == "webhook" {
+						if _, err := lockWebhookConfigForDestination(
+							tx,
+							operation.Scope,
+							anchor.DestinationID,
+						); err != nil {
+							return err
+						}
+					}
 					delivery, err := lockClaimedOutboxDelivery(
 						tx,
 						operation.Scope,
@@ -239,6 +259,19 @@ func (s *AgentNativeService) FinalizeOutboxAttempt(
 						)
 						result.Status = status
 						return err
+					}
+					dispatchPrepared := isWebhookDispatchPrepared(
+						delivery.DispatchStartedAt,
+						delivery.LockedAt,
+					)
+					if isWebhookDispatchUnknown(
+						delivery.DispatchStartedAt,
+						delivery.LockedAt,
+					) ||
+						(dispatchPrepared &&
+							attempt.Kind !=
+								OutboxAttemptKnownFailure) {
+						return ErrWebhookOutboxLifecycleInvariant
 					}
 					snapshot, err := lockWebhookSnapshotForDelivery(
 						tx,
@@ -297,19 +330,27 @@ func releaseUnstartedOutboxClaim(
 	if delivery == nil {
 		return "", ErrWebhookOutboxLifecycleInvariant
 	}
+	if delivery.DestinationType == "webhook" &&
+		!isWebhookDispatchPrepared(
+			delivery.DispatchStartedAt,
+			delivery.LockedAt,
+		) {
+		return "", ErrWebhookOutboxLifecycleInvariant
+	}
 	if err := updateClaimedOutboxDelivery(
 		tx,
 		scope,
 		claim,
 		map[string]any{
-			"status":          models.OutboxDeliveryFailed,
-			"attempts":        gorm.Expr("attempts - 1"),
-			"next_attempt_at": now,
-			"locked_at":       nil,
-			"locked_by":       "",
-			"lock_token":      nil,
-			"last_error":      "outbox delivery attempt did not start",
-			"updated_at":      now,
+			"status":              models.OutboxDeliveryFailed,
+			"attempts":            gorm.Expr("attempts - 1"),
+			"next_attempt_at":     now,
+			"locked_at":           nil,
+			"locked_by":           "",
+			"lock_token":          nil,
+			"dispatch_started_at": nil,
+			"last_error":          "outbox delivery attempt did not start",
+			"updated_at":          now,
 		},
 	); err != nil {
 		return "", err
@@ -496,12 +537,13 @@ func finalizeWebhookOutboxAttempt(
 			scope,
 			claim,
 			map[string]any{
-				"status":     models.OutboxDeliveryDead,
-				"locked_at":  nil,
-				"locked_by":  "",
-				"lock_token": nil,
-				"last_error": scrubOutboxFailure(attempt.Err),
-				"updated_at": now,
+				"status":              models.OutboxDeliveryDead,
+				"locked_at":           nil,
+				"locked_by":           "",
+				"lock_token":          nil,
+				"dispatch_started_at": nil,
+				"last_error":          scrubOutboxFailure(attempt.Err),
+				"updated_at":          now,
 			},
 		); err != nil {
 			return "", err
@@ -518,13 +560,14 @@ func finalizeWebhookOutboxAttempt(
 				scope,
 				claim,
 				map[string]any{
-					"status":          models.OutboxDeliveryFailed,
-					"next_attempt_at": now.Add(backoff),
-					"locked_at":       nil,
-					"locked_by":       "",
-					"lock_token":      nil,
-					"last_error":      scrubOutboxFailure(attempt.Err),
-					"updated_at":      now,
+					"status":              models.OutboxDeliveryFailed,
+					"next_attempt_at":     now.Add(backoff),
+					"locked_at":           nil,
+					"locked_by":           "",
+					"lock_token":          nil,
+					"dispatch_started_at": nil,
+					"last_error":          scrubOutboxFailure(attempt.Err),
+					"updated_at":          now,
 				},
 			); err != nil {
 				return "", err
@@ -567,7 +610,7 @@ func finalizeWebhookOutboxAttempt(
 			return "", err
 		}
 	}
-	if err := clearOutboxEventPublication(
+	if err := preserveOutboxEventPublication(
 		tx,
 		scope,
 		delivery.EventID,
@@ -774,6 +817,18 @@ func clearOutboxEventPublication(
 		return ErrWebhookOutboxLifecycleInvariant
 	}
 	return nil
+}
+
+// preserveOutboxEventPublication serializes an expiration transition with
+// publication without rewriting immutable event history. An expiration never
+// publishes an event, and a destination that published it earlier remains a
+// durable historical fact.
+func preserveOutboxEventPublication(
+	tx *gorm.DB,
+	scope models.ProjectScope,
+	eventID string,
+) error {
+	return lockOutboxLifecycleEvent(tx, scope, eventID)
 }
 
 func lockOutboxLifecycleEvent(

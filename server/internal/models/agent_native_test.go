@@ -1,10 +1,33 @@
 package models
 
 import (
+	"reflect"
 	"testing"
+	"time"
 
 	"gorm.io/datatypes"
 )
+
+func TestWebhookOutboxDeliveryCarriesDurableDispatchStartBoundary(
+	t *testing.T,
+) {
+	field, ok := reflect.TypeOf(OutboxDelivery{}).FieldByName(
+		"DispatchStartedAt",
+	)
+	if !ok {
+		t.Fatal(
+			"OutboxDelivery omits durable dispatch_started_at boundary",
+		)
+	}
+	if field.Type != reflect.TypeOf((*time.Time)(nil)) ||
+		field.Tag.Get("json") != "-" {
+		t.Fatalf(
+			"DispatchStartedAt contract type=%v json=%q",
+			field.Type,
+			field.Tag.Get("json"),
+		)
+	}
+}
 
 func TestActorRefValidationAndAuthoritativeBusinessActors(t *testing.T) {
 	human := HumanActor(42)
