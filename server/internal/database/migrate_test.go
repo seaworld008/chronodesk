@@ -8,6 +8,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
+	buildversion "github.com/seaworld008/chronodesk/server/internal/version"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -70,6 +71,14 @@ func TestValidateRuntimeSchemaAcceptsMigratedModel(t *testing.T) {
 	if err := RunMigrations(db); err != nil {
 		t.Fatalf("migrate runtime schema: %v", err)
 	}
+	var systemVersion models.SystemConfig
+	if err := db.Where(
+		"key = ?",
+		models.SystemConfigKeySystemVersion,
+	).First(&systemVersion).Error; err != nil {
+		t.Fatalf("load migration-owned system.version: %v", err)
+	}
+	assertCanonicalSystemVersion(t, systemVersion, buildversion.Version, 1)
 	if err := ValidateRuntimeSchema(db); err != nil {
 		t.Fatalf("validate migrated schema: %v", err)
 	}
@@ -486,12 +495,17 @@ func TestSeedDataRejectsUntrustedControlledAdministratorCandidates(
 				)
 			}
 			for _, artifact := range []struct {
-				name  string
-				model any
+				name      string
+				model     any
+				wantCount int64
 			}{
 				{name: "memberships", model: &models.ProjectMembership{}},
 				{name: "categories", model: &models.Category{}},
-				{name: "configs", model: &models.SystemConfig{}},
+				{
+					name:      "migration-owned configs",
+					model:     &models.SystemConfig{},
+					wantCount: 1,
+				},
 				{name: "email configs", model: &models.EmailConfig{}},
 				{name: "events", model: &models.DomainEvent{}},
 				{name: "outbox", model: &models.OutboxDelivery{}},
@@ -501,11 +515,12 @@ func TestSeedDataRejectsUntrustedControlledAdministratorCandidates(
 				if countErr := db.Model(artifact.model).Count(&count).Error; countErr != nil {
 					t.Fatalf("count %s: %v", artifact.name, countErr)
 				}
-				if count != 0 {
+				if count != artifact.wantCount {
 					t.Fatalf(
-						"failed seed retained %s = %d, want 0",
+						"failed seed retained %s = %d, want %d",
 						artifact.name,
 						count,
+						artifact.wantCount,
 					)
 				}
 			}
@@ -574,7 +589,7 @@ func TestSeedDataRejectsConflictingDefaultProjectMembershipWithoutOverwrite(
 	if err := db.Model(&models.EmailConfig{}).Count(&emailConfigs).Error; err != nil {
 		t.Fatal(err)
 	}
-	if categories != 0 || configs != 0 || emailConfigs != 0 {
+	if categories != 0 || configs != 1 || emailConfigs != 0 {
 		t.Fatalf(
 			"failed seed was not rolled back: categories=%d configs=%d email_configs=%d",
 			categories,
@@ -612,13 +627,18 @@ func TestSeedDataRequiresTrustedDefaultProjectAndRollsBackAdministrator(
 	}
 
 	for _, assertion := range []struct {
-		name  string
-		model any
+		name      string
+		model     any
+		wantCount int64
 	}{
 		{name: "administrators", model: &models.User{}},
 		{name: "memberships", model: &models.ProjectMembership{}},
 		{name: "categories", model: &models.Category{}},
-		{name: "configs", model: &models.SystemConfig{}},
+		{
+			name:      "migration-owned configs",
+			model:     &models.SystemConfig{},
+			wantCount: 1,
+		},
 		{name: "email configs", model: &models.EmailConfig{}},
 	} {
 		var count int64
@@ -632,8 +652,13 @@ func TestSeedDataRequiresTrustedDefaultProjectAndRollsBackAdministrator(
 		if err := query.Count(&count).Error; err != nil {
 			t.Fatalf("count %s: %v", assertion.name, err)
 		}
-		if count != 0 {
-			t.Fatalf("%s after failed seed = %d, want 0", assertion.name, count)
+		if count != assertion.wantCount {
+			t.Fatalf(
+				"%s after failed seed = %d, want %d",
+				assertion.name,
+				count,
+				assertion.wantCount,
+			)
 		}
 	}
 }
@@ -695,7 +720,7 @@ func TestSeedDataRejectsSamplesOutsideDevelopmentAndRollsBack(t *testing.T) {
 	}
 	if users != 0 ||
 		categories != 0 ||
-		configs != 0 ||
+		configs != 1 ||
 		emailConfigs != 0 ||
 		memberships != 0 ||
 		events != 0 ||

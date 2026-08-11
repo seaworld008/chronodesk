@@ -6,9 +6,62 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	buildversion "github.com/seaworld008/chronodesk/server/internal/version"
 )
 
 const testRuntimeDatabaseURL = "postgres://chronodesk_runtime:test@localhost:5432/chronodesk?sslmode=disable"
+
+func TestLoadUsesBuildVersionAndRejectsRuntimeVersionDrift(t *testing.T) {
+	originalVersion := buildversion.Version
+	buildversion.Version = "0.2.0-test"
+	t.Cleanup(func() {
+		buildversion.Version = originalVersion
+	})
+
+	t.Run("APP_VERSION absent", func(t *testing.T) {
+		t.Setenv("APP_VERSION", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.App.Version != buildversion.Version {
+			t.Fatalf(
+				"App.Version = %q, want build version %q",
+				cfg.App.Version,
+				buildversion.Version,
+			)
+		}
+	})
+
+	t.Run("matching APP_VERSION", func(t *testing.T) {
+		t.Setenv("APP_VERSION", buildversion.Version)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.App.Version != buildversion.Version {
+			t.Fatalf(
+				"App.Version = %q, want build version %q",
+				cfg.App.Version,
+				buildversion.Version,
+			)
+		}
+	})
+
+	t.Run("mismatched APP_VERSION", func(t *testing.T) {
+		t.Setenv("APP_VERSION", "0.1.0-runtime-override")
+		_, err := Load()
+		if err == nil ||
+			!strings.Contains(err.Error(), "APP_VERSION") ||
+			!strings.Contains(err.Error(), buildversion.Version) {
+			t.Fatalf(
+				"Load() error = %v, want stable build-version mismatch",
+				err,
+			)
+		}
+	})
+}
 
 func TestCORSConfigFromEnv(t *testing.T) {
 	t.Setenv("CORS_ALLOWED_ORIGINS", "https://a.com,https://b.com")

@@ -283,7 +283,7 @@ func TestConfigServiceWritePathsRejectInvalidKeysBeforePersistence(t *testing.T)
 	}
 }
 
-func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
+func TestConfigServiceProtectedConfigsRejectGenericWriteBypasses(
 	t *testing.T,
 ) {
 	db := openTestDB(t)
@@ -291,6 +291,14 @@ func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
 		t.Fatalf("migrate system configs: %v", err)
 	}
 	protected := []models.SystemConfig{
+		{
+			Key:         KeySystemVersion,
+			Value:       "0.2.0",
+			ValueType:   "string",
+			Description: "build identity",
+			Category:    CategorySystem,
+			Group:       "basic",
+		},
 		{
 			Key:         KeyAgentGlobalReadOnly,
 			Value:       "false",
@@ -335,6 +343,7 @@ func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
 	assertControlsUnchanged := func(t *testing.T) {
 		t.Helper()
 		for _, key := range []string{
+			KeySystemVersion,
 			KeyAgentGlobalReadOnly,
 			KeyAgentEmergencyStop,
 		} {
@@ -342,9 +351,16 @@ func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
 			if err := db.Where("key = ?", key).First(&persisted).Error; err != nil {
 				t.Fatalf("load protected control %q: %v", key, err)
 			}
-			if persisted.Value != "false" || persisted.ValueType != "bool" {
+			wantValue := "false"
+			wantValueType := "bool"
+			if key == KeySystemVersion {
+				wantValue = "0.2.0"
+				wantValueType = "string"
+			}
+			if persisted.Value != wantValue ||
+				persisted.ValueType != wantValueType {
 				t.Fatalf(
-					"protected control %q changed: %+v",
+					"protected config %q changed: %+v",
 					key,
 					persisted,
 				)
@@ -353,18 +369,19 @@ func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
 	}
 
 	for _, key := range []string{
+		KeySystemVersion,
 		KeyAgentGlobalReadOnly,
 		KeyAgentEmergencyStop,
 	} {
 		t.Run("single-key/"+key, func(t *testing.T) {
-			assertProtected(t, service.ValidateConfig(key, "true", "bool"))
+			assertProtected(t, service.ValidateConfig(key, "changed", "string"))
 			assertProtected(t, service.SetConfig(
 				key,
-				"true",
-				"bool",
+				"changed",
+				"string",
 				"generic bypass",
-				CategorySecurity,
-				"agent",
+				CategorySystem,
+				"basic",
 			))
 			assertControlsUnchanged(t)
 		})
@@ -384,10 +401,10 @@ func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
 				Category:  CategorySystem,
 			},
 			{
-				Key:       KeyAgentEmergencyStop,
-				Value:     "true",
-				ValueType: "bool",
-				Category:  CategorySecurity,
+				Key:       KeySystemVersion,
+				Value:     "changed",
+				ValueType: "string",
+				Category:  CategorySystem,
 			},
 		})
 		assertProtected(t, err)
@@ -412,10 +429,10 @@ func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
 				Category:  CategorySystem,
 			},
 			{
-				Key:       KeyAgentGlobalReadOnly,
-				Value:     "true",
-				ValueType: "bool",
-				Category:  CategorySecurity,
+				Key:       KeySystemVersion,
+				Value:     "changed",
+				ValueType: "string",
+				Category:  CategorySystem,
 			},
 		})
 		if err != nil {
@@ -435,7 +452,7 @@ func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
 	})
 }
 
-func TestConfigServiceGenericListAndExportHideAgentRuntimeControls(t *testing.T) {
+func TestConfigServiceGenericListAndExportHideProtectedConfigs(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
 		t.Fatalf("migrate system configs: %v", err)
@@ -447,6 +464,13 @@ func TestConfigServiceGenericListAndExportHideAgentRuntimeControls(t *testing.T)
 			ValueType: "bool",
 			Category:  CategorySecurity,
 			Group:     "visible",
+		},
+		{
+			Key:       KeySystemVersion,
+			Value:     "0.2.0",
+			ValueType: "string",
+			Category:  CategorySystem,
+			Group:     "basic",
 		},
 		{
 			Key:       KeyAgentGlobalReadOnly,
@@ -496,6 +520,17 @@ func TestConfigServiceGenericListAndExportHideAgentRuntimeControls(t *testing.T)
 	}
 	if len(exported) != 1 || exported[0].Key != "security.visible" {
 		t.Fatalf("generic export exposed protected controls: %+v", exported)
+	}
+
+	systemData, err := service.ExportConfigs(CategorySystem)
+	if err != nil {
+		t.Fatalf("export system configs: %v", err)
+	}
+	if err := json.Unmarshal(systemData, &exported); err != nil {
+		t.Fatalf("decode system export: %v", err)
+	}
+	if len(exported) != 0 {
+		t.Fatalf("system export exposed build identity: %+v", exported)
 	}
 }
 

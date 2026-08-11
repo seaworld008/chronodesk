@@ -1313,6 +1313,9 @@ func runMigrationsFromModelLocked(
 	if err := autoMigrateFromModel(db, firstModel); err != nil {
 		return fmt.Errorf("auto migration failed: %w", err)
 	}
+	if err := migrateSystemVersion(db, version.Version); err != nil {
+		return fmt.Errorf("system version migration failed: %w", err)
+	}
 	if err := MigrateAttachmentStorageIdentityContract(db); err != nil {
 		return fmt.Errorf(
 			"attachment storage identity migration failed: %w",

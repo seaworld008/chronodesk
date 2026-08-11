@@ -26,11 +26,11 @@ var (
 	// key invariant without depending on a persistence error.
 	ErrInvalidSystemConfigKey = errors.New("配置键无效")
 	// ErrProtectedSystemConfigKey prevents the generic configuration surface
-	// from bypassing the Agent platform's audited runtime-control workflow. It
-	// wraps ErrInvalidSystemConfigKey so existing transports fail closed as a
-	// bad generic-config request while callers can still match this sentinel.
+	// from bypassing migration-owned identity or audited runtime-control
+	// workflows. It wraps ErrInvalidSystemConfigKey so existing transports fail
+	// closed while callers can still match this sentinel.
 	ErrProtectedSystemConfigKey = fmt.Errorf(
-		"%w: Agent 全局安全控制必须通过专用接口修改",
+		"%w: 受保护系统配置必须通过专用流程修改",
 		ErrInvalidSystemConfigKey,
 	)
 	ErrConfigExportTooLarge = errors.New("系统配置导出超过大小限制")
@@ -80,7 +80,7 @@ const (
 const (
 	// 系统基础信息
 	KeySystemName        = "system.name"
-	KeySystemVersion     = "system.version"
+	KeySystemVersion     = models.SystemConfigKeySystemVersion
 	KeySystemDescription = "system.description"
 	KeySystemLogo        = "system.logo"
 	KeySystemCopyright   = "system.copyright"
@@ -560,7 +560,7 @@ func validateMutableSystemConfigKeys(configs []models.SystemConfig) error {
 
 func isProtectedSystemConfigKey(key string) bool {
 	switch key {
-	case KeyAgentGlobalReadOnly, KeyAgentEmergencyStop:
+	case KeySystemVersion, KeyAgentGlobalReadOnly, KeyAgentEmergencyStop:
 		return true
 	default:
 		return false
@@ -570,7 +570,11 @@ func isProtectedSystemConfigKey(key string) bool {
 func editableSystemConfigs(query *gorm.DB) *gorm.DB {
 	return query.Where(
 		"key NOT IN ?",
-		[]string{KeyAgentGlobalReadOnly, KeyAgentEmergencyStop},
+		[]string{
+			KeySystemVersion,
+			KeyAgentGlobalReadOnly,
+			KeyAgentEmergencyStop,
+		},
 	)
 }
 
