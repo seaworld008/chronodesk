@@ -112,7 +112,13 @@ test.describe('Ticket Workflow', () => {
             await expect(loadedSurface).toBeVisible({ timeout: 15_000 });
         };
         const openTicketFromList = async () => {
-            await page.goto('/#/tickets');
+            if (/#\/tickets\/\d+\/show(?:\?.*)?$/u.test(page.url())) {
+                await page
+                    .getByRole('link', { name: '返回列表', exact: true })
+                    .click();
+            } else {
+                await page.goto('/#/tickets');
+            }
             const searchInput = await waitForTicketList();
             if ((await searchInput.inputValue()) !== title) {
                 const filteredListResponse =
@@ -128,12 +134,43 @@ test.describe('Ticket Workflow', () => {
             await expect(searchInput).toHaveValue(title);
             await expect(ticketRow()).toBeVisible({ timeout: 10_000 });
         };
-        const openTicketDetailFromList = async () => {
+        const openTicketDetailFromList = async (
+            ticketID: number,
+            expectedNextStatus?:
+                | 'in_progress'
+                | 'resolved'
+                | 'closed',
+        ) => {
             await openTicketFromList();
+            const workflowPath =
+                `${ticketsPath}/${encodeURIComponent(
+                    String(ticketID),
+                )}/transitions`;
+            const workflowResponse = page.waitForResponse(
+                (response) =>
+                    response.request().method() === 'GET'
+                    && new URL(response.url()).pathname === workflowPath,
+            );
             await ticketRow()
                 .getByRole('link', { name: '查看', exact: true })
                 .click();
             await expect(page).toHaveURL(/#\/tickets\/\d+\/show/);
+            const workflow = await workflowResponse;
+            const workflowPayload = await workflow.json();
+            expect(
+                workflow.status(),
+                `加载工单绑定工作流失败：${JSON.stringify(
+                    workflowPayload,
+                )}`,
+            ).toBe(200);
+            const workflowData = extractData<{
+                allowed_next_statuses?: unknown;
+            }>(workflowPayload);
+            if (expectedNextStatus) {
+                expect(workflowData.allowed_next_statuses).toEqual(
+                    expect.arrayContaining([expectedNextStatus]),
+                );
+            }
         };
         const updateTicketStatus = async (
             ticketID: number,
@@ -177,6 +214,13 @@ test.describe('Ticket Workflow', () => {
                 updated.status(),
                 `工单更新失败：${await updated.text()}`,
             ).toBe(200);
+            await expect(dialog).toBeHidden({ timeout: 15_000 });
+            await expect(
+                page
+                    .getByRole('main')
+                    .getByText(statusLabel, { exact: true })
+                    .first(),
+            ).toBeVisible({ timeout: 15_000 });
         };
         const expectStatusInList = async (statusLabel: string) => {
             const row = ticketRow();
@@ -243,6 +287,10 @@ test.describe('Ticket Workflow', () => {
         await page.waitForURL(/#\/tickets\/\d+\/show/, { timeout: 15000 });
 
         const createdTicketID = createdTicket.id as number;
+        await openTicketDetailFromList(
+            createdTicketID,
+            'in_progress',
+        );
         await updateTicketStatus(
             createdTicketID,
             '处理中',
@@ -250,7 +298,10 @@ test.describe('Ticket Workflow', () => {
         await openTicketFromList();
         await expectStatusInList('处理中');
 
-        await openTicketDetailFromList();
+        await openTicketDetailFromList(
+            createdTicketID,
+            'resolved',
+        );
         await updateTicketStatus(
             createdTicketID,
             '已解决',
@@ -258,7 +309,10 @@ test.describe('Ticket Workflow', () => {
         await openTicketFromList();
         await expectStatusInList('已解决');
 
-        await openTicketDetailFromList();
+        await openTicketDetailFromList(
+            createdTicketID,
+            'closed',
+        );
         await updateTicketStatus(
             createdTicketID,
             '已关闭',
@@ -266,7 +320,7 @@ test.describe('Ticket Workflow', () => {
         await openTicketFromList();
         await expectStatusInList('已关闭');
 
-        await openTicketDetailFromList();
+        await openTicketDetailFromList(createdTicketID);
         await page.getByRole('button', { name: '删除', exact: true }).click();
         const confirmDialog = page.getByRole('dialog');
         await expect(confirmDialog).toBeVisible();
