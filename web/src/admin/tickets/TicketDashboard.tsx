@@ -830,7 +830,6 @@ const TicketDashboard: React.FC = () => {
                     variant="contained"
                     color="warning"
                     onClick={() => handleNavigateToTickets({ unassigned: true })}
-                    sx={{ color: 'rgba(0, 0, 0, 0.87)' }}
                   >
                     快速分配
                   </Button>
