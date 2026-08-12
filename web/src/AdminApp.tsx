@@ -261,10 +261,10 @@ const theme = createTheme(
                 contrastText: '#ffffff',
             },
             warning: {
-                main: '#ed6c02',
+                main: '#b45309',
                 light: '#ff9800',
                 dark: '#e65100',
-                contrastText: 'rgba(0, 0, 0, 0.87)',
+                contrastText: '#ffffff',
             },
             background: {
                 default: '#f8fafc',
@@ -289,6 +289,11 @@ const theme = createTheme(
             closedWidth: sidebarClosedWidth,
         },
         components: {
+            MuiCircularProgress: {
+                defaultProps: {
+                    'aria-label': '正在加载',
+                },
+            },
             RaSkipNavigationButton: {
                 defaultProps: {
                     onClick: focusMainContent,
