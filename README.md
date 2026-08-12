@@ -237,8 +237,39 @@ Open:
 - MCP: <http://localhost:8081/mcp>
 - A2A Agent Card: <http://localhost:8081/.well-known/agent-card.json>
 
-The Compose credentials and secrets are development-only. Never reuse them in a
+### Bootstrap administrator
+
+`make dev` starts the services and applies the Schema migration, but it does not
+seed business data. The explicit `chronodesk-migrate -seed` command above
+creates the controlled bootstrap identity only when it does not already exist.
+The account receives `platform_admin` and an active `project_admin` Membership
+in the default Project. On first creation, `ADMIN_EMAIL` defaults to
+`admin@example.com` and `ADMIN_PASSWORD` must be non-empty. The local Compose
+configuration supplies both values, so it does not force the operator to
+configure them.
+
+The isolated Compose demo supplies these development-only sign-in credentials:
+
+- Email: `admin@example.com`
+- Password: `Admin123!`
+
+To override them, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` in the ignored
+repository-root `.env` before `make dev`. Never reuse the Compose defaults in a
 shared or production environment.
+
+For a shared or production deployment, choose the administrator email and
+generate a strong, unique password before the first seed. Inject
+`ADMIN_EMAIL` and `ADMIN_PASSWORD` from the deployment secret manager only into
+the one-shot migration/seed job, then run `chronodesk-migrate -seed`. Do not
+commit either value, put the password in shell history, or leave
+`ADMIN_PASSWORD` in the long-running application environment. Production
+application instances should keep `AUTO_MIGRATE=false`.
+
+`-seed` is idempotent: rerunning it with the same controlled identity does not
+create another administrator and does not reset its password. Choose
+`ADMIN_EMAIL` before the first seed; changing it later does not rename the
+existing account and makes the controlled-identity check fail closed. Use the
+normal password administration or recovery flow for later credential changes.
 
 Stop and remove the local services with:
 
@@ -259,6 +290,7 @@ Requirements:
 ```bash
 make doctor
 cp server/.env.example server/.env
+# Replace ADMIN_EMAIL and the ADMIN_PASSWORD placeholder before the first seed.
 make install-deps
 make db-migrate-seed
 ```
