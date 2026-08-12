@@ -650,7 +650,7 @@ test('未来新增 leaf 只登记 registry 数据即可进入通用过滤结果'
     assert.ok(items.some((item) => item.id === 'future-governance'))
 })
 
-test('当前路由强制展开所属 group 且不破坏其他展开选择', () => {
+test('当前路由默认展开所属 group，之后可手动收起且不破坏其他展开选择', () => {
     const nodes = registryModule.visibleNavigationNodes(
         'sidebar',
         platformProjectAdmin,
@@ -671,11 +671,29 @@ test('当前路由强制展开所属 group 且不破坏其他展开选择', () =
     )
     assert.deepEqual(
         stateModule.toggleNavigationGroup(
-            { 'intelligent-operations': true },
-            'intelligent-operations',
+            {
+                'project-operations': true,
+                'intelligent-operations': true,
+            },
             'intelligent-operations',
         ),
-        { 'intelligent-operations': true },
+        {
+            'project-operations': true,
+            'intelligent-operations': false,
+        },
+    )
+    assert.deepEqual(
+        stateModule.toggleNavigationGroup(
+            {
+                'project-operations': true,
+                'intelligent-operations': false,
+            },
+            'intelligent-operations',
+        ),
+        {
+            'project-operations': true,
+            'intelligent-operations': true,
+        },
     )
 })
 

@@ -32,11 +32,25 @@ guardrail 的能力进入“系统设置”；跨项目资产、身份、合规�
 
 一级节点使用相同视觉样式，不渲染“我的工作”“平台管理”等分区标题或分隔卡。
 children 多于一个的一级节点点击只展开或收起二级列表；只有一个 child 时，通用
-renderer 将一级节点直接渲染为该 child 的链接。当前路由所在多子项分组会强制保持
-展开，同时保留用户手动展开的其他分组。工作台当前依次包含“运营大屏”和“跨项目
-工作台”，因此由通用 renderer 渲染为 Collapse。`/workbench/dashboard` 使用更
-具体的 active prefix；`/workbench` leaf 通过 registry 的 `activePathExclusions`
-排除该子路由，避免两个入口同时激活。
+renderer 将一级节点直接渲染为该 child 的链接。进入路由时，所在的多子项分组默认
+展开；用户之后仍可手动收起当前分组，各分组的展开选择彼此独立，也可以同时展开
+多个分组。工作台当前依次包含“运营大屏”和“跨项目工作台”，因此由通用 renderer
+渲染为 Collapse。`/workbench/dashboard` 使用更具体的 active prefix；
+`/workbench` leaf 通过 registry 的 `activePathExclusions` 排除该子路由，避免两个
+入口同时激活。
+
+功能树的状态视觉与 OINK 文档导航保持同一合同：一级文字使用 `#16222e`，二级
+文字使用 `#586b80`，非当前项 hover 使用 `rgba(22, 34, 46, 0.06)`；当前功能页
+使用 `#245f94`、`rgba(36, 95, 148, 0.1)` 背景和 1px 当前项导轨。分组展开本身
+不冒充当前功能页，当前页只由 canonical route 决定。桌面行高 36px、圆角 10px；
+移动端行高保持 44px，以满足触控命中要求。
+
+桌面侧栏展开宽度默认 240px，可在 216–360px 之间拖动调整；分隔条支持
+Left/Right、Shift 加速、Home/End 和双击恢复默认值，宽度偏好按账号持久化。
+收起宽度固定为 56px，只保留带可访问名称和 Tooltip 的一级图标，二级功能、文字、
+箭头和导轨立即退出渲染，但不会清空各分组的展开选择；点击收起态的分组图标会恢复
+上次宽度和树状态。移动端继续使用 240px 临时 Drawer，不显示桌面调宽分隔条，也
+不会覆盖桌面宽度偏好。
 
 项目运营、智能运营、集成中心和项目设置都要求已解析的 `ProjectScope`。没有
 当前项目时，这些分组整体隐藏。治理中心只承载已经实现的项目治理、平台身份与访问、
@@ -137,6 +151,8 @@ group ID 始终来自完整 registry，而非异步权限过滤后的首屏子�
 - 缺失 active path 的 leaf。
 
 每次新增节点至少覆盖：职责/capability 可见性、无项目隐藏、route guard、当前
-路由自动展开、Enter/Space 键盘操作、`aria-expanded`/`aria-controls`、会话隔离
-持久化，以及旧 URL 重定向。新增 leaf 的测试应证明只修改 registry 数据即可由
-通用 renderer 呈现。
+路由进入时默认展开且可手动收起、Enter/Space 键盘操作、
+`aria-expanded`/`aria-controls`、会话隔离持久化，以及旧 URL 重定向。新增 leaf
+的测试应证明只修改 registry 数据即可由通用 renderer 呈现。侧栏壳层改动还必须
+覆盖收起态无可见文字和二级节点、宽度边界与刷新恢复、separator 键盘操作，以及
+移动端无调宽控件。
