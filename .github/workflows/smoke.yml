@@ -24,6 +24,7 @@ jobs:
       ADMIN_PASSWORD: Admin123!
       CHRONODESK_E2E_OWNERSHIP_PREFIX: e2e-ci-${{ github.run_id }}-${{ github.run_attempt }}
       CHRONODESK_E2E_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CHRONODESK_EPHEMERAL_E2E: "1"
 
     steps:
       - name: Checkout repository

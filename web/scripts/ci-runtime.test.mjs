@@ -31,6 +31,10 @@ test('完整 Smoke 只验证 PR 合并结果并取消同 PR 的旧运行', async
     "${{ github.event_name == 'pull_request' }}",
   )
   assert.equal(workflow.jobs.smoke['timeout-minutes'], 35)
+  assert.equal(
+    workflow.jobs.smoke.env.CHRONODESK_EPHEMERAL_E2E,
+    '1',
+  )
   assert.match(
     workflow.jobs.smoke.env.CHRONODESK_E2E_RUN_ID,
     /github\.run_id/u,
