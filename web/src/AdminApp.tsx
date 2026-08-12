@@ -7,6 +7,7 @@ import {
     Title,
     type LayoutProps,
     usePermissions,
+    useSidebarState,
 } from 'react-admin'
 import {
     Navigate,
@@ -26,9 +27,14 @@ import {
     ListItemText,
     Paper,
     Stack,
+    Tooltip,
     Typography,
 } from '@mui/material'
-import { createTheme } from '@mui/material/styles'
+import {
+    createTheme,
+    type SxProps,
+    type Theme,
+} from '@mui/material/styles'
 import { useQueryClient } from '@tanstack/react-query'
 
 import { dataProvider } from './lib/dataProvider'
@@ -74,13 +80,16 @@ import {
     History as HistoryIcon,
     Notifications as NotificationIcon,
     People as UsersIcon,
-    ExpandLess,
     ExpandMore,
 } from '@mui/icons-material'
 
 import { CustomLayout as Layout } from './layout/CustomLayout'
 import { CustomAppBar } from './layout/CustomAppBar'
 import { focusMainContent } from './layout/skipNavigation'
+import {
+    sidebarClosedWidth,
+    sidebarDefaultWidth,
+} from './layout/sidebarWidth'
 import LoginPage from './components/auth/LoginPage'
 import { AppNotification } from './components/layout/AppNotification'
 import { i18nProvider, muiZhCN } from './i18n'
@@ -275,6 +284,10 @@ const theme = createTheme(
             ].join(','),
         },
         shape: { borderRadius: 12 },
+        sidebar: {
+            width: sidebarDefaultWidth,
+            closedWidth: sidebarClosedWidth,
+        },
         components: {
             RaSkipNavigationButton: {
                 defaultProps: {
@@ -823,15 +836,11 @@ const useNavigationTreeState = (
             }
             return next
         })
-    }, [activeGroupID, binding])
+    }, [activeGroupID, binding, pathname])
 
     const toggleGroup = React.useCallback((groupID: string) => {
         setExpanded((current) => {
-            const next = toggleNavigationGroup(
-                current,
-                groupID,
-                activeGroupID,
-            )
+            const next = toggleNavigationGroup(current, groupID)
             if (binding) {
                 saveNavigationGroupState(
                     localStorage,
@@ -842,13 +851,123 @@ const useNavigationTreeState = (
             }
             return next
         })
-    }, [activeGroupID, binding])
+    }, [binding])
 
     return { activeGroupID, expanded, pathname, toggleGroup }
 }
 
+type NavigationRowLevel = 'primary' | 'secondary'
+
+const oinkNavigationColors = {
+    active: '#245f94',
+    activeBackground: 'rgba(36, 95, 148, 0.1)',
+    branch: '#16222e',
+    branchHover: 'rgba(22, 34, 46, 0.06)',
+    child: '#586b80',
+    rail: 'rgba(22, 34, 46, 0.1)',
+} as const
+
+const navigationRowSx = (
+    level: NavigationRowLevel,
+    currentPage: boolean,
+    compact = false,
+): SxProps<Theme> => (rowTheme) => {
+    const isSecondary = level === 'secondary'
+    const rowColor = currentPage
+        ? oinkNavigationColors.active
+        : isSecondary
+            ? oinkNavigationColors.child
+            : oinkNavigationColors.branch
+
+    return {
+        position: 'relative',
+        width: '100%',
+        height: 36,
+        minHeight: '36px !important',
+        mt: isSecondary ? 0 : 0.25,
+        px: compact ? 0 : 1,
+        py: 0.75,
+        pl: compact ? 0 : isSecondary ? 3 : 1,
+        borderRadius: '10px',
+        overflow: 'hidden',
+        justifyContent: compact ? 'center' : 'flex-start',
+        color: rowColor,
+        backgroundColor: currentPage
+            ? oinkNavigationColors.activeBackground
+            : 'transparent',
+        boxShadow: 'none',
+        transition: currentPage
+            ? 'none'
+            : 'background-color 150ms',
+        '&::before': {
+            position: 'absolute',
+            zIndex: 2,
+            top: 6,
+            bottom: 6,
+            left: 10,
+            width: '1px',
+            backgroundColor: oinkNavigationColors.active,
+            content: currentPage && isSecondary ? '""' : 'none',
+        },
+        '& .RaMenuItemLink-icon, & > .MuiListItemIcon-root': {
+            minWidth: compact ? 0 : 24,
+            color: 'inherit',
+            justifyContent: 'center',
+        },
+        '& [data-navigation-icon]': {
+            width: '16px !important',
+            height: '16px !important',
+        },
+        '& [data-navigation-icon] .MuiSvgIcon-root': {
+            fontSize: 16,
+        },
+        '& .MuiTypography-root': {
+            color: 'inherit',
+            display: compact ? 'none' : undefined,
+            fontSize: 14,
+            fontWeight: isSecondary ? 400 : 500,
+            lineHeight: '23.8px',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+        },
+        '& .MuiListItemText-root': {
+            minWidth: 0,
+        },
+        '&.RaMenuItemLink-active': {
+            color: rowColor,
+            backgroundColor: currentPage
+                ? oinkNavigationColors.activeBackground
+                : 'transparent',
+        },
+        '&:hover': {
+            color: currentPage
+                ? rowColor
+                : oinkNavigationColors.branch,
+            backgroundColor: currentPage
+                ? oinkNavigationColors.activeBackground
+                : oinkNavigationColors.branchHover,
+            transition: 'none',
+        },
+        '&.Mui-focusVisible, &:focus-visible': {
+            outline: `2px solid ${oinkNavigationColors.active}`,
+            outlineOffset: -2,
+        },
+        [rowTheme.breakpoints.down('md')]: {
+            height: 44,
+            minHeight: '44px !important',
+            py: 1.25,
+            '&::before': {
+                top: 10,
+                bottom: 10,
+            },
+        },
+    }
+}
+
 const CustomMenu: React.FC = () => {
     const { permissions } = usePermissions<AccessPermissions>()
+    const [sidebarOpen, setSidebarOpen] = useSidebarState()
     const { access, isPending } = useActiveProjectAccess()
     const projectRole = parseProjectRole(access?.project_role)
     const hasProject = !isPending && projectRole !== null
@@ -886,13 +1005,16 @@ const CustomMenu: React.FC = () => {
                                 <NavigationIconGlyph icon={directEntry.icon} />
                             }
                             data-navigation-id={directEntry.id}
+                            data-navigation-level="primary"
+                            data-navigation-state={
+                                active ? 'active' : 'idle'
+                            }
                             aria-current={active ? 'page' : undefined}
-                            sx={{
-                                py: 0.75,
-                                bgcolor: active
-                                    ? 'action.selected'
-                                    : undefined,
-                            }}
+                            sx={navigationRowSx(
+                                'primary',
+                                active,
+                                !sidebarOpen,
+                            )}
                         />
                     )
                 }
@@ -900,91 +1022,153 @@ const CustomMenu: React.FC = () => {
                 const contentID = `navigation-group-${node.id}-children`
                 const isExpanded = expanded[node.id] === true
                 const isActive = activeGroupID === node.id
+                const renderedExpanded = sidebarOpen && isExpanded
+                const activateGroup = () => {
+                    if (!sidebarOpen) {
+                        setSidebarOpen(true)
+                        if (!isExpanded) toggleGroup(node.id)
+                        return
+                    }
+                    toggleGroup(node.id)
+                }
                 return (
-                    <Box component="div" key={node.id}>
-                        <ListItemButton
-                            component="button"
-                            type="button"
-                            role="menuitem"
-                            aria-expanded={isExpanded}
-                            aria-controls={contentID}
-                            data-navigation-id={node.id}
-                            data-testid={`navigation-group-${nodeIndex}-toggle`}
-                            onClick={() => toggleGroup(node.id)}
-                            onKeyDown={(event) => {
-                                if (!isNavigationToggleKey(event.key)) return
-                                event.preventDefault()
-                                toggleGroup(node.id)
-                            }}
-                            sx={{
-                                width: '100%',
-                                color: isActive
-                                    ? 'primary.dark'
-                                    : 'text.secondary',
-                                bgcolor: isActive
-                                    ? 'action.selected'
-                                    : undefined,
-                                py: 0.75,
-                            }}
+                    <Box component="li" key={node.id} role="none">
+                        <Tooltip
+                            title={sidebarOpen ? '' : node.label}
+                            placement="right"
                         >
-                            <ListItemIcon sx={{ minWidth: 36 }}>
-                                <NavigationIconGlyph icon={node.icon} />
-                            </ListItemIcon>
-                            <ListItemText
-                                primary={node.label}
-                                slotProps={{
-                                    primary: {
-                                        variant: 'body2',
-                                        sx: {
-                                            fontWeight: isActive ? 700 : 600,
-                                        },
-                                    },
+                            <ListItemButton
+                                component="button"
+                                type="button"
+                                role="menuitem"
+                                aria-label={node.label}
+                                aria-expanded={renderedExpanded}
+                                aria-controls={
+                                    sidebarOpen ? contentID : undefined
+                                }
+                                data-navigation-id={node.id}
+                                data-navigation-level="primary"
+                                data-navigation-state={
+                                    isActive ? 'active' : 'idle'
+                                }
+                                data-testid={
+                                    `navigation-group-${nodeIndex}-toggle`
+                                }
+                                onClick={activateGroup}
+                                onKeyDown={(event) => {
+                                    if (!isNavigationToggleKey(event.key)) {
+                                        return
+                                    }
+                                    event.preventDefault()
+                                    activateGroup()
                                 }}
-                            />
-                            {isExpanded ? <ExpandLess /> : <ExpandMore />}
-                        </ListItemButton>
-                        <Collapse
-                            in={isExpanded}
-                            timeout="auto"
-                            unmountOnExit
-                            id={contentID}
-                        >
-                            <List
-                                component="div"
-                                role="group"
-                                aria-label={`${node.label}导航`}
-                                disablePadding
+                                sx={navigationRowSx(
+                                    'primary',
+                                    false,
+                                    !sidebarOpen,
+                                )}
                             >
-                                {node.children.map((item) => {
-                                    const active = isNavigationItemActive(
-                                        item,
-                                        pathname,
-                                    )
-                                    return (
-                                        <Menu.Item
-                                            key={item.id}
-                                            to={item.path}
-                                            primaryText={item.label}
-                                            leftIcon={
-                                                <NavigationIconGlyph
-                                                    icon={item.icon}
-                                                />
-                                            }
-                                            data-navigation-id={item.id}
-                                            aria-current={
-                                                active ? 'page' : undefined
-                                            }
-                                            sx={{
-                                                pl: 4,
-                                                bgcolor: active
-                                                    ? 'action.selected'
-                                                    : undefined,
+                                <ListItemIcon>
+                                    <NavigationIconGlyph icon={node.icon} />
+                                </ListItemIcon>
+                                {sidebarOpen ? (
+                                    <>
+                                        <ListItemText
+                                            primary={node.label}
+                                            slotProps={{
+                                                primary: {
+                                                    variant: 'body2',
+                                                    sx: {
+                                                        fontWeight: 'inherit',
+                                                    },
+                                                },
                                             }}
                                         />
-                                    )
-                                })}
-                            </List>
-                        </Collapse>
+                                        <ExpandMore
+                                            aria-hidden="true"
+                                            sx={{
+                                                width: 24,
+                                                height: 24,
+                                                p: 0.5,
+                                                color:
+                                                    oinkNavigationColors.child,
+                                                transform: isExpanded
+                                                    ? 'rotate(0deg)'
+                                                    : 'rotate(-90deg)',
+                                                transition: 'transform 150ms',
+                                            }}
+                                        />
+                                    </>
+                                ) : null}
+                            </ListItemButton>
+                        </Tooltip>
+                        {sidebarOpen ? (
+                            <Collapse
+                                in={isExpanded}
+                                timeout={150}
+                                unmountOnExit
+                                id={contentID}
+                            >
+                                <List
+                                    component="div"
+                                    role="group"
+                                    aria-label={`${node.label}导航`}
+                                    disablePadding
+                                    sx={{
+                                        position: 'relative',
+                                        '&::before': {
+                                            position: 'absolute',
+                                            top: 4,
+                                            bottom: 4,
+                                            left: 10,
+                                            width: '1px',
+                                            backgroundColor:
+                                                oinkNavigationColors.rail,
+                                            content: '""',
+                                            pointerEvents: 'none',
+                                        },
+                                    }}
+                                >
+                                    {node.children.map((item) => {
+                                        const active =
+                                            isNavigationItemActive(
+                                                item,
+                                                pathname,
+                                            )
+                                        return (
+                                            <Menu.Item
+                                                key={item.id}
+                                                to={item.path}
+                                                primaryText={item.label}
+                                                leftIcon={
+                                                    <NavigationIconGlyph
+                                                        icon={item.icon}
+                                                    />
+                                                }
+                                                data-navigation-id={item.id}
+                                                data-navigation-level={
+                                                    'secondary'
+                                                }
+                                                data-navigation-state={
+                                                    active
+                                                        ? 'active'
+                                                        : 'idle'
+                                                }
+                                                aria-current={
+                                                    active
+                                                        ? 'page'
+                                                        : undefined
+                                                }
+                                                sx={navigationRowSx(
+                                                    'secondary',
+                                                    active,
+                                                )}
+                                            />
+                                        )
+                                    })}
+                                </List>
+                            </Collapse>
+                        ) : null}
                     </Box>
                 )
             })}

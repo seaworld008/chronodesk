@@ -119,10 +119,9 @@ export const expandActiveNavigationGroup = (
 export const toggleNavigationGroup = (
     state: NavigationGroupState,
     groupID: string,
-    forcedOpenGroupID: string | null = null,
 ): NavigationGroupState => ({
     ...state,
-    [groupID]: groupID === forcedOpenGroupID ? true : !state[groupID],
+    [groupID]: !state[groupID],
 })
 
 export const isNavigationToggleKey = (key: string): boolean =>
