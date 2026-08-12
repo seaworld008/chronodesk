@@ -261,6 +261,105 @@ const readStableTransform = async (locator: Locator): Promise<string> => {
 };
 
 test.describe('OINK 左侧导航交互状态（mock）', () => {
+    test('当前路由主项在首次可交互帧前完成自动展开', async ({
+        page,
+    }) => {
+        await page.addInitScript(() => {
+            const state = window as typeof window & {
+                __chronodeskActiveNavigationGroupStates?: string[];
+            };
+            const start = () => {
+                state.__chronodeskActiveNavigationGroupStates = [];
+                const record = (
+                    activeGroup: HTMLElement,
+                    expanded: string | null,
+                ) => {
+                    const observation = [
+                        activeGroup.dataset.navigationId,
+                        expanded,
+                    ].join(':');
+                    const observations =
+                        state.__chronodeskActiveNavigationGroupStates ?? [];
+                    if (observations.at(-1) !== observation) {
+                        observations.push(observation);
+                    }
+                };
+                const capture = () => {
+                    const activeGroup = document.querySelector<HTMLElement>(
+                        '[data-navigation-level="primary"]' +
+                        '[data-navigation-state="active"]' +
+                        '[aria-expanded]',
+                    );
+                    if (!activeGroup) return;
+                    record(
+                        activeGroup,
+                        activeGroup.getAttribute('aria-expanded'),
+                    );
+                };
+                new MutationObserver((mutations) => {
+                    for (const mutation of mutations) {
+                        if (
+                            mutation.type !== 'attributes' ||
+                            mutation.attributeName !== 'aria-expanded' ||
+                            !(mutation.target instanceof HTMLElement) ||
+                            mutation.target.dataset.navigationState !== 'active'
+                        ) {
+                            continue;
+                        }
+                        record(mutation.target, mutation.oldValue);
+                    }
+                    capture();
+                }).observe(
+                    document.documentElement,
+                    {
+                        attributes: true,
+                        attributeOldValue: true,
+                        childList: true,
+                        subtree: true,
+                        attributeFilter: [
+                            'aria-expanded',
+                            'data-navigation-state',
+                        ],
+                    },
+                );
+                capture();
+            };
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', start, {
+                    once: true,
+                });
+            } else {
+                start();
+            }
+        });
+
+        const backend = await installNavigationMocks(page);
+        await page.goto('/#/');
+        await expect(page.getByTestId('project-home')).toBeVisible();
+
+        const projectOperations = navigationRow(
+            page.getByRole('menu', { name: '主导航' }),
+            'primary',
+            'project-operations',
+        );
+        await expect(projectOperations).toHaveAttribute(
+            'aria-expanded',
+            'true',
+        );
+        const observations = await page.evaluate(() => (
+            window as typeof window & {
+                __chronodeskActiveNavigationGroupStates?: string[];
+            }
+        ).__chronodeskActiveNavigationGroupStates ?? []);
+        expect(
+            observations.filter((observation) =>
+                observation.startsWith('project-operations:'),
+            ),
+        ).toEqual(['project-operations:true']);
+        expect(backend.unexpectedApiRequests).toEqual([]);
+    });
+
     test('精确区分主项、功能页、hover、focus 与展开状态', async ({
         page,
     }) => {

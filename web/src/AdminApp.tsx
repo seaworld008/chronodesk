@@ -89,7 +89,7 @@ import { focusMainContent } from './layout/skipNavigation'
 import {
     sidebarClosedWidth,
     sidebarDefaultWidth,
-} from './layout/sidebarWidth'
+} from '@/layout/sidebarWidth'
 import LoginPage from './components/auth/LoginPage'
 import { AppNotification } from './components/layout/AppNotification'
 import { i18nProvider, muiZhCN } from './i18n'
@@ -784,8 +784,8 @@ const persistedNavigationGroupIDs = validNavigationGroupIDs(
 
 const useNavigationTreeState = (
     nodes: ReturnType<typeof visibleNavigationNodes>,
+    pathname: string,
 ) => {
-    const { pathname } = useLocation()
     const session = readHumanSessionBinding()
     const sessionSubject = session?.subject ?? ''
     const sessionID = session?.session_id ?? ''
@@ -810,23 +810,60 @@ const useNavigationTreeState = (
             : {}
         return expandActiveNavigationGroup(stored, activeGroupID)
     }, [activeGroupID, binding])
-    const [expanded, setExpanded] =
-        React.useState<NavigationGroupState>(loadState)
-    const loadedBindingKey = React.useRef(bindingKey)
-
-    React.useEffect(() => {
-        if (loadedBindingKey.current === bindingKey) return
-        loadedBindingKey.current = bindingKey
-        setExpanded(loadState())
-    }, [bindingKey, loadState])
-
-    React.useEffect(() => {
-        setExpanded((current) => {
-            const next = expandActiveNavigationGroup(
-                current,
+    const [treeState, setTreeState] = React.useState<{
+        activeGroupID: string | null
+        bindingKey: string
+        expanded: NavigationGroupState
+        pathname: string
+    }>(() => ({
+        activeGroupID,
+        bindingKey,
+        expanded: loadState(),
+        pathname,
+    }))
+    const expanded = React.useMemo(() => {
+        if (treeState.bindingKey !== bindingKey) {
+            return loadState()
+        }
+        if (
+            treeState.activeGroupID !== activeGroupID ||
+            treeState.pathname !== pathname
+        ) {
+            return expandActiveNavigationGroup(
+                treeState.expanded,
                 activeGroupID,
             )
-            if (next !== current && binding) {
+        }
+        return treeState.expanded
+    }, [
+        activeGroupID,
+        bindingKey,
+        loadState,
+        pathname,
+        treeState,
+    ])
+
+    React.useEffect(() => {
+        setTreeState((current) => {
+            if (
+                current.bindingKey === bindingKey &&
+                current.activeGroupID === activeGroupID &&
+                current.pathname === pathname
+            ) {
+                return current
+            }
+            const currentExpanded = current.bindingKey === bindingKey
+                ? current.expanded
+                : loadState()
+            const next = expandActiveNavigationGroup(
+                currentExpanded,
+                activeGroupID,
+            )
+            if (
+                current.bindingKey === bindingKey &&
+                next !== currentExpanded &&
+                binding
+            ) {
                 saveNavigationGroupState(
                     localStorage,
                     binding,
@@ -834,13 +871,38 @@ const useNavigationTreeState = (
                     persistedNavigationGroupIDs,
                 )
             }
-            return next
+            return {
+                activeGroupID,
+                bindingKey,
+                expanded: next,
+                pathname,
+            }
         })
-    }, [activeGroupID, binding, pathname])
+    }, [
+        activeGroupID,
+        binding,
+        bindingKey,
+        loadState,
+        pathname,
+    ])
 
     const toggleGroup = React.useCallback((groupID: string) => {
-        setExpanded((current) => {
-            const next = toggleNavigationGroup(current, groupID)
+        setTreeState((current) => {
+            const currentExpanded = current.bindingKey === bindingKey
+                ? (
+                    current.activeGroupID === activeGroupID &&
+                    current.pathname === pathname
+                        ? current.expanded
+                        : expandActiveNavigationGroup(
+                            current.expanded,
+                            activeGroupID,
+                        )
+                )
+                : loadState()
+            const next = toggleNavigationGroup(
+                currentExpanded,
+                groupID,
+            )
             if (binding) {
                 saveNavigationGroupState(
                     localStorage,
@@ -849,9 +911,20 @@ const useNavigationTreeState = (
                     persistedNavigationGroupIDs,
                 )
             }
-            return next
+            return {
+                activeGroupID,
+                bindingKey,
+                expanded: next,
+                pathname,
+            }
         })
-    }, [binding])
+    }, [
+        activeGroupID,
+        binding,
+        bindingKey,
+        loadState,
+        pathname,
+    ])
 
     return { activeGroupID, expanded, pathname, toggleGroup }
 }
@@ -966,26 +1039,74 @@ const navigationRowSx = (
 }
 
 const CustomMenu: React.FC = () => {
-    const { permissions } = usePermissions<AccessPermissions>()
+    const { pathname } = useLocation()
+    const {
+        permissions,
+        isPending: permissionsPending,
+    } = usePermissions<AccessPermissions>()
     const [sidebarOpen, setSidebarOpen] = useSidebarState()
-    const { access, isPending } = useActiveProjectAccess()
+    const {
+        access,
+        projects,
+        isPending: projectAccessPending,
+    } = useActiveProjectAccess()
     const projectRole = parseProjectRole(access?.project_role)
-    const hasProject = !isPending && projectRole !== null
+    const navigationPending =
+        permissionsPending || projectAccessPending
+    const hasProject = !navigationPending && projectRole !== null
     const platformRole = parsePlatformRole(permissions?.platform_role)
+    const navigationPathname =
+        !navigationPending &&
+        pathname === '/' &&
+        !hasProject &&
+        projects.length === 0 &&
+        platformRole !== null &&
+        platformRole !== 'member'
+            ? '/platform/home'
+            : pathname
     const nodes = React.useMemo(
-        () => visibleNavigationNodes('sidebar', {
+        () => navigationPending
+            ? []
+            : visibleNavigationNodes('sidebar', {
+                platformRole,
+                projectRole,
+                hasProject,
+            }),
+        [
+            hasProject,
+            navigationPending,
             platformRole,
             projectRole,
-            hasProject,
-        }),
-        [hasProject, platformRole, projectRole],
+        ],
     )
     const {
         activeGroupID,
         expanded,
-        pathname,
+        pathname: activePathname,
         toggleGroup,
-    } = useNavigationTreeState(nodes)
+    } = useNavigationTreeState(nodes, navigationPathname)
+
+    if (navigationPending) {
+        return (
+            <Menu aria-label="主导航" aria-busy="true">
+                <Box
+                    component="li"
+                    role="none"
+                    sx={{
+                        display: 'grid',
+                        minHeight: 72,
+                        placeItems: 'center',
+                    }}
+                >
+                    <CircularProgress
+                        role="status"
+                        aria-label="正在加载导航"
+                        size={20}
+                    />
+                </Box>
+            </Menu>
+        )
+    }
 
     return (
         <Menu aria-label="主导航">
@@ -994,7 +1115,7 @@ const CustomMenu: React.FC = () => {
                 if (directEntry) {
                     const active = isNavigationItemActive(
                         directEntry,
-                        pathname,
+                        activePathname,
                     )
                     return (
                         <Menu.Item
@@ -1133,7 +1254,7 @@ const CustomMenu: React.FC = () => {
                                         const active =
                                             isNavigationItemActive(
                                                 item,
-                                                pathname,
+                                                activePathname,
                                             )
                                         return (
                                             <Menu.Item

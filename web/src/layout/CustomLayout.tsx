@@ -23,7 +23,7 @@ import {
   sidebarDefaultWidth,
   sidebarMaxWidth,
   sidebarMinWidth,
-} from './sidebarWidth'
+} from '@/layout/sidebarWidth'
 
 const primaryNavigationID = 'chronodesk-primary-navigation'
 
