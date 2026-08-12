@@ -1,0 +1,181 @@
+name: CI Policy
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+  workflow_run:
+    workflows: [Smoke Tests]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: 要重新评估的开放 PR 编号
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  policy:
+    if: >-
+      github.event_name == 'workflow_run' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify protected CI files
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            let pullNumber;
+            if (context.eventName === 'workflow_run') {
+              const run = context.payload.workflow_run;
+              if (run.event !== 'pull_request') {
+                core.notice('忽略非 Pull Request 的 Smoke 运行。');
+                return;
+              }
+              const associated = await github.paginate(
+                github.rest.repos.listPullRequestsAssociatedWithCommit,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: run.head_sha,
+                  per_page: 100,
+                },
+              );
+              const candidates = associated.filter(
+                (candidate) =>
+                  candidate.state === 'open' &&
+                  candidate.base.ref === 'main' &&
+                  candidate.base.repo.full_name ===
+                    `${context.repo.owner}/${context.repo.repo}` &&
+                  candidate.head.sha === run.head_sha &&
+                  candidate.head.repo?.full_name ===
+                    run.head_repository?.full_name,
+              );
+              if (candidates.length !== 1) {
+                core.notice(
+                  '没有找到与本次 Smoke 精确匹配的唯一开放 PR。',
+                );
+                return;
+              }
+              pullNumber = candidates[0].number;
+            } else if (context.eventName === 'workflow_dispatch') {
+              pullNumber = Number(context.payload.inputs.pull_request);
+              if (!Number.isSafeInteger(pullNumber) || pullNumber < 1) {
+                core.setFailed('必须提供有效的开放 PR 编号。');
+                return;
+              }
+            } else {
+              pullNumber = context.payload.pull_request.number;
+            }
+
+            const response = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullNumber,
+            });
+            const pull = response.data;
+
+            if (
+              pull.state !== 'open' ||
+              pull.base.ref !== 'main' ||
+              pull.base.repo.full_name !==
+                `${context.repo.owner}/${context.repo.repo}`
+            ) {
+              core.setFailed('CI policy 仅处理目标为本仓库 main 的开放 PR。');
+              return;
+            }
+
+            let permission = 'none';
+            try {
+              const response =
+                await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: pull.user.login,
+                });
+              permission = response.data.permission;
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+            const trusted = new Set([
+              'admin',
+              'maintain',
+              'push',
+              'write',
+            ]).has(permission);
+            const protectedPaths = [
+              '.github/main-branch-protection.json',
+              '.github/workflows/',
+            ];
+            let complete = true;
+            let protectedChanges = [];
+            if (!trusted) {
+              const files = await github.paginate(
+                github.rest.pulls.listFiles,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pull.number,
+                  per_page: 100,
+                },
+              );
+              complete =
+                Number.isSafeInteger(pull.changed_files) &&
+                files.length === pull.changed_files;
+              protectedChanges = files
+                .flatMap(({ filename, previous_filename: previous }) =>
+                  typeof previous === 'string'
+                    ? [filename, previous]
+                    : [filename],
+                )
+                .filter((filename) =>
+                  protectedPaths.some((path) =>
+                    path.endsWith('/')
+                      ? filename.startsWith(path)
+                      : filename === path,
+                  ),
+                )
+                .filter(
+                  (filename, index, all) =>
+                    all.indexOf(filename) === index,
+                );
+            }
+            const accepted =
+              trusted ||
+              (complete && protectedChanges.length === 0);
+            const description = trusted
+              ? '仓库写入者可维护受保护 CI 文件'
+              : !complete
+                ? 'PR 文件清单不完整，CI policy 失败关闭'
+                : accepted
+                  ? '受保护 CI 文件策略通过'
+                  : '外部贡献者不得修改受保护 CI 文件';
+            const targetUrl =
+              `${context.serverUrl}/${context.repo.owner}/` +
+              `${context.repo.repo}/actions/runs/${context.runId}`;
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: pull.head.sha,
+              state: accepted ? 'success' : 'failure',
+              context: 'ci-policy',
+              description,
+              target_url: targetUrl,
+            });
+
+            if (!accepted) {
+              const details = !complete
+                ? `GitHub 返回的文件数与 changed_files=${pull.changed_files} 不一致`
+                : protectedChanges.join(', ');
+              core.setFailed(`${description}: ${details}`);
+            }

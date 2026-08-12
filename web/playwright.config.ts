@@ -22,6 +22,10 @@ assertDestructiveE2EAllowed('启动 Playwright 写测试会话');
 
 const isPublishingCI =
     process.env.CI === 'true' || process.env.CI === '1';
+const isEphemeralPublishingCI =
+    isPublishingCI &&
+    isLoopbackE2E() &&
+    process.env.CHRONODESK_EPHEMERAL_E2E === '1';
 const shouldStartLocalServer =
     isLoopbackE2E() &&
     configuredBaseURL.port === '3000';
@@ -33,11 +37,12 @@ const shouldStartLocalServer =
 export default defineConfig({
     testDir: './e2e',
     // E2E 场景会修改共享的管理员账号、系统配置和测试数据。
-    // 固定单 worker 可避免并行登录触发认证限流，也避免清理阶段互相删除数据。
+    // 只有 CI 的一次性回环环境允许文件级并行；共享、本地和远端环境固定单
+    // worker，避免并行登录限流或清理其他会话的数据。单文件内部仍保持串行。
     fullyParallel: false,
     forbidOnly: isPublishingCI,
     retries: isPublishingCI ? 2 : 0,
-    workers: 1,
+    workers: isEphemeralPublishingCI ? 3 : 1,
     // 发布 CI 只输出凭据安全的行报告，不生成可上传的浏览器状态快照。
     reporter: isPublishingCI
         ? 'line'

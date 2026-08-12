@@ -33,6 +33,9 @@
 - 产品构建、容器、Web、SDK 与独立的 Human Web API 契约版本提升到 `0.3.0`。
   MCP `2026-07-28`、A2A wire `1.0`、OpenAPI `3.2.0` 与 CloudEvents `1.0`
   协议基线保持不变。
+- 完整 Smoke 只验证受保护分支上的 PR 合并结果，不再在 squash 合并后重复执行同一
+  源码树；新提交会取消旧流水线，一次性 CI 使用 3 个隔离的 Playwright 文件级
+  worker，本地、共享和远端环境仍保持单 worker。
 
 ### Fixed
 

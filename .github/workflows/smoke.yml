@@ -1,9 +1,12 @@
 name: Smoke Tests
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
+    branches: [main]
+
+concurrency:
+  group: smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -20,6 +23,7 @@ jobs:
       ADMIN_EMAIL: admin@example.com
       ADMIN_PASSWORD: Admin123!
       CHRONODESK_E2E_OWNERSHIP_PREFIX: e2e-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CHRONODESK_E2E_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
       CHRONODESK_EPHEMERAL_E2E: "1"
 
     steps:
@@ -116,7 +120,7 @@ jobs:
           fi
 
       - name: Prepare credential-safe reports
-        if: always()
+        if: failure()
         id: prepare-safe-reports
         shell: bash
         run: |
@@ -199,7 +203,7 @@ jobs:
           echo "has_reports=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload smoke reports
-        if: always() && steps.prepare-safe-reports.outputs.has_reports == 'true'
+        if: failure() && steps.prepare-safe-reports.outputs.has_reports == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: smoke-reports

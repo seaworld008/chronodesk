@@ -7,6 +7,10 @@ on:
   schedule:
     - cron: "0 19 * * 0"
 
+concurrency:
+  group: dependency-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -117,6 +121,9 @@ jobs:
 
       - name: Test navigation contracts
         run: npm run test:navigation
+
+      - name: Test CI runtime contracts
+        run: npm run test:ci-runtime
 
       - name: Validate AsyncAPI 3.1 contract
         run: npx --yes @asyncapi/cli@6.0.2 validate ../server/internal/asyncapi/asyncapi.yaml
