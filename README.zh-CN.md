@@ -208,7 +208,34 @@ docker compose exec server chronodesk-migrate -seed
 - MCP：<http://localhost:8081/mcp>
 - A2A Agent Card：<http://localhost:8081/.well-known/agent-card.json>
 
-Compose 中的账号和密钥只用于本地开发，严禁复用于共享或生产环境。
+### 初始化管理员
+
+`make dev` 只启动服务并执行 Schema 迁移，不会写入业务种子数据。只有显式执行
+上面的 `chronodesk-migrate -seed`，且受控初始化身份尚不存在时，命令才会创建
+该账号。账号会获得 `platform_admin`，以及默认 Project 的 active
+`project_admin` Membership。首次创建时，`ADMIN_EMAIL` 默认为
+`admin@example.com`，`ADMIN_PASSWORD` 必须非空；本地 Compose 已自动提供这
+两个值，因此不会强制操作者自行配置。
+
+隔离的 Compose 本地体验会提供以下仅供开发使用的登录凭据：
+
+- 邮箱：`admin@example.com`
+- 密码：`Admin123!`
+
+如需覆盖默认值，请在执行 `make dev` 前，将 `ADMIN_EMAIL` 和
+`ADMIN_PASSWORD` 写入仓库根目录下已被 Git 忽略的 `.env`。严禁在共享或生产
+环境复用 Compose 默认值。
+
+共享或生产部署必须在首次 seed 前确定管理员邮箱，并生成强且唯一的密码。通过
+部署密钥管理系统，仅向一次性 migration/seed Job 注入 `ADMIN_EMAIL` 和
+`ADMIN_PASSWORD`，再执行 `chronodesk-migrate -seed`。禁止提交这两个值、将
+密码写入 Shell 历史，或在长期运行的应用环境中保留 `ADMIN_PASSWORD`。生产
+应用实例应保持 `AUTO_MIGRATE=false`。
+
+`-seed` 是幂等操作：使用同一受控身份重复执行不会创建另一个管理员，也不会
+重置已有密码。应在首次 seed 前确定 `ADMIN_EMAIL`；之后修改该值不会重命名已有
+账号，而会使受控身份校验 fail closed。后续凭据变更应使用正常的密码管理或找回
+流程。
 
 停止环境：
 
@@ -224,6 +251,7 @@ Redis `8`。
 ```bash
 make doctor
 cp server/.env.example server/.env
+# 首次 seed 前，先替换 server/.env 中的 ADMIN_EMAIL 和 ADMIN_PASSWORD 占位值。
 make install-deps
 make db-migrate-seed
 ```
