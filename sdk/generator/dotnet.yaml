@@ -2,7 +2,7 @@ generatorName: csharp
 inputSpec: ../../server/internal/openapi/openapi.yaml
 outputDir: dist/dotnet
 packageName: ChronoDesk.Client
-packageVersion: 0.2.0
+packageVersion: 0.3.0
 library: httpclient
 additionalProperties:
   disallowAdditionalPropertiesIfNotPresent: false

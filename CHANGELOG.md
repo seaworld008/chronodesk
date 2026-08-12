@@ -12,6 +12,53 @@
 
 ### Security
 
+## [0.3.0] - 2026-08-12
+
+### Added
+
+- 提供企业级公开认证首页：桌面使用 AI 工单编排主视觉与右侧凭据工作区，移动端改为
+  上方品牌叙事、下方可滚动表单；登录、注册、找回、重置和验证流程共用一致骨架。
+- 建立 ChronoDesk **Handoff Core / 交接核** 品牌标识、单色与小尺寸光学母版、
+  Apple/PWA/maskable 图标和品牌使用规范。
+- 在中英文 README 增加桌面登录、控制台导航和移动端登录的真实组件产品图集。
+
+### Changed
+
+- 为控制台 33 个功能入口提供唯一语义图标，并将左侧功能树的默认、hover、focus、
+  当前主项、当前功能页、展开和层级导轨对齐统一的企业导航规范。
+- 桌面侧栏支持 `216–360px` 可访问调宽、键盘操作和账号级持久化；收起态只显示
+  一级图标与 Tooltip，移动端继续使用临时 Drawer。
+- 公共认证页面覆盖纵向窄屏、横屏显示切口和四向 safe-area，密码支持键盘可达的
+  显示/隐藏控制；登录失败只保留一处可访问错误播报。
+- 产品构建、容器、Web、SDK 与独立的 Human Web API 契约版本提升到 `0.3.0`。
+  MCP `2026-07-28`、A2A wire `1.0`、OpenAPI `3.2.0` 与 CloudEvents `1.0`
+  协议基线保持不变。
+
+### Fixed
+
+- 修复侧栏收起时仍渲染二级中文、箭头与导轨造成的残字、错位和横向溢出。
+- 修复根路由异步解析项目权限时主项先折叠后展开的竞态，首个可交互帧即显示正确
+  激活路径。
+- 修复当前主项、当前功能页与其他主项 hover 提示不明显，以及权限过滤后单叶直达
+  入口未使用当前页视觉的问题。
+- 修复登录失败同时出现表单 Alert 与全局 Snackbar 导致屏幕阅读器重复播报的问题。
+
+### Migration
+
+- Human Web API `0.3.0` 不再允许在创建或通用更新工单时写入 `status`；状态变化必须
+  使用专用状态操作，否则返回 `422 workflow_transition_required`。`source` 仅接受
+  人类入口来源，可信的 `agent` 来源只能由机器接入边界设置；违规写入返回
+  `422 trusted_source_not_human_writable`。
+- 创建与更新工单的 JSON 请求体上限为 `1 MiB`，超限返回 `413`；违反已发布工作流、
+  表单、来源、标签、Agent 上下文或分类规则时返回 `422 application/problem+json`。
+
+### Security
+
+- 认证主视觉和品牌资产完全随应用自托管；移除无用途的第三方字体预连接，保持现有
+  `font-src 'self'` 内容安全策略。
+- 新增认证页 console、page error、资源失败、未声明 API、键盘、safe-area 与
+  WCAG A/AA serious/critical fail-closed 回归。
+
 ## [0.2.0] - 2026-08-11
 
 ### Added
@@ -94,6 +141,7 @@
 
 > 本项目从该 `Unreleased` 部分开始维护结构化 changelog；更早的开发历史请查阅 Git commit 记录。
 
-[Unreleased]: https://github.com/seaworld008/chronodesk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/seaworld008/chronodesk/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/seaworld008/chronodesk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/seaworld008/chronodesk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/seaworld008/chronodesk/releases/tag/v0.1.0

@@ -4,7 +4,7 @@ outputDir: dist/java
 library: native
 artifactId: chronodesk-java
 groupId: io.chronodesk
-artifactVersion: 0.2.0
+artifactVersion: 0.3.0
 additionalProperties:
   dateLibrary: java8
   disallowAdditionalPropertiesIfNotPresent: false
