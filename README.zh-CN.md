@@ -19,6 +19,43 @@ IT 服务、SRE、安全运营、企业内部服务、设备运维等需要可�
 工单/附件来源追溯、人工发布门禁、反馈与模型策略基础，并连接由部署方管理的搜索和
 模型网关。私有对象默认存放在本地文件目录，也可切换到 S3 兼容对象存储。
 
+## 产品预览
+
+登录、注册与找回密码统一使用右侧凭据工作区；进入控制台后，当前项目范围、
+主项与功能页状态始终保持清晰。
+
+<p align="center">
+  <a href="docs/assets/screenshots/chronodesk-login-desktop.webp">
+    <img src="docs/assets/screenshots/chronodesk-login-desktop.webp"
+         alt="ChronoDesk 企业级登录页，左侧展示 AI 工单编排主视觉，右侧为登录表单"
+         width="100%">
+  </a><br>
+  <sub>面向可信人机协作的企业级登录首页</sub>
+</p>
+
+<table>
+  <tr>
+    <td width="75%">
+      <a href="docs/assets/screenshots/chronodesk-console-navigation.webp">
+        <img src="docs/assets/screenshots/chronodesk-console-navigation.webp"
+             alt="ChronoDesk 企业控制台，左侧导航清晰展示当前主项与功能页"
+             width="100%">
+      </a>
+    </td>
+    <td width="25%">
+      <a href="docs/assets/screenshots/chronodesk-login-mobile.webp">
+        <img src="docs/assets/screenshots/chronodesk-login-mobile.webp"
+             alt="ChronoDesk 移动端响应式登录页面"
+             width="100%">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><sub>层级明确、宽度可调的控制台导航</sub></td>
+    <td align="center"><sub>移动端响应式登录</sub></td>
+  </tr>
+</table>
+
 ## 为什么选择 ChronoDesk
 
 - **一套 Ticket 领域，五类 Adapter**：Human REST/WebSocket、Agent REST、MCP、

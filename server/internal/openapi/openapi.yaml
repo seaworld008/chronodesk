@@ -2,7 +2,7 @@ openapi: 3.2.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: ChronoDesk Agent-Native API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     Stable machine contract for ChronoDesk service principals.
 
@@ -2017,7 +2017,7 @@ paths:
                   _meta:
                     io.modelcontextprotocol/serverInfo:
                       name: chronodesk
-                      version: 0.2.0
+                      version: 0.3.0
             text/event-stream:
               schema:
                 $ref: '#/components/schemas/MCPSSEStream'

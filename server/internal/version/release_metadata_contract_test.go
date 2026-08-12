@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	releaseVersion = "0.2.0"
-	// Human Web is an independent API contract. It currently shares the same
-	// number as the product release but must not move mechanically with it.
-	humanContractVersion = "0.2.0"
+	releaseVersion = "0.3.0"
+	// Human Web is an independent API contract and must not move mechanically
+	// with the product release.
+	humanContractVersion = "0.3.0"
 )
 
 func TestReleaseMetadataUsesOneProductVersion(t *testing.T) {

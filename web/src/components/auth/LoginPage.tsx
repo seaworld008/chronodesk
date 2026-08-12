@@ -1,17 +1,23 @@
-import { useState, FormEvent } from 'react'
+import { useState, type FormEvent } from 'react'
 import {
+    Alert,
     Box,
     Button,
-    Card,
-    CardContent,
     Checkbox,
     CircularProgress,
+    Divider,
     FormControlLabel,
+    IconButton,
+    InputAdornment,
     Link,
     Stack,
     TextField,
     Typography,
 } from '@mui/material'
+import {
+    VisibilityOffOutlined,
+    VisibilityOutlined,
+} from '@mui/icons-material'
 import { useAuthProvider, useNotify } from 'react-admin'
 import { useQueryClient } from '@tanstack/react-query'
 import {
@@ -21,6 +27,7 @@ import {
 } from 'react-router-dom'
 import { localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { markHumanAuthQueryAuthenticated } from '@/lib/authQueryState'
+import PublicAuthShell from './PublicAuthShell'
 
 type NavigatorWithUAData = Navigator & {
     userAgentData?: {
@@ -90,6 +97,7 @@ const LoginPage = () => {
 
     const [email, setEmail] = useState('')
     const [password, setPassword] = useState('')
+    const [showPassword, setShowPassword] = useState(false)
     const [otpCode, setOtpCode] = useState('')
     const [rememberDevice, setRememberDevice] = useState(storedPreference)
     const [deviceName, setDeviceName] = useState(getDefaultDeviceName())
@@ -134,250 +142,246 @@ const LoginPage = () => {
         } catch (err) {
             const message = localizedUnknownErrorMessage(err, '登录失败')
             setError(message)
-            notify(message, { type: 'warning' })
         } finally {
             setSubmitting(false)
         }
     }
 
     return (
-        <Box
-            sx={{
-                display: 'flex',
-                justifyContent: 'center',
-                alignItems: 'center',
-                minHeight: '100vh',
-                background: 'linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%)',
-                position: 'relative',
-                overflow: 'hidden',
-                '&::before': {
-                    content: '""',
-                    position: 'absolute',
-                    top: '-10%',
-                    left: '-10%',
-                    width: '50%',
-                    height: '50%',
-                    background: 'radial-gradient(circle, rgba(37, 99, 235, 0.1) 0%, rgba(255,255,255,0) 70%)',
-                    borderRadius: '50%',
-                    filter: 'blur(60px)',
-                },
-                '&::after': {
-                    content: '""',
-                    position: 'absolute',
-                    bottom: '-10%',
-                    right: '-10%',
-                    width: '50%',
-                    height: '50%',
-                    background: 'radial-gradient(circle, rgba(79, 70, 229, 0.1) 0%, rgba(255,255,255,0) 70%)',
-                    borderRadius: '50%',
-                    filter: 'blur(60px)',
-                },
-            }}
+        <PublicAuthShell
+            title="欢迎回来"
+            description="登录以继续处理可信任务流"
+            contentWidth={468}
         >
-            <Card sx={{
-                maxWidth: 440,
-                width: '100%',
-                mx: 2,
-                borderRadius: 4,
-                boxShadow: '0 8px 32px rgba(0, 0, 0, 0.08)',
-                backdropFilter: 'blur(20px)',
-                backgroundColor: 'rgba(255, 255, 255, 0.9)',
-                border: '1px solid rgba(255, 255, 255, 0.5)',
-            }}>
-                <Box sx={{ pt: 6, pb: 2, textAlign: 'center' }}>
-                    <Box
-                        sx={{
-                            width: 48,
-                            height: 48,
-                            borderRadius: 2,
-                            background: 'linear-gradient(135deg, #2563eb 0%, #4f46e5 100%)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            margin: '0 auto 16px',
-                            color: 'white',
-                            fontWeight: 'bold',
-                            fontSize: 24,
-                            boxShadow: '0 4px 12px rgba(37, 99, 235, 0.3)',
+            <Stack
+                component="form"
+                spacing={2}
+                onSubmit={handleSubmit}
+                noValidate
+            >
+                <TextField
+                    label="邮箱"
+                    type="email"
+                    value={email}
+                    onChange={(event) => {
+                        setEmail(event.target.value)
+                        setEmailError(null)
+                    }}
+                    error={emailError !== null}
+                    helperText={emailError}
+                    required
+                    fullWidth
+                    autoComplete="email"
+                    autoFocus
+                />
+
+                <Box>
+                    <TextField
+                        id="chronodesk-login-password"
+                        label="密码"
+                        type={showPassword ? 'text' : 'password'}
+                        value={password}
+                        onChange={(event) => {
+                            setPassword(event.target.value)
+                            setPasswordError(null)
                         }}
-                    >
-                        T
+                        error={passwordError !== null}
+                        helperText={passwordError}
+                        required
+                        fullWidth
+                        autoComplete="current-password"
+                        slotProps={{
+                            input: {
+                                endAdornment: (
+                                    <InputAdornment position="end">
+                                        <IconButton
+                                            aria-label={
+                                                showPassword
+                                                    ? '隐藏已输入内容'
+                                                    : '显示已输入内容'
+                                            }
+                                            aria-controls={
+                                                'chronodesk-login-password'
+                                            }
+                                            edge="end"
+                                            onClick={() =>
+                                                setShowPassword(
+                                                    (current) => !current,
+                                                )
+                                            }
+                                        >
+                                            {showPassword ? (
+                                                <VisibilityOffOutlined />
+                                            ) : (
+                                                <VisibilityOutlined />
+                                            )}
+                                        </IconButton>
+                                    </InputAdornment>
+                                ),
+                            },
+                        }}
+                    />
+                    <Box sx={{ mt: 0.75, textAlign: 'right' }}>
+                        <Link
+                            component={RouterLink}
+                            to="/forgot-password"
+                            underline="hover"
+                            sx={{ fontSize: 13, fontWeight: 600 }}
+                        >
+                            忘记密码？
+                        </Link>
                     </Box>
-                    <Typography
-                        variant="h5"
-                        gutterBottom
-                        sx={{
-                            fontWeight: 700,
-                            color: "#1e293b"
-                        }}>
-                        ChronoDesk 工单自动化平台
-                    </Typography>
-                    <Typography variant="body2" sx={{
-                        color: "text.secondary"
-                    }}>
-                        欢迎回来，请登录您的账号
-                    </Typography>
                 </Box>
-                <CardContent sx={{ px: 4, pb: 6 }}>
-                    <Box component="form" onSubmit={handleSubmit} noValidate>
-                        <Stack spacing={3}>
-                            <TextField
-                                label="邮箱"
-                                type="email"
-                                value={email}
-                                onChange={(event) => {
-                                    setEmail(event.target.value)
-                                    setEmailError(null)
-                                }}
-                                error={emailError !== null}
-                                helperText={emailError}
-                                required
-                                fullWidth
-                                autoComplete="email"
-                                autoFocus
-                                variant="outlined"
-                                sx={{
-                                    '& .MuiOutlinedInput-root': {
-                                        borderRadius: 2,
-                                        backgroundColor: 'rgba(255, 255, 255, 0.5)',
-                                    }
-                                }}
-                            />
-                            <TextField
-                                label="密码"
-                                type="password"
-                                value={password}
-                                onChange={(event) => {
-                                    setPassword(event.target.value)
-                                    setPasswordError(null)
-                                }}
-                                error={passwordError !== null}
-                                helperText={passwordError}
-                                required
-                                fullWidth
-                                autoComplete="current-password"
-                                variant="outlined"
-                                sx={{
-                                    '& .MuiOutlinedInput-root': {
-                                        borderRadius: 2,
-                                        backgroundColor: 'rgba(255, 255, 255, 0.5)',
-                                    }
-                                }}
-                            />
-                            <TextField
-                                label="OTP 验证码"
-                                value={otpCode}
-                                onChange={(event) => setOtpCode(event.target.value)}
-                                fullWidth
-                                placeholder="如开启双因子认证请填写"
-                                slotProps={{ htmlInput: { maxLength: 10 } }}
-                                variant="outlined"
-                                sx={{
-                                    '& .MuiOutlinedInput-root': {
-                                        borderRadius: 2,
-                                        backgroundColor: 'rgba(255, 255, 255, 0.5)',
-                                    }
-                                }}
-                            />
 
-                            <Box sx={{
-                                p: 2,
-                                borderRadius: 2,
-                                bgcolor: 'rgba(241, 245, 249, 0.5)',
-                                border: '1px solid rgba(226, 232, 240, 0.8)'
-                            }}>
-                                <FormControlLabel
-                                    control={
-                                        <Checkbox
-                                            checked={rememberDevice}
-                                            onChange={(event) => setRememberDevice(event.target.checked)}
-                                            color="primary"
-                                            size="small"
-                                        />
-                                    }
-                                    label={<Typography variant="body2" sx={{
-                                        color: "text.secondary"
-                                    }}>记住此设备（免 OTP）</Typography>}
-                                />
-                                {rememberDevice && (
-                                    <TextField
-                                        size="small"
-                                        placeholder="设备名称，例如：MacBook Pro"
-                                        value={deviceName}
-                                        onChange={(event) => setDeviceName(event.target.value)}
-                                        fullWidth
-                                        sx={{ mt: 1, '& .MuiOutlinedInput-root': { bgcolor: 'white' } }}
-                                    />
-                                )}
+                <TextField
+                    label="OTP 验证码"
+                    value={otpCode}
+                    onChange={(event) => setOtpCode(event.target.value)}
+                    helperText="账号启用双因子认证时填写"
+                    fullWidth
+                    autoComplete="one-time-code"
+                    placeholder="可选"
+                    slotProps={{
+                        htmlInput: {
+                            maxLength: 10,
+                            spellCheck: false,
+                        },
+                    }}
+                />
+
+                <Box
+                    sx={{
+                        p: 1.5,
+                        border: '1px solid #e2e8f0',
+                        borderRadius: '10px',
+                        bgcolor: '#f1f5f9',
+                    }}
+                >
+                    <FormControlLabel
+                        control={
+                            <Checkbox
+                                checked={rememberDevice}
+                                onChange={(event) =>
+                                    setRememberDevice(event.target.checked)
+                                }
+                                color="primary"
+                                size="small"
+                            />
+                        }
+                        label={
+                            <Box>
+                                <Typography
+                                    sx={{
+                                        color: '#334155',
+                                        fontSize: 13,
+                                        fontWeight: 650,
+                                    }}
+                                >
+                                    记住此设备（免 OTP）
+                                </Typography>
+                                <Typography
+                                    sx={{
+                                        mt: 0.2,
+                                        color: '#586b80',
+                                        fontSize: 11,
+                                    }}
+                                >
+                                    仅在受控的个人设备上启用
+                                </Typography>
                             </Box>
+                        }
+                        sx={{
+                            m: 0,
+                            alignItems: 'flex-start',
+                            '& .MuiCheckbox-root': {
+                                mt: -0.45,
+                                ml: -0.5,
+                            },
+                        }}
+                    />
+                    {rememberDevice && (
+                        <TextField
+                            label="设备名称"
+                            size="small"
+                            placeholder="设备名称，例如：MacBook Pro"
+                            value={deviceName}
+                            onChange={(event) =>
+                                setDeviceName(event.target.value)
+                            }
+                            fullWidth
+                            autoComplete="off"
+                            sx={{ mt: 1.5 }}
+                        />
+                    )}
+                </Box>
 
-                            <Stack
-                                direction={{ xs: 'column', sm: 'row' }}
-                                spacing={1}
-                                sx={{ justifyContent: 'space-between' }}
-                            >
-                                <Link
-                                    component={RouterLink}
-                                    to="/forgot-password"
-                                >
-                                    忘记密码
-                                </Link>
-                                <Link
-                                    component={RouterLink}
-                                    to="/resend-verification"
-                                >
-                                    重发验证邮件
-                                </Link>
-                                <Link component={RouterLink} to="/register">
-                                    注册账号
-                                </Link>
-                            </Stack>
+                {error && (
+                    <Alert severity="error" role="alert">
+                        {error}
+                    </Alert>
+                )}
 
-                            {error && (
-                                <Box sx={{
-                                    p: 1.5,
-                                    borderRadius: 2,
-                                    bgcolor: 'error.lighter',
-                                    color: 'error.main',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    gap: 1
-                                }}>
-                                    <Typography variant="body2" sx={{
-                                        fontWeight: 500
-                                    }}>
-                                        {error}
-                                    </Typography>
-                                </Box>
-                            )}
+                <Button
+                    type="submit"
+                    variant="contained"
+                    disabled={submitting}
+                    size="large"
+                    aria-label={submitting ? '正在登录' : undefined}
+                    sx={{ gap: 1 }}
+                >
+                    {submitting ? (
+                        <>
+                            <CircularProgress
+                                size={18}
+                                color="inherit"
+                                aria-hidden="true"
+                            />
+                            正在验证…
+                        </>
+                    ) : (
+                        '登录系统'
+                    )}
+                </Button>
+            </Stack>
 
-                            <Button
-                                type="submit"
-                                variant="contained"
-                                disabled={submitting}
-                                size="large"
-                                sx={{
-                                    py: 1.5,
-                                    borderRadius: 2,
-                                    fontSize: '1rem',
-                                    fontWeight: 600,
-                                    textTransform: 'none',
-                                    background: 'linear-gradient(135deg, #2563eb 0%, #4f46e5 100%)',
-                                    boxShadow: '0 4px 12px rgba(37, 99, 235, 0.2)',
-                                    '&:hover': {
-                                        background: 'linear-gradient(135deg, #1d4ed8 0%, #4338ca 100%)',
-                                        boxShadow: '0 6px 16px rgba(37, 99, 235, 0.3)',
-                                    }
-                                }}
-                            >
-                                {submitting ? <CircularProgress size={24} color="inherit" /> : '登录系统'}
-                            </Button>
-                        </Stack>
-                    </Box>
-                </CardContent>
-            </Card>
-        </Box>
-    );
+            <Divider
+                sx={{
+                    color: '#64748b',
+                    fontSize: 11,
+                    '&::before, &::after': {
+                        borderColor: '#e2e8f0',
+                    },
+                }}
+            >
+                账号帮助
+            </Divider>
+
+            <Stack spacing={1.25} sx={{ alignItems: 'center' }}>
+                <Typography sx={{ color: '#64748b', fontSize: 13 }}>
+                    尚未加入 ChronoDesk？{' '}
+                    <Link
+                        component={RouterLink}
+                        to="/register"
+                        underline="hover"
+                        sx={{ fontWeight: 700 }}
+                    >
+                        创建账号
+                    </Link>
+                </Typography>
+                <Typography sx={{ color: '#64748b', fontSize: 12 }}>
+                    未收到验证邮件？{' '}
+                    <Link
+                        component={RouterLink}
+                        to="/resend-verification"
+                        underline="hover"
+                        sx={{ fontWeight: 600 }}
+                    >
+                        重新发送
+                    </Link>
+                </Typography>
+            </Stack>
+        </PublicAuthShell>
+    )
 }
 
 export default LoginPage

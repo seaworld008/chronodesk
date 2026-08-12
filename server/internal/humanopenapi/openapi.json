@@ -2,7 +2,7 @@
   "openapi": "3.2.0",
   "info": {
     "title": "ChronoDesk Human Web API",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "Canonical Human Web contract for browser sessions, membership-filtered project work, platform governance, and the P1 operator surfaces consumed by the Web application.",
     "license": {
       "name": "Apache-2.0",

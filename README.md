@@ -24,6 +24,44 @@ citations, feedback, and model-policy foundations that connect to
 deployment-owned search and model gateways. Private objects use the local
 filesystem by default and can be routed to an S3-compatible store.
 
+## Product preview
+
+Public identity flows keep sign-in, registration, and recovery in a consistent
+right-side workspace. The enterprise console keeps project scope and the active
+navigation path explicit.
+
+<p align="center">
+  <a href="docs/assets/screenshots/chronodesk-login-desktop.webp">
+    <img src="docs/assets/screenshots/chronodesk-login-desktop.webp"
+         alt="ChronoDesk enterprise sign-in page with AI ticket orchestration artwork"
+         width="100%">
+  </a><br>
+  <sub>Enterprise sign-in for trustworthy human-agent operations</sub>
+</p>
+
+<table>
+  <tr>
+    <td width="75%">
+      <a href="docs/assets/screenshots/chronodesk-console-navigation.webp">
+        <img src="docs/assets/screenshots/chronodesk-console-navigation.webp"
+             alt="ChronoDesk enterprise console with a clear active navigation hierarchy"
+             width="100%">
+      </a>
+    </td>
+    <td width="25%">
+      <a href="docs/assets/screenshots/chronodesk-login-mobile.webp">
+        <img src="docs/assets/screenshots/chronodesk-login-mobile.webp"
+             alt="ChronoDesk responsive mobile sign-in page"
+             width="100%">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Clear active hierarchy and adjustable console navigation</sub></td>
+    <td align="center"><sub>Responsive mobile sign-in</sub></td>
+  </tr>
+</table>
+
 ## Why ChronoDesk
 
 - **One Ticket domain, five Adapters**: Human REST/WebSocket, Agent REST,

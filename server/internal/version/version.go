@@ -2,7 +2,7 @@
 // Release builds may replace these values with -ldflags -X.
 package version
 
-const DefaultVersion = "0.2.0"
+const DefaultVersion = "0.3.0"
 
 var (
 	Version   = DefaultVersion

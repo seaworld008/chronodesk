@@ -4,7 +4,7 @@ FROM golang:1.26.5-alpine AS builder
 
 WORKDIR /src
 
-ARG VERSION=0.2.0
+ARG VERSION=0.3.0
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 
@@ -49,7 +49,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 FROM alpine:3.24.1
 
-ARG VERSION=0.2.0
+ARG VERSION=0.3.0
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 

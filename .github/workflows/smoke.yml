@@ -11,7 +11,7 @@ permissions:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     permissions:
       contents: read
     env:
@@ -54,7 +54,7 @@ jobs:
 
       - name: Start services
         run: |
-          export VERSION=0.2.0
+          export VERSION=0.3.0
           export COMMIT="${GITHUB_SHA}"
           export BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           if docker compose version >/dev/null 2>&1; then
