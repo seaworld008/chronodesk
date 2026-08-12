@@ -31,10 +31,6 @@ test('完整 Smoke 只验证 PR 合并结果并取消同 PR 的旧运行', async
     "${{ github.event_name == 'pull_request' }}",
   )
   assert.equal(workflow.jobs.smoke['timeout-minutes'], 35)
-  assert.equal(
-    workflow.jobs.smoke.env.CHRONODESK_EPHEMERAL_E2E,
-    '1',
-  )
   assert.match(
     workflow.jobs.smoke.env.CHRONODESK_E2E_RUN_ID,
     /github\.run_id/u,
@@ -200,14 +196,13 @@ test('仓库声明的 main 保护严格绑定 GitHub Actions 门禁', async () =
   assert.ok(checks.every(({ app_id: appID }) => appID === 15368))
 })
 
-test('Playwright 只在一次性回环 CI 使用文件级并行', async () => {
+test('Playwright 在 CI、本地、共享与远端均保持单 worker', async () => {
   const config = await readFile(
     new URL('playwright.config.ts', new URL(`file://${webRoot}/`)),
     'utf8',
   )
 
   assert.match(config, /fullyParallel:\s*false/u)
-  assert.match(config, /workers:\s*isEphemeralPublishingCI\s*\?\s*3\s*:\s*1/u)
-  assert.match(config, /process\.env\.CHRONODESK_EPHEMERAL_E2E === '1'/u)
-  assert.match(config, /isLoopbackE2E\(\)/u)
+  assert.match(config, /workers:\s*1/u)
+  assert.doesNotMatch(config, /CHRONODESK_EPHEMERAL_E2E/u)
 })

@@ -40,10 +40,9 @@ checks，要求 PR 基于最新目标分支后重新通过门禁。因此 squash
 - policy 同时检查重命名前后的路径、PR 文件总数与实际仓库写权限。GitHub 文件
   清单截断、权限查询异常或 PR/Smoke 关联不唯一时不会签发成功状态。
 
-一次性回环 CI 设置 `CHRONODESK_EPHEMERAL_E2E=1`，Playwright 使用 `3` 个文件级
-worker；单文件内部保持顺序，`fullyParallel` 固定为 `false`。测试数据通过
-`TEST_WORKER_INDEX`、进程 ID 和本轮 run ID 隔离。共享、本地或远端环境始终使用
-单 worker，避免账号限流、全局配置冲突和跨会话清理。
+Playwright 在 CI、本地、共享和远端环境均使用单 worker，`fullyParallel` 固定为
+`false`，避免长链路导航、视觉截图、全局配置与账号会话在并发负载下产生假阴性。
+测试数据仍通过进程 ID 和本轮 run ID 隔离。
 
 ## 变更验证
 
@@ -57,18 +56,18 @@ npm run typecheck
 npm run lint
 ```
 
-并在一次性 Compose 环境中用零重试连续运行两轮完整 E2E：
+并在一次性 Compose 环境中运行完整 E2E：
 
 ```bash
-CI=1 CHRONODESK_EPHEMERAL_E2E=1 \
+CI=1 \
 CHRONODESK_E2E_OWNERSHIP_PREFIX=e2e-<唯一所有者> \
 CHRONODESK_E2E_RUN_ID=<唯一运行标识> \
 TEST_BASE_URL=http://127.0.0.1:3000 \
-npx playwright test --workers=3 --retries=0
+npx playwright test --workers=1
 ```
 
-两轮都必须保持完整用例数、零 `429`、零清理冲突、零残留本轮 marker。正式 PR
-Smoke 仍使用仓库配置的 retry 策略；零重试验证用于防止并发竞态被 retry 掩盖。
+必须保持完整用例数、零 `429`、零清理冲突、零残留本轮 marker。正式 PR Smoke
+使用仓库配置的 retry 策略。
 
 合并后核对：
 
