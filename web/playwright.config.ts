@@ -33,7 +33,8 @@ const shouldStartLocalServer =
 export default defineConfig({
     testDir: './e2e',
     // E2E 场景会修改共享的管理员账号、系统配置和测试数据。
-    // 固定单 worker 可避免并行登录触发认证限流，也避免清理阶段互相删除数据。
+    // CI、共享、本地和远端环境固定单 worker，避免长链路导航、视觉截图、
+    // 并行登录限流或清理其他会话的数据。单文件内部同样保持串行。
     fullyParallel: false,
     forbidOnly: isPublishingCI,
     retries: isPublishingCI ? 2 : 0,
