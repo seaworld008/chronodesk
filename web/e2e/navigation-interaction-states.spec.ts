@@ -43,6 +43,7 @@ const installNavigationMocks = async (
     await installMockSession(page, platformAdmin, projectA);
 
     const unexpectedApiRequests: string[] = [];
+    const refreshBodies: Array<string | null> = [];
 
     await page.route('**/api/**', async (route) => {
         const request = route.request();
@@ -53,6 +54,7 @@ const installNavigationMocks = async (
             request.method() === 'POST' &&
             url.pathname === '/api/auth/refresh'
         ) {
+            refreshBodies.push(request.postData());
             await fulfillMockSessionRefresh(route, platformAdmin);
             return;
         }
@@ -182,7 +184,7 @@ const installNavigationMocks = async (
         }, 404);
     });
 
-    return { unexpectedApiRequests };
+    return { unexpectedApiRequests, refreshBodies };
 };
 
 const navigationRow = (
@@ -624,6 +626,11 @@ test.describe('OINK 左侧导航交互状态（mock）', () => {
             'aria-current',
             'page',
         );
+        expect(backend.refreshBodies).toEqual([null]);
+        await expect.poll(() => page.evaluate(() => ({
+            token: localStorage.getItem('token'),
+            refreshToken: localStorage.getItem('refreshToken'),
+        }))).toEqual({ token: null, refreshToken: null });
 
         expect(backend.unexpectedApiRequests).toEqual([]);
         browserHealth.assertClean();

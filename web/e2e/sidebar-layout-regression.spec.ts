@@ -26,6 +26,7 @@ const installSidebarMocks = async (page: Page) => {
     await installMockSession(page, platformAdmin, projectA);
 
     const unexpectedApiRequests: string[] = [];
+    const refreshBodies: Array<string | null> = [];
 
     await page.route('**/api/**', async (route) => {
         const request = route.request();
@@ -36,6 +37,7 @@ const installSidebarMocks = async (page: Page) => {
             request.method() === 'POST' &&
             url.pathname === '/api/auth/refresh'
         ) {
+            refreshBodies.push(request.postData());
             await fulfillMockSessionRefresh(route, platformAdmin);
             return;
         }
@@ -165,7 +167,7 @@ const installSidebarMocks = async (page: Page) => {
         }, 404);
     });
 
-    return { unexpectedApiRequests };
+    return { unexpectedApiRequests, refreshBodies };
 };
 
 const expectSidebarWidth = async (
@@ -362,6 +364,11 @@ test.describe('左侧导航布局回归（mock）', () => {
             'aria-valuenow',
             String(sidebarDefaultWidth + 48),
         );
+        expect(backend.refreshBodies).toEqual([null]);
+        await expect.poll(() => page.evaluate(() => ({
+            token: localStorage.getItem('token'),
+            refreshToken: localStorage.getItem('refreshToken'),
+        }))).toEqual({ token: null, refreshToken: null });
 
         expect(backend.unexpectedApiRequests).toEqual([]);
         browserHealth.assertClean();

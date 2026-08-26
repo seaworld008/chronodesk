@@ -1352,6 +1352,7 @@ test.describe('项目授权缓存与撤销', () => {
             }
             await fulfillJSON(route, {
                 code: 0,
+                msg: '登录成功',
                 data: {
                     access_token: session.token,
                     expires_in: 3600,
@@ -1364,6 +1365,7 @@ test.describe('项目授权缓存与撤销', () => {
                         status: 'active',
                         email_verified: true,
                         otp_enabled: false,
+                        last_login_at: null,
                     },
                 },
             });

@@ -602,6 +602,7 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
                 newPasswordAttempts += 1
                 await fulfillJSON(route, {
                     code: 0,
+                    msg: '登录成功',
                     data: {
                         user,
                         access_token: accessToken,
@@ -624,7 +625,8 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
         ) {
             refreshRequests += 1
             await fulfillJSON(route, {
-                code: 0,
+                success: true,
+                message: '登录令牌刷新成功',
                 data: {
                     user,
                     access_token: accessToken,
@@ -850,7 +852,8 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
             markRefreshRequestStarted?.()
             await refreshResponseReleased
             await fulfillJSON(route, {
-                code: 0,
+                success: true,
+                message: '登录令牌刷新成功',
                 data: {
                     user,
                     access_token: rotatedToken,
@@ -1098,6 +1101,7 @@ for (const replacement of [
                 replacementLoggedIn = true
                 await fulfillJSON(route, {
                     code: 0,
+                    msg: '登录成功',
                     data: {
                         user: {
                             id: replacement.identity.id,
@@ -1123,7 +1127,8 @@ for (const replacement of [
                 replacementLoggedIn
             ) {
                 await fulfillJSON(route, {
-                    code: 0,
+                    success: true,
+                    message: '登录令牌刷新成功',
                     data: {
                         user: {
                             id: replacement.identity.id,
@@ -1364,6 +1369,7 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
             identityBSessionActive = true
             await fulfillJSON(route, {
                 code: 0,
+                msg: '登录成功',
                 data: {
                     user: {
                         ...user,
@@ -1384,7 +1390,8 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
             identityBSessionActive
         ) {
             await fulfillJSON(route, {
-                code: 0,
+                success: true,
+                message: '登录令牌刷新成功',
                 data: {
                     user: {
                         id: identityB.id,

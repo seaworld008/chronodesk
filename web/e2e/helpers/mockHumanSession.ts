@@ -136,6 +136,7 @@ export const installMockSession = async (
                     status: 'active',
                     email_verified: true,
                     otp_enabled: false,
+                    last_login_at: null,
                 }),
             );
             sessionStorage.setItem(
@@ -184,8 +185,8 @@ export const fulfillMockSessionRefresh = (
     identity: MockSessionIdentity,
     expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600,
 ) => fulfillJSON(route, {
-    code: 0,
-    msg: 'ok',
+    success: true,
+    message: '登录令牌刷新成功',
     data: {
         user: {
             id: identity.id,
@@ -195,6 +196,7 @@ export const fulfillMockSessionRefresh = (
             status: 'active',
             email_verified: true,
             otp_enabled: false,
+            last_login_at: null,
         },
         access_token: mockSessionToken(identity, expiresAtSeconds),
         expires_in: Math.max(

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import { createServer } from 'vite'
 import { joinApiUrl } from '../src/lib/apiUrl.ts'
 import {
     humanApiRoutes,
@@ -2520,6 +2521,109 @@ assert.doesNotMatch(
 assert.doesNotMatch(
     humanSessionChannel,
     /\b(?:access_token|refresh_token)\b/,
+)
+
+const viteServer = await createServer({
+    root: webDirectory,
+    appType: 'custom',
+    logLevel: 'silent',
+    server: { middlewareMode: true },
+})
+let authProviderModule
+try {
+    authProviderModule = await viteServer.ssrLoadModule(
+        '/src/lib/authProvider.ts',
+    )
+} finally {
+    await viteServer.close()
+}
+const {
+    parseHumanLoginSessionResponse,
+    parseHumanRefreshSessionResponse,
+} = authProviderModule
+assert.equal(typeof parseHumanLoginSessionResponse, 'function')
+assert.equal(typeof parseHumanRefreshSessionResponse, 'function')
+
+const encodeBase64URL = (value) =>
+    Buffer.from(JSON.stringify(value)).toString('base64url')
+const authContractToken = [
+    encodeBase64URL({ alg: 'none', typ: 'JWT' }),
+    encodeBase64URL({
+        sub: '9001',
+        sid: 'human-auth-contract-session',
+        platform_role: 'member',
+        exp: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    'contract-signature',
+].join('.')
+const canonicalAuthSession = {
+    user: {
+        id: 9001,
+        username: 'human-auth-contract',
+        email: 'human-auth-contract@example.test',
+        platform_role: 'member',
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+    },
+    access_token: authContractToken,
+    expires_in: 3600,
+    token_type: 'Bearer',
+}
+assert.deepEqual(
+    parseHumanLoginSessionResponse({
+        code: 0,
+        msg: '登录成功',
+        data: canonicalAuthSession,
+    }),
+    canonicalAuthSession,
+)
+assert.deepEqual(
+    parseHumanRefreshSessionResponse({
+        success: true,
+        message: '登录令牌刷新成功',
+        data: canonicalAuthSession,
+    }),
+    canonicalAuthSession,
+)
+assert.equal(
+    parseHumanRefreshSessionResponse({
+        code: 0,
+        msg: '登录令牌刷新成功',
+        data: canonicalAuthSession,
+    }),
+    null,
+)
+const missingLastLoginSession = structuredClone(canonicalAuthSession)
+delete missingLastLoginSession.user.last_login_at
+assert.equal(
+    parseHumanRefreshSessionResponse({
+        success: true,
+        message: '登录令牌刷新成功',
+        data: missingLastLoginSession,
+    }),
+    null,
+)
+assert.equal(
+    parseHumanRefreshSessionResponse({
+        success: true,
+        message: '登录令牌刷新成功',
+        data: {
+            ...canonicalAuthSession,
+            refresh_token: 'must-not-be-exposed',
+        },
+    }),
+    null,
+)
+assert.equal(
+    parseHumanLoginSessionResponse({
+        code: 0,
+        msg: '登录成功',
+        data: canonicalAuthSession,
+        success: true,
+    }),
+    null,
 )
 
 for (const routeHelper of [

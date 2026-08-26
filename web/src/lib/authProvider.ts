@@ -85,6 +85,55 @@ const positiveInteger = (value: unknown): value is number =>
 const nonEmptyString = (value: unknown): value is string =>
     typeof value === 'string' && value.length > 0
 
+const hasOnlyKeys = (
+    value: Record<string, unknown>,
+    allowedKeys: ReadonlySet<string>,
+): boolean => Object.keys(value).every((key) => allowedKeys.has(key))
+
+const dateTimeString = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u
+        .test(value) &&
+    !Number.isNaN(Date.parse(value))
+
+const humanUserProfileKeys = new Set([
+    'id',
+    'user_id',
+    'first_name',
+    'last_name',
+    'display_name',
+    'avatar',
+    'phone',
+    'department',
+    'position',
+    'timezone',
+    'language',
+    'created_at',
+    'updated_at',
+])
+
+const humanSessionUserKeys = new Set([
+    'id',
+    'username',
+    'email',
+    'platform_role',
+    'status',
+    'email_verified',
+    'otp_enabled',
+    'last_login_at',
+    'profile',
+])
+
+const authSessionKeys = new Set([
+    'user',
+    'access_token',
+    'expires_in',
+    'token_type',
+])
+
+const loginSessionEnvelopeKeys = new Set(['code', 'msg', 'data'])
+const refreshSessionEnvelopeKeys = new Set(['success', 'message', 'data'])
+
 const safeFetch = async (
     input: RequestInfo | URL,
     init: RequestInit | undefined,
@@ -102,7 +151,30 @@ const responseData = (value: unknown): unknown => {
     return value
 }
 
-const parseHumanSessionUser = (value: unknown): HumanSessionUser | null => {
+const validHumanUserProfile = (value: unknown): boolean => {
+    if (!isRecord(value) || !hasOnlyKeys(value, humanUserProfileKeys)) {
+        return false
+    }
+    return (
+        positiveInteger(value.id) &&
+        positiveInteger(value.user_id) &&
+        typeof value.first_name === 'string' &&
+        typeof value.last_name === 'string' &&
+        typeof value.display_name === 'string' &&
+        typeof value.avatar === 'string' &&
+        typeof value.phone === 'string' &&
+        typeof value.department === 'string' &&
+        typeof value.position === 'string' &&
+        typeof value.timezone === 'string' &&
+        typeof value.language === 'string' &&
+        dateTimeString(value.created_at) &&
+        dateTimeString(value.updated_at)
+    )
+}
+
+const parseStoredHumanSessionUser = (
+    value: unknown,
+): HumanSessionUser | null => {
     if (!isRecord(value)) return null
     const platformRole = parsePlatformRole(value.platform_role)
     if (
@@ -121,8 +193,31 @@ const parseHumanSessionUser = (value: unknown): HumanSessionUser | null => {
     return value as HumanSessionUser
 }
 
+const parseHumanSessionUser = (value: unknown): HumanSessionUser | null => {
+    if (!isRecord(value) || !hasOnlyKeys(value, humanSessionUserKeys)) {
+        return null
+    }
+    const user = parseStoredHumanSessionUser(value)
+    if (
+        user === null ||
+        (
+            value.last_login_at !== null &&
+            !dateTimeString(value.last_login_at)
+        ) ||
+        (
+            value.profile !== undefined &&
+            !validHumanUserProfile(value.profile)
+        )
+    ) {
+        return null
+    }
+    return user
+}
+
 const parseAuthSession = (value: unknown): AuthSession | null => {
-    if (!isRecord(value)) return null
+    if (!isRecord(value) || !hasOnlyKeys(value, authSessionKeys)) {
+        return null
+    }
     const user = parseHumanSessionUser(value.user)
     if (
         user === null ||
@@ -143,12 +238,40 @@ const parseAuthSession = (value: unknown): AuthSession | null => {
     return value as AuthSession
 }
 
+export const parseHumanLoginSessionResponse = (
+    value: unknown,
+): AuthSession | null => {
+    if (
+        !isRecord(value) ||
+        !hasOnlyKeys(value, loginSessionEnvelopeKeys) ||
+        value.code !== 0 ||
+        typeof value.msg !== 'string'
+    ) {
+        return null
+    }
+    return parseAuthSession(value.data)
+}
+
+export const parseHumanRefreshSessionResponse = (
+    value: unknown,
+): AuthSession | null => {
+    if (
+        !isRecord(value) ||
+        !hasOnlyKeys(value, refreshSessionEnvelopeKeys) ||
+        value.success !== true ||
+        value.message !== '登录令牌刷新成功'
+    ) {
+        return null
+    }
+    return parseAuthSession(value.data)
+}
+
 const readStoredUser = (): HumanSessionUser | null => {
     const serialized = readHumanSessionMetadata('user')
     const binding = readHumanSessionBinding()
     if (!serialized || !binding) return null
     try {
-        const user = parseHumanSessionUser(JSON.parse(serialized))
+        const user = parseStoredHumanSessionUser(JSON.parse(serialized))
         if (
             user === null ||
             binding.subject !== String(user.id) ||
@@ -265,7 +388,7 @@ const performSessionRefresh = async (): Promise<void> => {
             '登录状态刷新失败',
         )
         const body: unknown = await response.json().catch(() => ({}))
-        const session = parseAuthSession(responseData(body))
+        const session = parseHumanRefreshSessionResponse(body)
         const nextBinding = session
             ? readHumanSessionBinding(session.access_token)
             : null
@@ -462,7 +585,7 @@ export const authProvider: AuthProvider = {
             throw new Error(message)
         }
 
-        const session = parseAuthSession(responseData(body))
+        const session = parseHumanLoginSessionResponse(body)
         if (session === null) {
             throw new Error('登录响应包含无效的平台角色或会话信息')
         }
