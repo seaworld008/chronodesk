@@ -3,6 +3,7 @@ import {
     authorizedProjectAccess,
     defaultMockIdentity,
     fulfillJSON,
+    fulfillMockSessionRefresh,
     installMockSession,
     projectA,
 } from './helpers/mockHumanSession';
@@ -47,6 +48,14 @@ const installNavigationMocks = async (
         const request = route.request();
         const url = new URL(request.url());
         const signature = `${request.method()} ${url.pathname}`;
+
+        if (
+            request.method() === 'POST' &&
+            url.pathname === '/api/auth/refresh'
+        ) {
+            await fulfillMockSessionRefresh(route, platformAdmin);
+            return;
+        }
 
         if (
             request.method() === 'GET' &&

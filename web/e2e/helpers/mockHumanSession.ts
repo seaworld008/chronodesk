@@ -178,3 +178,29 @@ export const fulfillJSON = (
     headers,
     body: JSON.stringify(body),
 });
+
+export const fulfillMockSessionRefresh = (
+    route: Route,
+    identity: MockSessionIdentity,
+    expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600,
+) => fulfillJSON(route, {
+    code: 0,
+    msg: 'ok',
+    data: {
+        user: {
+            id: identity.id,
+            username: `e2e-${identity.id}`,
+            email: identity.email,
+            platform_role: identity.platformRole,
+            status: 'active',
+            email_verified: true,
+            otp_enabled: false,
+        },
+        access_token: mockSessionToken(identity, expiresAtSeconds),
+        expires_in: Math.max(
+            1,
+            expiresAtSeconds - Math.floor(Date.now() / 1000),
+        ),
+        token_type: 'Bearer',
+    },
+});
