@@ -4865,7 +4865,10 @@ func (s *AgentNativeService) beginGenericWebhookDispatch(
 	if delivery.ExpiresAt.Before(effectiveDeadline) {
 		effectiveDeadline = delivery.ExpiresAt.UTC()
 	}
-	gate := &NotificationService{db: s.db}
+	gate := &NotificationService{
+		db:                      s.db,
+		webhookAttemptGateClock: s.now,
+	}
 	return gate.beginWebhookOutboxDispatch(
 		ctx,
 		WebhookOutboxAttemptClaim{
