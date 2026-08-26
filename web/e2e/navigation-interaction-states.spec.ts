@@ -88,6 +88,7 @@ const installNavigationMocks = async (
                     status: 'active',
                     email_verified: true,
                     otp_enabled: false,
+                    last_login_at: null,
                     profile: {
                         id: platformAdmin.id,
                         user_id: platformAdmin.id,

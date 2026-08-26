@@ -136,6 +136,7 @@ const installLayoutMocks = async (
         status: 'active',
         email_verified: true,
         otp_enabled: false,
+        last_login_at: null,
         profile: {
             id: 1,
             user_id: 1,
@@ -1171,11 +1172,21 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             status: 'active',
             email_verified: true,
             otp_enabled: false,
+            last_login_at: null,
             profile: {
+                id: 1,
+                user_id: 1,
                 first_name: '',
                 last_name: '',
                 display_name: longDisplayName,
                 avatar: '',
+                phone: '',
+                department: '',
+                position: '',
+                timezone: 'Asia/Shanghai',
+                language: 'zh-CN',
+                created_at: '2026-01-01T00:00:00Z',
+                updated_at: '2026-01-01T00:00:00Z',
             },
         }
 
@@ -1418,14 +1429,21 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             status: 'active',
             email_verified: true,
             otp_enabled: false,
+            last_login_at: null,
             profile: {
+                id: 1,
+                user_id: 1,
                 first_name: 'Chrono',
                 last_name: 'Desk',
                 display_name: 'Chrono Desk',
                 avatar: '',
                 phone: '',
+                department: '',
+                position: '',
                 timezone: 'Asia/Shanghai',
                 language: 'zh-CN',
+                created_at: '2026-01-01T00:00:00Z',
+                updated_at: '2026-01-01T00:00:00Z',
             },
         }
 

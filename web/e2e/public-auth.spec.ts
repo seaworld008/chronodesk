@@ -815,10 +815,19 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
         otp_enabled: false,
         last_login_at: null,
         profile: {
+            id: identity.id,
+            user_id: identity.id,
             first_name: '服务端名字',
             last_name: '已加载查询态',
+            display_name: '服务端名字 已加载查询态',
+            avatar: '',
+            phone: '',
+            department: '',
+            position: '',
             timezone: 'Asia/Shanghai',
             language: 'zh-CN',
+            created_at: '2026-08-10T00:00:00Z',
+            updated_at: '2026-08-10T00:00:00Z',
         },
     }
     let refreshRequests = 0
