@@ -1086,6 +1086,59 @@ func (r *GormTokenRepository) RevokeAllUserTokens(ctx context.Context, userID ui
 	})
 }
 
+// RevokeAllSessionsIssuedBefore is the one-shot hard-cutover primitive for
+// browser sessions created before a deployment-owned cutoff. A rotated refresh
+// token keeps the original login-history session, so selecting by LoginTime
+// closes old sessions even when their newest token row was created later.
+func (r *GormTokenRepository) RevokeAllSessionsIssuedBefore(
+	ctx context.Context,
+	cutoff time.Time,
+) (int64, error) {
+	if ctx == nil || cutoff.IsZero() {
+		return 0, ErrInvalidSessionCutoff
+	}
+	cutoff = cutoff.UTC().Truncate(time.Microsecond)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	var revokedSessions int64
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		sessionSubquery := tx.
+			Model(&models.LoginHistory{}).
+			Select("user_id", "session_id").
+			Where("login_time < ? AND session_id <> ''", cutoff)
+		if err := tx.Model(&RefreshToken{}).
+			Where("revoked = ?", false).
+			Where("(user_id, session_id) IN (?)", sessionSubquery).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"revoked_at": &now,
+			}).Error; err != nil {
+			return err
+		}
+		result := tx.Model(&models.LoginHistory{}).
+			Where(
+				"login_time < ? AND session_id <> '' AND is_active = ?",
+				cutoff,
+				true,
+			).
+			Updates(map[string]interface{}{
+				"is_active":        false,
+				"logout_time":      now,
+				"last_activity_at": now,
+				"login_status":     models.LoginStatusExpired,
+				"failure_reason":   "session_cutover",
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		revokedSessions = result.RowsAffected
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return revokedSessions, nil
+}
+
 // RevokeSession revokes every refresh token issued for one login session.
 // Refresh rotation keeps the same session ID, so this invalidates both the
 // current refresh token and every access token carrying that sid.

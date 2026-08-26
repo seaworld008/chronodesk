@@ -123,6 +123,15 @@ func NewAuthModule(
 	if err != nil {
 		return nil, fmt.Errorf("initialize authentication email consumer: %w", err)
 	}
+	allowedBrowserOrigin, err := browserOriginFromApplicationWebURL(
+		cfg.App.WebURL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"initialize authentication browser origin: %w",
+			err,
+		)
+	}
 
 	// 创建认证服务
 	authService := NewAuthService(
@@ -145,7 +154,8 @@ func NewAuthModule(
 	authHandler := NewAuthHandler(
 		authService,
 		logger,
-		WithSecureTrustedDeviceCookie(cfg.Server.Environment == "production"),
+		WithSecureAuthCookies(cfg.Server.Environment == "production"),
+		WithAllowedBrowserOrigin(allowedBrowserOrigin),
 	)
 
 	return &AuthModule{

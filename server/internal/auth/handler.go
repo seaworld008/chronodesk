@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -15,15 +17,18 @@ import (
 
 // AuthHandler 认证处理器
 type AuthHandler struct {
-	authService               *AuthService
-	logger                    Logger
-	secureTrustedDeviceCookie bool
-	requestTimeout            time.Duration
+	authService          *AuthService
+	logger               Logger
+	secureAuthCookies    bool
+	allowedBrowserOrigin string
+	requestTimeout       time.Duration
 }
 
 const (
 	trustedDeviceCookieName = "chronodesk_trusted_device"
 	trustedDeviceCookiePath = "/api/auth/login"
+	refreshTokenCookieName  = "chronodesk_refresh_token"
+	refreshTokenCookiePath  = "/api/auth"
 	// statusClientClosedRequest follows the established reverse-proxy convention
 	// for a request whose client has already canceled its context. net/http does
 	// not define this non-standard status, so keep it local to the HTTP adapter.
@@ -37,9 +42,71 @@ type AuthHandlerOption func(*AuthHandler)
 // WithSecureTrustedDeviceCookie 强制可信设备 Cookie 使用 Secure 属性。
 // 生产环境必须启用；TLS 直连请求即使未配置也会自动启用。
 func WithSecureTrustedDeviceCookie(secure bool) AuthHandlerOption {
+	return WithSecureAuthCookies(secure)
+}
+
+// WithSecureAuthCookies 强制所有浏览器认证 Cookie 使用 Secure 属性。
+// 生产环境必须启用；TLS 直连请求即使未配置也会自动启用。
+func WithSecureAuthCookies(secure bool) AuthHandlerOption {
 	return func(handler *AuthHandler) {
-		handler.secureTrustedDeviceCookie = secure
+		handler.secureAuthCookies = secure
 	}
+}
+
+// WithAllowedBrowserOrigin configures the one deployment-owned Web origin
+// allowed to use refresh-cookie authenticated endpoints. Invalid or empty
+// values deliberately leave the handler fail closed.
+func WithAllowedBrowserOrigin(origin string) AuthHandlerOption {
+	return func(handler *AuthHandler) {
+		normalized, err := normalizeBrowserOrigin(origin)
+		if err != nil {
+			handler.allowedBrowserOrigin = ""
+			return
+		}
+		handler.allowedBrowserOrigin = normalized
+	}
+}
+
+func browserOriginFromApplicationWebURL(raw string) (string, error) {
+	parsed, err := parseApplicationWebURL(raw)
+	if err != nil {
+		return "", err
+	}
+	return normalizeBrowserOrigin(parsed.Scheme + "://" + parsed.Host)
+}
+
+func normalizeBrowserOrigin(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("parse browser origin: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme != "http" && scheme != "https") ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		parsed.Opaque != "" ||
+		parsed.Path != "" ||
+		parsed.RawPath != "" ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return "", errors.New("browser origin must be an absolute HTTP(S) origin")
+	}
+	hostname := strings.ToLower(parsed.Hostname())
+	if hostname == "" {
+		return "", errors.New("browser origin host is required")
+	}
+	port := parsed.Port()
+	if (scheme == "http" && port == "80") ||
+		(scheme == "https" && port == "443") {
+		port = ""
+	}
+	authority := hostname
+	if port != "" {
+		authority = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		authority = "[" + hostname + "]"
+	}
+	return scheme + "://" + authority, nil
 }
 
 // Logger 日志接口
@@ -286,6 +353,135 @@ type SuccessResponse struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
+func (h *AuthHandler) requireAllowedBrowserOrigin(c HTTPContext) bool {
+	request := c.Request()
+	if request == nil {
+		c.JSON(http.StatusForbidden, ErrorResponse{
+			Error:   "origin_not_allowed",
+			Message: "浏览器来源不受信任",
+			Code:    "origin_not_allowed",
+		})
+		return false
+	}
+	origins := request.Header.Values("Origin")
+	if len(origins) != 1 || h.allowedBrowserOrigin == "" {
+		h.rejectBrowserOrigin(c)
+		return false
+	}
+	origin, err := normalizeBrowserOrigin(origins[0])
+	if err != nil || origin != h.allowedBrowserOrigin {
+		h.rejectBrowserOrigin(c)
+		return false
+	}
+	return true
+}
+
+func (h *AuthHandler) rejectBrowserOrigin(c HTTPContext) {
+	h.logger.Warn(
+		"Rejected refresh-cookie request from an untrusted browser origin",
+		"request_id", authLogRequestID(c),
+		"reason", "origin_not_allowed",
+	)
+	c.JSON(http.StatusForbidden, ErrorResponse{
+		Error:   "origin_not_allowed",
+		Message: "浏览器来源不受信任",
+		Code:    "origin_not_allowed",
+	})
+}
+
+// rejectLegacyRefreshCredentials ensures the browser refresh credential has
+// exactly one transport: the HttpOnly Cookie. Even an empty legacy header or
+// an empty JSON object is rejected so callers cannot accidentally retain a
+// bearer-copy compatibility path.
+func rejectLegacyRefreshCredentials(c HTTPContext) bool {
+	request := c.Request()
+	if request == nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_request",
+			Message: "认证请求格式无效",
+		})
+		return true
+	}
+	if len(request.Header.Values("X-Refresh-Token")) != 0 {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_request",
+			Message: "刷新凭据只能通过安全 Cookie 提交",
+		})
+		return true
+	}
+	if request.URL != nil {
+		if _, exists := request.URL.Query()["refresh_token"]; exists {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Error:   "invalid_request",
+				Message: "刷新凭据只能通过安全 Cookie 提交",
+			})
+			return true
+		}
+	}
+	if request.Body == nil || request.Body == http.NoBody {
+		return false
+	}
+	if request.ContentLength > maxAuthenticationJSONBodyBytes {
+		return rejectOversizedAuthenticationRequest(
+			c,
+			ErrAuthenticationRequestBodyTooLarge,
+		)
+	}
+	body, err := io.ReadAll(io.LimitReader(
+		request.Body,
+		maxAuthenticationJSONBodyBytes+1,
+	))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_request",
+			Message: "认证请求格式无效",
+		})
+		return true
+	}
+	if int64(len(body)) > maxAuthenticationJSONBodyBytes {
+		return rejectOversizedAuthenticationRequest(
+			c,
+			ErrAuthenticationRequestBodyTooLarge,
+		)
+	}
+	if len(body) != 0 {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_request",
+			Message: "刷新凭据只能通过安全 Cookie 提交",
+		})
+		return true
+	}
+	return false
+}
+
+func refreshTokenFromCookie(c HTTPContext) (string, bool) {
+	request := c.Request()
+	if request == nil {
+		return "", false
+	}
+	var token string
+	count := 0
+	for _, cookie := range request.Cookies() {
+		if cookie.Name != refreshTokenCookieName {
+			continue
+		}
+		count++
+		token = cookie.Value
+	}
+	if count != 1 || token == "" || strings.TrimSpace(token) != token {
+		return "", false
+	}
+	return token, true
+}
+
+func writeMissingRefreshCookie(c HTTPContext) {
+	c.JSON(http.StatusUnauthorized, ErrorResponse{
+		Error:   "invalid_token",
+		Message: "缺少有效的登录会话 Cookie",
+		Code:    "invalid_token",
+	})
+}
+
 // Register 用户注册
 func (h *AuthHandler) Register(c HTTPContext) {
 	var req RegisterRequest
@@ -348,6 +544,22 @@ func (h *AuthHandler) Register(c HTTPContext) {
 		"request_id", authLogRequestID(c),
 		"user_id", authLogUserID(resp.User.ID),
 	)
+	if resp.RefreshToken != "" && !h.setRefreshTokenCookie(
+		c,
+		resp.RefreshToken,
+		resp.RefreshTokenExpiresAt,
+	) {
+		h.logger.Error(
+			"Registration session cookie could not be issued",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_refresh_cookie_lifetime",
+		)
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "authentication_unavailable",
+			Message: "认证服务暂时不可用",
+		})
+		return
+	}
 
 	// 返回成功响应
 	c.JSON(http.StatusCreated, map[string]interface{}{
@@ -448,6 +660,22 @@ func (h *AuthHandler) Login(c HTTPContext) {
 
 	// 设置安全头
 	c.SetHeader("X-Auth-Token", resp.AccessToken)
+	if !h.setRefreshTokenCookie(
+		c,
+		resp.RefreshToken,
+		resp.RefreshTokenExpiresAt,
+	) {
+		h.logger.Error(
+			"Login session cookie could not be issued",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_refresh_cookie_lifetime",
+		)
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "authentication_unavailable",
+			Message: "认证服务暂时不可用",
+		})
+		return
+	}
 	if req.RememberDevice && resp.TrustedDeviceToken != "" {
 		h.setTrustedDeviceCookie(
 			c,
@@ -468,30 +696,18 @@ func (h *AuthHandler) Login(c HTTPContext) {
 
 // RefreshToken 刷新令牌
 func (h *AuthHandler) RefreshToken(c HTTPContext) {
-	var req RefreshTokenRequest
-	if err := c.Bind(&req); err != nil {
-		if rejectOversizedAuthenticationRequest(c, err) {
-			return
-		}
-		h.logger.Error(
-			"Failed to bind refresh token request",
-			"request_id", authLogRequestID(c),
-			"reason", "invalid_request_body",
-		)
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "invalid_request",
-			Message: "请求格式无效",
-		})
+	if !h.requireAllowedBrowserOrigin(c) {
 		return
 	}
-
-	if req.RefreshToken == "" {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "validation_error",
-			Message: "缺少刷新令牌",
-		})
+	if rejectLegacyRefreshCredentials(c) {
 		return
 	}
+	refreshToken, ok := refreshTokenFromCookie(c)
+	if !ok {
+		writeMissingRefreshCookie(c)
+		return
+	}
+	req := RefreshTokenRequest{RefreshToken: refreshToken}
 
 	// 获取客户端信息
 	ipAddress := c.ClientIP()
@@ -526,6 +742,23 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 		"request_id", authLogRequestID(c),
 		"user_id", authLogUserID(resp.User.ID),
 	)
+	if !h.setRefreshTokenCookie(
+		c,
+		resp.RefreshToken,
+		resp.RefreshTokenExpiresAt,
+	) {
+		h.logger.Error(
+			"Rotated session cookie could not be issued",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_refresh_cookie_lifetime",
+		)
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "refresh_failed",
+			Message: "刷新登录令牌失败",
+			Code:    "refresh_failed",
+		})
+		return
+	}
 
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
@@ -576,20 +809,15 @@ func refreshFailureHTTPResponse(err error) (int, string, string) {
 func (h *AuthHandler) Logout(c HTTPContext) {
 	// 普通退出只结束当前登录会话。用户显式选择的可信设备凭据继续保留，
 	// 直到其在设备管理中撤销、过期，或执行全设备退出。
-	// 从头部获取刷新令牌
-	refreshToken := c.GetHeader("X-Refresh-Token")
-	var req LogoutRequest
-	if err := c.Bind(&req); err == nil {
-		if refreshToken == "" {
-			refreshToken = req.RefreshToken
-		}
-	} else if rejectOversizedAuthenticationRequest(c, err) {
+	if !h.requireAllowedBrowserOrigin(c) {
 		return
-	} else if !errors.Is(err, io.EOF) {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "invalid_request",
-			Message: "请求格式无效",
-		})
+	}
+	if rejectLegacyRefreshCredentials(c) {
+		return
+	}
+	refreshToken, ok := refreshTokenFromCookie(c)
+	if !ok {
+		writeMissingRefreshCookie(c)
 		return
 	}
 
@@ -612,6 +840,7 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 	}
 
 	h.logger.Info("User logged out successfully", "request_id", authLogRequestID(c))
+	h.clearRefreshTokenCookie(c)
 
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
@@ -622,8 +851,6 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 
 // LogoutAll 登出所有设备
 func (h *AuthHandler) LogoutAll(c HTTPContext) {
-	h.clearTrustedDeviceCookie(c)
-
 	// 从上下文获取用户ID
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -667,6 +894,8 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 		"request_id", authLogRequestID(c),
 		"user_id", authLogUserID(userIDUint),
 	)
+	h.clearRefreshTokenCookie(c)
+	h.clearTrustedDeviceCookie(c)
 
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
@@ -692,7 +921,7 @@ func (h *AuthHandler) setTrustedDeviceCookie(c HTTPContext, token string, expire
 		MaxAge:   maxAge,
 		Expires:  expiresAt.UTC(),
 		HttpOnly: true,
-		Secure:   h.trustedDeviceCookieIsSecure(c),
+		Secure:   h.authCookieIsSecure(c),
 		SameSite: http.SameSiteStrictMode,
 	})
 }
@@ -705,13 +934,52 @@ func (h *AuthHandler) clearTrustedDeviceCookie(c HTTPContext) {
 		MaxAge:   -1,
 		Expires:  time.Unix(1, 0).UTC(),
 		HttpOnly: true,
-		Secure:   h.trustedDeviceCookieIsSecure(c),
+		Secure:   h.authCookieIsSecure(c),
 		SameSite: http.SameSiteStrictMode,
 	})
 }
 
-func (h *AuthHandler) trustedDeviceCookieIsSecure(c HTTPContext) bool {
-	if h.secureTrustedDeviceCookie {
+func (h *AuthHandler) setRefreshTokenCookie(
+	c HTTPContext,
+	token string,
+	expiresAt time.Time,
+) bool {
+	now := time.Now()
+	if token == "" || expiresAt.IsZero() || !expiresAt.After(now) {
+		return false
+	}
+	maxAge := int(time.Until(expiresAt).Seconds())
+	if maxAge < 1 {
+		return false
+	}
+	c.SetCookie(&http.Cookie{
+		Name:     refreshTokenCookieName,
+		Value:    token,
+		Path:     refreshTokenCookiePath,
+		MaxAge:   maxAge,
+		Expires:  expiresAt.UTC(),
+		HttpOnly: true,
+		Secure:   h.authCookieIsSecure(c),
+		SameSite: http.SameSiteStrictMode,
+	})
+	return true
+}
+
+func (h *AuthHandler) clearRefreshTokenCookie(c HTTPContext) {
+	c.SetCookie(&http.Cookie{
+		Name:     refreshTokenCookieName,
+		Value:    "",
+		Path:     refreshTokenCookiePath,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0).UTC(),
+		HttpOnly: true,
+		Secure:   h.authCookieIsSecure(c),
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (h *AuthHandler) authCookieIsSecure(c HTTPContext) bool {
+	if h.secureAuthCookies {
 		return true
 	}
 	request := c.Request()

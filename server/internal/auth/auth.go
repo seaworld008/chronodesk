@@ -58,6 +58,7 @@ var (
 	ErrInvalidProfileAvatar = errors.New("profile avatar is invalid")
 	ErrInvalidPassword      = errors.New("current password is invalid")
 	ErrOTPNotEnabled        = errors.New("OTP is not enabled")
+	ErrInvalidSessionCutoff = errors.New("session revocation cutoff is invalid")
 	ErrBackupCodesChanged   = errors.New(
 		"backup codes or authentication state changed",
 	)
@@ -312,12 +313,6 @@ type RefreshTokenRequest struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
 }
 
-// LogoutRequest optionally identifies the browser session to revoke when the
-// refresh token is not supplied through the X-Refresh-Token header.
-type LogoutRequest struct {
-	RefreshToken string `json:"refresh_token,omitempty"`
-}
-
 // ChangePasswordRequest 修改密码请求
 type ChangePasswordRequest struct {
 	CurrentPassword string `json:"current_password" binding:"required"`
@@ -381,7 +376,8 @@ type VerifyOTPRequest struct {
 type AuthResponse struct {
 	User                   *UserInfo `json:"user"`
 	AccessToken            string    `json:"access_token"`
-	RefreshToken           string    `json:"refresh_token"`
+	RefreshToken           string    `json:"-"`
+	RefreshTokenExpiresAt  time.Time `json:"-"`
 	ExpiresIn              int64     `json:"expires_in"`
 	TokenType              string    `json:"token_type"`
 	TrustedDeviceToken     string    `json:"-"`
@@ -559,6 +555,12 @@ type TokenRepository interface {
 	) error
 	// 撤销用户所有令牌
 	RevokeAllUserTokens(ctx context.Context, userID uint) error
+	// 一次性撤销在给定时刻之前建立的全部浏览器会话。该能力仅供显式
+	// 维护入口调用，普通应用启动不得自动触发。
+	RevokeAllSessionsIssuedBefore(
+		ctx context.Context,
+		cutoff time.Time,
+	) (int64, error)
 	// 撤销一个登录会话的全部刷新令牌，使该会话签发的访问令牌立即失效
 	RevokeSession(ctx context.Context, userID uint, sessionID string) error
 	// 检查数据库中是否仍存在该会话的有效刷新令牌
@@ -989,16 +991,19 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		result.Session == nil ||
 		strings.TrimSpace(result.Session.AccessToken) == "" ||
 		strings.TrimSpace(result.Session.RefreshToken) == "" ||
-		strings.TrimSpace(result.Session.SessionID) == "" {
+		strings.TrimSpace(result.Session.SessionID) == "" ||
+		result.Session.RefreshAuthority == nil ||
+		result.Session.RefreshAuthority.ExpiresAt.IsZero() {
 		return nil, ErrAtomicRegistrationUnavailable
 	}
 
 	return &AuthResponse{
-		User:         s.buildUserInfo(user, profile),
-		AccessToken:  result.Session.AccessToken,
-		RefreshToken: result.Session.RefreshToken,
-		ExpiresIn:    int64(s.config.AccessTokenExpire.Seconds()),
-		TokenType:    "Bearer",
+		User:                  s.buildUserInfo(user, profile),
+		AccessToken:           result.Session.AccessToken,
+		RefreshToken:          result.Session.RefreshToken,
+		RefreshTokenExpiresAt: result.Session.RefreshAuthority.ExpiresAt,
+		ExpiresIn:             int64(s.config.AccessTokenExpire.Seconds()),
+		TokenType:             "Bearer",
 	}, nil
 }
 
@@ -1374,6 +1379,7 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 		User:                   s.buildUserInfo(user, profile),
 		AccessToken:            accessToken,
 		RefreshToken:           refreshToken,
+		RefreshTokenExpiresAt:  refreshRecord.ExpiresAt,
 		ExpiresIn:              int64(s.config.AccessTokenExpire.Seconds()),
 		TokenType:              "Bearer",
 		TrustedDeviceToken:     trustedDeviceToken,
@@ -1537,11 +1543,12 @@ func (s *AuthService) refreshToken(
 	}
 
 	return &AuthResponse{
-		User:         s.buildUserInfo(user, profile),
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresIn:    int64(s.config.AccessTokenExpire.Seconds()),
-		TokenType:    "Bearer",
+		User:                  s.buildUserInfo(user, profile),
+		AccessToken:           accessToken,
+		RefreshToken:          refreshToken,
+		RefreshTokenExpiresAt: issuedAt.Add(s.config.RefreshTokenExpire),
+		ExpiresIn:             int64(s.config.AccessTokenExpire.Seconds()),
+		TokenType:             "Bearer",
 	}, nil
 }
 
@@ -1556,9 +1563,26 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 		sessionID string
 	)
 
-	if tokenRecord, err := s.tokenRepo.GetRefreshToken(ctx, refreshToken); err == nil {
+	tokenRecord, lookupErr := s.tokenRepo.GetRefreshTokenForRotation(
+		ctx,
+		refreshToken,
+	)
+	if lookupErr == nil {
 		userID = tokenRecord.UserID
 		sessionID = tokenRecord.SessionID
+	} else if !errors.Is(lookupErr, ErrInvalidToken) {
+		return lookupErr
+	}
+	if (userID == 0 || sessionID == "") && s.jwtManager != nil {
+		// A delayed refresh response can leave an older, already-rotated Cookie
+		// in the browser after the short deterministic replay window. The
+		// signed refresh claims still identify only their own immutable session,
+		// so they are safe to use for logout even when that exact token row is
+		// no longer rotation-eligible.
+		if claims, err := s.jwtManager.VerifyRefreshToken(refreshToken); err == nil {
+			userID = claims.UserID
+			sessionID = claims.SessionID
+		}
 	}
 
 	if userID != 0 && sessionID != "" {
@@ -1566,8 +1590,9 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 			return err
 		}
 	} else {
-		// Invalid and already-revoked refresh tokens keep logout idempotent without
-		// allowing unsigned ParseTokenClaims data to revoke another user's session.
+		// Invalid refresh tokens keep logout idempotent. Session fallback above
+		// accepts only signature-verified claims and never unsigned ParseTokenClaims
+		// data, so an attacker cannot choose another user's session ID.
 		if err := s.tokenRepo.RevokeRefreshToken(ctx, refreshToken); err != nil &&
 			!errors.Is(err, ErrInvalidToken) {
 			return err
@@ -1593,6 +1618,22 @@ func (s *AuthService) LogoutAll(ctx context.Context, userID uint) error {
 		}
 	}
 	return nil
+}
+
+// RevokeAllSessionsIssuedBefore exposes the repository's one-shot browser
+// session cutover primitive to an explicit maintenance adapter. It is
+// intentionally not called by application startup.
+func (s *AuthService) RevokeAllSessionsIssuedBefore(
+	ctx context.Context,
+	cutoff time.Time,
+) (int64, error) {
+	if cutoff.IsZero() {
+		return 0, ErrInvalidSessionCutoff
+	}
+	return s.tokenRepo.RevokeAllSessionsIssuedBefore(
+		ctx,
+		cutoff.UTC().Truncate(time.Microsecond),
+	)
 }
 
 // ForgotPassword 忘记密码

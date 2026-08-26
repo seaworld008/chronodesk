@@ -1529,7 +1529,7 @@ func getTicketStatsCacheTTL() time.Duration {
 
 func buildCORSConfig(cfg *config.Config) *middleware.CORSConfig {
 	corsConfig := &middleware.CORSConfig{
-		AllowOrigins: cfg.CORS.AllowedOrigins,
+		AllowOrigins: trustedProtocolOrigins(cfg.CORS.AllowedOrigins),
 		AllowMethods: cfg.CORS.AllowedMethods,
 		AllowHeaders: cfg.CORS.AllowedHeaders,
 		ExposeHeaders: []string{
@@ -1546,19 +1546,7 @@ func buildCORSConfig(cfg *config.Config) *middleware.CORSConfig {
 		AllowCredentials: true,
 		MaxAge:           86400,
 	}
-	if cfg.Server.Environment != "production" || containsOrigin(cfg.CORS.AllowedOrigins, "*") {
-		corsConfig.AllowAllOrigins = true
-	}
 	return corsConfig
-}
-
-func containsOrigin(origins []string, target string) bool {
-	for _, origin := range origins {
-		if strings.TrimSpace(origin) == target {
-			return true
-		}
-	}
-	return false
 }
 
 func trustedProtocolOrigins(origins []string) []string {

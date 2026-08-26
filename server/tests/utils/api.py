@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = int(os.getenv("TEST_REQUEST_TIMEOUT", "15"))
 DEFAULT_MAX_RETRIES = int(os.getenv("TEST_REQUEST_MAX_RETRIES", "3"))
 DEFAULT_RETRY_DELAY = float(os.getenv("TEST_REQUEST_RETRY_DELAY", "1.0"))
+DEFAULT_BROWSER_ORIGIN = os.getenv("TEST_WEB_ORIGIN", "http://localhost:3000")
 PROJECT_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
 PROJECT_PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 
@@ -50,6 +51,7 @@ class APIClient:
     max_retries: int = DEFAULT_MAX_RETRIES
     retry_delay: float = DEFAULT_RETRY_DELAY
     project_key: str | None = None
+    browser_origin: str = DEFAULT_BROWSER_ORIGIN
 
     def __post_init__(self) -> None:
         # remove trailing slash for consistency
@@ -292,15 +294,22 @@ class APIClient:
 
     def with_auth(self, token: str) -> APIClient:
         register_secret(token)
+        clone = self.clone()
+        clone.session.headers["Authorization"] = f"Bearer {token}"
+        return clone
+
+    def clone(self, *, include_cookies: bool = True) -> APIClient:
         clone = APIClient(
             base_url=self.base_url,
             timeout=self.timeout,
             max_retries=self.max_retries,
             retry_delay=self.retry_delay,
             project_key=self.project_key,
+            browser_origin=self.browser_origin,
         )
         clone.session.headers.update(self.session.headers)
-        clone.session.headers["Authorization"] = f"Bearer {token}"
+        if include_cookies:
+            clone.session.cookies.update(self.session.cookies)
         return clone
 
     def close(self) -> None:
@@ -325,8 +334,12 @@ class APIClient:
             raise APIError("Unexpected login response payload", response=response)
         return data["data"]
 
-    def refresh(self, refresh_token: str) -> dict[str, Any]:
-        response = self.post_json("/auth/refresh", {"refresh_token": refresh_token})
+    def refresh(self) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/auth/refresh",
+            headers={"Origin": self.browser_origin},
+        )
         if response.status_code != 200:
             raise APIError("Refresh token failed", response=response)
         return response.json().get("data", {})
@@ -341,12 +354,12 @@ class APIClient:
             raise APIError("Unexpected registration payload", response=response)
         return data["data"]
 
-    def logout(self, refresh_token: str | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if refresh_token:
-            payload["refresh_token"] = refresh_token
-
-        response = self.post_json("/auth/logout", payload)
+    def logout(self) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/auth/logout",
+            headers={"Origin": self.browser_origin},
+        )
         if response.status_code != 200:
             raise APIError("Logout failed", response=response)
 

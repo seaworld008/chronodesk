@@ -208,25 +208,25 @@ def assert_human_session_contract(
     assert "role" not in user, safe_diagnostic(user)
     assert "project_role" not in user, safe_diagnostic(user)
 
-    for token_name in ("access_token", "refresh_token"):
-        token = session.get(token_name)
-        assert isinstance(token, str) and token
-        segments = token.split(".")
-        assert len(segments) == 3, f"{token_name} is not a compact JWT"
-        encoded_payload = segments[1]
-        padding = "=" * (-len(encoded_payload) % 4)
-        try:
-            claims = json.loads(
-                base64.urlsafe_b64decode(encoded_payload + padding).decode("utf-8")
-            )
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise AssertionError(f"{token_name} payload is not valid JSON") from exc
-        assert isinstance(claims, dict)
-        assert claims.get("platform_role") == expected_platform_role, safe_diagnostic(
-            claims
+    assert "refresh_token" not in session, safe_diagnostic(session)
+    token = session.get("access_token")
+    assert isinstance(token, str) and token
+    segments = token.split(".")
+    assert len(segments) == 3, "access_token is not a compact JWT"
+    encoded_payload = segments[1]
+    padding = "=" * (-len(encoded_payload) % 4)
+    try:
+        claims = json.loads(
+            base64.urlsafe_b64decode(encoded_payload + padding).decode("utf-8")
         )
-        assert "role" not in claims, safe_diagnostic(claims)
-        assert "project_role" not in claims, safe_diagnostic(claims)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AssertionError("access_token payload is not valid JSON") from exc
+    assert isinstance(claims, dict)
+    assert claims.get("platform_role") == expected_platform_role, safe_diagnostic(
+        claims
+    )
+    assert "role" not in claims, safe_diagnostic(claims)
+    assert "project_role" not in claims, safe_diagnostic(claims)
 
 
 _WEAK_PASSWORD_PATTERNS = (
@@ -295,7 +295,6 @@ class HumanIdentity:
     email: str
     password: str = field(repr=False)
     access_token: str = field(repr=False)
-    refresh_token: str = field(repr=False)
     api: APIClient = field(repr=False)
 
     def __post_init__(self) -> None:
@@ -426,9 +425,7 @@ class E2EResourceManager:
             expected_platform_role=platform_role,
         )
         access_token = tokens.get("access_token")
-        refresh_token = tokens.get("refresh_token")
         assert isinstance(access_token, str) and access_token, safe_diagnostic(tokens)
-        assert isinstance(refresh_token, str) and refresh_token, safe_diagnostic(tokens)
         api = self.api_client.with_auth(access_token)
         self._clients.append(api)
         return HumanIdentity(
@@ -439,7 +436,6 @@ class E2EResourceManager:
             email=email,
             password=password,
             access_token=access_token,
-            refresh_token=refresh_token,
             api=api,
         )
 

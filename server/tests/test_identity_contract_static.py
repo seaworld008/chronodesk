@@ -42,7 +42,6 @@ def _identity(
         email="static-contract@example.com",
         password="not-a-real-secret",
         access_token="not-a-real-token",
-        refresh_token="not-a-real-token",
         api=cast(APIClient, object()),
     )
 
@@ -99,7 +98,6 @@ def test_auth_and_jwt_contract_contains_only_platform_role() -> None:
             "platform_role": "member",
         },
         "access_token": _jwt(valid_claims),
-        "refresh_token": _jwt({**valid_claims, "type": "refresh"}),
     }
     assert_human_session_contract(
         session,

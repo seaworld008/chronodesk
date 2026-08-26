@@ -60,8 +60,7 @@ class TestAuthenticationFlows:
         registered_user: dict[str, str],
     ) -> None:
         access_token = registered_user.get("access_token")
-        refresh_token = registered_user.get("refresh_token")
-        assert access_token and refresh_token, "注册响应缺少令牌"
+        assert access_token, "注册响应缺少访问令牌"
 
         authed_client = api_client.with_auth(access_token)
         try:
@@ -113,21 +112,22 @@ class TestAuthenticationFlows:
         finally:
             authed_client.close()
 
-        refreshed = api_client.refresh(refresh_token)
+        refreshed = api_client.refresh()
         assert_human_session_contract(
             refreshed,
             expected_platform_role="member",
         )
         new_access_token = refreshed.get("access_token")
-        new_refresh_token = refreshed.get("refresh_token")
-        assert new_access_token and new_refresh_token, "刷新令牌接口未返回新的令牌"
-        assert new_refresh_token != refresh_token, "刷新后应生成新的 refresh token"
+        assert new_access_token, "刷新接口未返回新的访问令牌"
+        assert "refresh_token" not in refreshed, "刷新响应不得暴露 refresh token"
 
-        logout_body = api_client.logout(new_refresh_token)
+        logout_body = api_client.logout()
         assert logout_body.get("success") is True
 
-        failed_resp = api_client.post_json(
-            "/auth/refresh", {"refresh_token": new_refresh_token}
+        failed_resp = api_client.request(
+            "POST",
+            "/auth/refresh",
+            headers={"Origin": api_client.browser_origin},
         )
         assert failed_resp.status_code == 401, response_diagnostic(failed_resp)
         failed_body = failed_resp.json()
@@ -167,10 +167,11 @@ class TestAuthenticationFlows:
         registered_user: dict[str, str],
     ) -> None:
         first_access = registered_user.get("access_token")
-        first_refresh = registered_user.get("refresh_token")
-        assert first_access and first_refresh
+        assert first_access
+        first_browser = api_client.clone()
 
-        second_session = api_client.login(
+        second_browser = api_client.clone(include_cookies=False)
+        second_session = second_browser.login(
             registered_user["email"],
             registered_user["password"],
         )
@@ -179,10 +180,9 @@ class TestAuthenticationFlows:
             expected_platform_role="member",
         )
         second_access = second_session.get("access_token")
-        second_refresh = second_session.get("refresh_token")
-        assert second_access and second_refresh
+        assert second_access
 
-        first_client = api_client.with_auth(first_access)
+        first_client = first_browser.with_auth(first_access)
         try:
             logout_all = first_client.post_json("/auth/logout-all", {})
             assert logout_all.status_code == 200, response_diagnostic(logout_all)
@@ -199,12 +199,17 @@ class TestAuthenticationFlows:
             finally:
                 revoked_client.close()
 
-        for refresh_token in (first_refresh, second_refresh):
-            response = api_client.post_json(
-                "/auth/refresh",
-                {"refresh_token": refresh_token},
-            )
-            assert response.status_code == 401, response_diagnostic(response)
+        try:
+            for browser in (first_browser, second_browser):
+                response = browser.request(
+                    "POST",
+                    "/auth/refresh",
+                    headers={"Origin": browser.browser_origin},
+                )
+                assert response.status_code == 401, response_diagnostic(response)
+        finally:
+            first_browser.close()
+            second_browser.close()
 
     def test_otp_trusted_device_flow(
         self,
@@ -214,12 +219,11 @@ class TestAuthenticationFlows:
         email = registered_user["email"]
         password = registered_user["password"]
         access_token = registered_user["access_token"]
-        refresh_token = registered_user["refresh_token"]
 
         secret, _ = self._enable_otp(api_client, access_token, password)
 
         # 原刷新令牌应该继续可用，先显式登出便于后续验证
-        api_client.logout(refresh_token)
+        api_client.logout()
 
         missing_otp_resp = api_client.post_json(
             "/auth/login",
@@ -265,6 +269,10 @@ class TestAuthenticationFlows:
             f"可信设备 Cookie 缺少安全属性：{', '.join(missing_cookie_attributes)}"
         )
         assert login_data.get("user", {}).get("otp_enabled") is True
+        assert "refresh_token" not in login_data, "登录响应不得暴露 refresh token"
+        refresh_cookie = login_resp.cookies.get("chronodesk_refresh_token")
+        assert refresh_cookie, "登录响应缺少 HttpOnly refresh Cookie"
+        assert "Path=/api/auth" in set_cookie
 
         second_login_resp = api_client.post_json(
             "/auth/login",
@@ -281,15 +289,15 @@ class TestAuthenticationFlows:
 
         second_data = second_body.get("data", {})
         assert "trusted_device_token" not in second_data, "重复登录不应返回设备凭据"
+        assert "refresh_token" not in second_data, "重复登录不得返回 refresh token"
 
         # 设备免OTP登录仍应提供新的令牌对，验证刷新立即可用
-        new_refresh = second_data.get("refresh_token")
-        assert new_refresh, "设备免OTP登录缺少刷新令牌"
-        refreshed = api_client.refresh(new_refresh)
+        refreshed = api_client.refresh()
         assert refreshed.get("access_token"), "Trusted 登录 refresh 未返回访问令牌"
+        assert "refresh_token" not in refreshed
 
         # 销毁最新会话，避免污染
-        api_client.logout(new_refresh)
+        api_client.logout()
 
     def test_login_failure_scenarios(
         self,
@@ -309,10 +317,18 @@ class TestAuthenticationFlows:
         invalid_body = invalid_resp.json()
         assert invalid_body.get("msg") in {"邮箱或密码错误", "登录失败"}
 
-        refresh_resp = api_client.post_json(
-            "/auth/refresh",
-            {"refresh_token": "deadbeef"},
+        invalid_browser = api_client.clone(include_cookies=False)
+        invalid_browser.session.cookies.set(
+            "chronodesk_refresh_token",
+            "invalid-session-sentinel",
+            path="/api/auth",
         )
+        refresh_resp = invalid_browser.request(
+            "POST",
+            "/auth/refresh",
+            headers={"Origin": invalid_browser.browser_origin},
+        )
+        invalid_browser.close()
         assert refresh_resp.status_code == 401, response_diagnostic(refresh_resp)
         refresh_body = refresh_resp.json()
         assert refresh_body.get("error") in {
@@ -375,10 +391,9 @@ class TestAuthenticationFlows:
         email = registered_user["email"]
         password = registered_user["password"]
         access_token = registered_user["access_token"]
-        refresh_token = registered_user["refresh_token"]
 
         secret, _ = self._enable_otp(api_client, access_token, password)
-        api_client.logout(refresh_token)
+        api_client.logout()
 
         otp_code = _generate_totp(secret)
         login_payload = {
@@ -409,8 +424,8 @@ class TestAuthenticationFlows:
         )
         second_data = second_login_resp.json()["data"]
         new_access = second_data.get("access_token")
-        new_refresh = second_data.get("refresh_token")
-        assert new_access and new_refresh
+        assert new_access
+        assert "refresh_token" not in second_data
 
         authed = api_client.with_auth(new_access)
         try:
@@ -458,8 +473,8 @@ class TestAuthenticationFlows:
             },
         )
         assert recovery_login.status_code == 200, response_diagnostic(recovery_login)
-        recovery_data = recovery_login.json()["data"]
-        api_client.logout(recovery_data.get("refresh_token"))
+        assert "refresh_token" not in recovery_login.json()["data"]
+        api_client.logout()
 
     def test_backup_code_single_use(
         self,
@@ -469,13 +484,12 @@ class TestAuthenticationFlows:
         email = registered_user["email"]
         password = registered_user["password"]
         access_token = registered_user["access_token"]
-        refresh_token = registered_user["refresh_token"]
 
         secret, backup_codes = self._enable_otp(api_client, access_token, password)
         assert backup_codes, "启用OTP应返回备用码"
         backup_code = backup_codes[0]
 
-        api_client.logout(refresh_token)
+        api_client.logout()
 
         backup_login_resp = api_client.post_json(
             "/auth/login",
@@ -490,8 +504,9 @@ class TestAuthenticationFlows:
         )
         backup_data = backup_login_resp.json()["data"]
         assert backup_data.get("user", {}).get("otp_enabled") is True
+        assert "refresh_token" not in backup_data
 
-        api_client.logout(backup_data.get("refresh_token"))
+        api_client.logout()
 
         reuse_resp = api_client.post_json(
             "/auth/login",
@@ -512,7 +527,8 @@ class TestAuthenticationFlows:
             },
         )
         assert totp_resp.status_code == 200, response_diagnostic(totp_resp)
-        api_client.logout(totp_resp.json()["data"].get("refresh_token"))
+        assert "refresh_token" not in totp_resp.json()["data"]
+        api_client.logout()
 
     def test_disable_otp_restores_password_only_login(
         self,
@@ -522,10 +538,9 @@ class TestAuthenticationFlows:
         email = registered_user["email"]
         password = registered_user["password"]
         access_token = registered_user["access_token"]
-        refresh_token = registered_user["refresh_token"]
 
         secret, _ = self._enable_otp(api_client, access_token, password)
-        api_client.logout(refresh_token)
+        api_client.logout()
 
         # Without OTP now fails
         missing_resp = api_client.post_json(
@@ -548,8 +563,8 @@ class TestAuthenticationFlows:
         assert login_resp.status_code == 200, response_diagnostic(login_resp)
         login_data = login_resp.json()["data"]
         new_access = login_data.get("access_token")
-        new_refresh = login_data.get("refresh_token")
-        assert new_access and new_refresh
+        assert new_access
+        assert "refresh_token" not in login_data
 
         authed = api_client.with_auth(new_access)
         try:
@@ -560,7 +575,7 @@ class TestAuthenticationFlows:
         finally:
             authed.close()
 
-        api_client.logout(new_refresh)
+        api_client.logout()
 
         plain_login_resp = api_client.post_json(
             "/auth/login",
@@ -574,4 +589,5 @@ class TestAuthenticationFlows:
         )
         plain_data = plain_login_resp.json()["data"]
         assert plain_data.get("user", {}).get("otp_enabled") is False
-        api_client.logout(plain_data.get("refresh_token"))
+        assert "refresh_token" not in plain_data
+        api_client.logout()

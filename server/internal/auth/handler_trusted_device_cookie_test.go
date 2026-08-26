@@ -27,6 +27,7 @@ func TestTrustedDeviceCredentialIsNotPartOfTheJSONContract(t *testing.T) {
 
 	encoded, err := json.Marshal(AuthResponse{
 		AccessToken:            "access-token",
+		RefreshToken:           "refresh-token",
 		TrustedDeviceToken:     "trusted-device-secret",
 		TrustedDeviceExpiresAt: time.Now().Add(time.Hour),
 	})
@@ -34,8 +35,10 @@ func TestTrustedDeviceCredentialIsNotPartOfTheJSONContract(t *testing.T) {
 		t.Fatalf("encode auth response: %v", err)
 	}
 	if strings.Contains(string(encoded), "trusted-device-secret") ||
-		strings.Contains(string(encoded), "trusted_device") {
-		t.Fatalf("auth response exposed trusted-device credential: %s", encoded)
+		strings.Contains(string(encoded), "trusted_device") ||
+		strings.Contains(string(encoded), "refresh-token") ||
+		strings.Contains(string(encoded), "refresh_token") {
+		t.Fatalf("auth response exposed a server-managed credential: %s", encoded)
 	}
 }
 

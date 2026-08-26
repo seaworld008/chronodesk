@@ -323,16 +323,14 @@ def platform_admin_identity(
     admin_username = admin_user.get("username")
     admin_email = admin_user.get("email", admin_credentials["email"])
     admin_access_token = admin_tokens.get("access_token")
-    admin_refresh_token = admin_tokens.get("refresh_token")
     if (
         not isinstance(admin_id, int)
         or admin_id <= 0
         or not isinstance(admin_username, str)
         or not isinstance(admin_email, str)
         or not isinstance(admin_access_token, str)
-        or not isinstance(admin_refresh_token, str)
     ):
-        pytest.fail("管理员登录响应缺少完整身份或令牌字段")
+        pytest.fail("管理员登录响应缺少完整身份或访问令牌字段")
 
     context = admin_api.get_json(admin_api.project_path("context"))
     if context.status_code != 200:
@@ -358,7 +356,6 @@ def platform_admin_identity(
         email=admin_email,
         password=admin_credentials["password"],
         access_token=admin_access_token,
-        refresh_token=admin_refresh_token,
         api=admin_api,
     )
 
@@ -458,7 +455,6 @@ def registered_user(
         "email": email,
         "password": password,
         "access_token": data.get("access_token"),
-        "refresh_token": data.get("refresh_token"),
         "user": data.get("user", {}),
     }
     registered_identity = registered["user"]

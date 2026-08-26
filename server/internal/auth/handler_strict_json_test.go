@@ -213,7 +213,15 @@ func TestAuthFailureMappingsPublishContractedRuntimeStatuses(t *testing.T) {
 func TestLogoutHandlersPublishClosedSuccessEnvelopesAndPreserveTrustSemantics(
 	t *testing.T,
 ) {
-	_, _, handler := setupSessionRevocationTest(t)
+	repository, manager, handler := setupSessionRevocationTest(t)
+	_, refreshToken := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		42,
+		PlatformRolePlatformAdmin,
+		"logout-envelope-session",
+	)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/logout", func(c *gin.Context) {
@@ -242,6 +250,14 @@ func TestLogoutHandlersPublishClosedSuccessEnvelopesAndPreserveTrustSemantics(
 	} {
 		t.Run(test.path, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, test.path, nil)
+			request.AddCookie(&http.Cookie{
+				Name:  refreshTokenCookieName,
+				Value: refreshToken,
+				Path:  refreshTokenCookiePath,
+			})
+			if test.path == "/logout" {
+				request.Header.Set("Origin", testBrowserOrigin)
+			}
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 
@@ -257,17 +273,34 @@ func TestLogoutHandlersPublishClosedSuccessEnvelopesAndPreserveTrustSemantics(
 				body["message"] != test.wantMessage {
 				t.Fatalf("logout response = %v", body)
 			}
-			cookie := response.Header().Get("Set-Cookie")
-			hasClearingCookie :=
-				strings.Contains(cookie, trustedDeviceCookieName+"=") &&
-					strings.Contains(
-						cookie,
-						"Path="+trustedDeviceCookiePath,
-					) &&
-					strings.Contains(cookie, "HttpOnly") &&
-					strings.Contains(cookie, "SameSite=Strict")
-			if hasClearingCookie != test.clearsTrust {
-				t.Fatalf("trusted-device clearing cookie = %q", cookie)
+			refreshCleared := false
+			trustCleared := false
+			for _, cookie := range response.Result().Cookies() {
+				if cookie.MaxAge >= 0 ||
+					!cookie.HttpOnly ||
+					cookie.SameSite != http.SameSiteStrictMode {
+					continue
+				}
+				switch cookie.Name {
+				case refreshTokenCookieName:
+					refreshCleared =
+						cookie.Path == refreshTokenCookiePath
+				case trustedDeviceCookieName:
+					trustCleared =
+						cookie.Path == trustedDeviceCookiePath
+				}
+			}
+			if !refreshCleared {
+				t.Fatalf(
+					"refresh clearing cookie missing: %q",
+					response.Header().Values("Set-Cookie"),
+				)
+			}
+			if trustCleared != test.clearsTrust {
+				t.Fatalf(
+					"trusted-device clearing cookies = %q",
+					response.Header().Values("Set-Cookie"),
+				)
 			}
 		})
 	}
@@ -275,7 +308,11 @@ func TestLogoutHandlersPublishClosedSuccessEnvelopesAndPreserveTrustSemantics(
 
 func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	handler := NewAuthHandler(nil, nil)
+	handler := NewAuthHandler(
+		nil,
+		nil,
+		WithAllowedBrowserOrigin(testBrowserOrigin),
+	)
 	tests := []struct {
 		name    string
 		handle  func(HTTPContext)
@@ -376,6 +413,7 @@ func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 				strings.NewReader(test.payload),
 			)
 			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Origin", testBrowserOrigin)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 
