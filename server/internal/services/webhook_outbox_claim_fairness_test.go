@@ -188,7 +188,7 @@ func TestWebhookOutboxProjectCursorReachesEveryProjectPastHotBacklog(
 			}
 		}
 	}
-	fixture.service.outboxDeliverySlots = make(chan struct{}, 8)
+	fixture.service.configureOutboxDeliveryBulkheads(8)
 	var adapterCalls atomic.Int32
 	deliverer := OutboxDeliverFunc(func(
 		context.Context,
@@ -285,7 +285,7 @@ func TestProcessOutboxBatchPreservesCommittedPartialClaimsAfterProjectError(
 		injected,
 		nil,
 	)
-	fixture.service.outboxDeliverySlots = make(chan struct{}, 3)
+	fixture.service.configureOutboxDeliveryBulkheads(3)
 	var adapterCalls atomic.Int32
 	batch, err := fixture.service.ProcessOutboxBatch(
 		context.Background(),

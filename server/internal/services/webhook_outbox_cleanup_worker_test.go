@@ -740,10 +740,11 @@ func TestWebhookOutboxClaimBoundsIdleProjectScanByGlobalLimit(
 	if adapterCalls.Load() != 0 {
 		t.Fatalf("idle claim made %d adapter calls", adapterCalls.Load())
 	}
-	if got := candidateQueries.Load(); got != 5 {
+	if got := candidateQueries.Load(); got != outboxClaimClassCount {
 		t.Fatalf(
-			"idle claim candidate queries = %d, want one project's 5 bounded class scans",
+			"idle claim candidate queries = %d, want one project's %d bounded class scans",
 			got,
+			outboxClaimClassCount,
 		)
 	}
 }
