@@ -91,6 +91,11 @@ test('短时安全检查保留 main 状态并取消同 PR 的旧运行', async (
           (step) => step.run === 'npm run test:ci-runtime',
         ),
       )
+      assert.ok(
+        workflow.jobs.web.steps.some(
+          (step) => step.run === 'npm run test:project-scope',
+        ),
+      )
     }
   }
 })
