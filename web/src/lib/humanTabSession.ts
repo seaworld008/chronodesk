@@ -1,5 +1,7 @@
 import type { PlatformRole } from '@/lib/generated/human-api'
 import { parsePlatformRole } from './accessControl'
+import { readHumanAccessToken } from './humanSessionRuntime'
+import { readHumanSessionMetadata } from './humanSessionStorage'
 
 export type HumanSessionBinding = {
     subject: string
@@ -8,10 +10,7 @@ export type HumanSessionBinding = {
     expires_at: number
 }
 
-let boundAccessToken: string | null =
-    typeof window === 'undefined'
-        ? null
-        : window.localStorage.getItem('token')
+let boundAccessToken: string | null = readHumanAccessToken()
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
@@ -34,7 +33,7 @@ const decodeBase64Url = (value: string): string => {
 }
 
 export const readHumanSessionBinding = (
-    token = localStorage.getItem('token'),
+    token = readHumanAccessToken(),
 ): HumanSessionBinding | null => {
     if (!token) return null
     const parts = token.split('.')
@@ -63,14 +62,13 @@ export const readHumanSessionBinding = (
 }
 
 export const readCommittedHumanTabSessionToken = (): string | null => {
-    const token = localStorage.getItem('token')
-    const refreshToken = localStorage.getItem('refreshToken')
-    const serializedUser = localStorage.getItem('user')
-    const serializedExpiresAt = localStorage.getItem('tokenExpiresAt')
+    const token = readHumanAccessToken()
+    const serializedUser = readHumanSessionMetadata('user')
+    const serializedExpiresAt =
+        readHumanSessionMetadata('tokenExpiresAt')
     const binding = readHumanSessionBinding(token)
     if (
         !token ||
-        !nonEmptyString(refreshToken) ||
         !serializedUser ||
         !serializedExpiresAt ||
         binding === null ||

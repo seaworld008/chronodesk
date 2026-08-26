@@ -54,6 +54,7 @@ import {
     sessionAwareFetch,
 } from '@/lib/apiClient'
 import { joinApiUrl } from '@/lib/apiUrl'
+import { readHumanAccessToken } from '@/lib/humanSessionRuntime'
 import { resolveActiveProjectKey } from '@/lib/projectScope'
 import {
     canWriteInternalTicketContent,
@@ -76,7 +77,7 @@ const AttachmentPreviewDialog = lazy(() =>
 
 const authHeaders = (contentType?: string) => {
     const headers = new Headers({ Accept: 'application/json' })
-    const token = localStorage.getItem('token')
+    const token = readHumanAccessToken()
     if (token) {
         headers.set('Authorization', `Bearer ${token}`)
     }

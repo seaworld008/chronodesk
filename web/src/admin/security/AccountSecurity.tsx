@@ -94,7 +94,7 @@ const AccountSecurity = () => {
             notify('密码已修改，所有会话（包括当前会话）均已失效，请重新登录', {
                 type: 'success',
             })
-            clearAuthenticationState()
+            clearAuthenticationState({ notifyPeers: true })
             navigate('/login', { replace: true })
         } catch (error) {
             notify(localizedUnknownErrorMessage(error, '密码修改失败'), {

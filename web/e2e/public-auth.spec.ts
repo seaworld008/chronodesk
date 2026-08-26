@@ -90,7 +90,6 @@ test('公开注册页无需会话并提交严格 Human API DTO', async ({ page }
                 data: {
                     user: publicUser,
                     access_token: '',
-                    refresh_token: '',
                     expires_in: 0,
                     token_type: '',
                 },
@@ -139,6 +138,7 @@ test('已验证注册会话按登录路径写入并进入根路由', async ({ pa
         last_login_at: null,
     }
     let projectListRequests = 0
+    let projectListAuthorization = ''
 
     await page.addInitScript(() => {
         const tracedWindow = window as Window & {
@@ -174,7 +174,6 @@ test('已验证注册会话按登录路径写入并进入根路由', async ({ pa
                     data: {
                         user,
                         access_token: accessToken,
-                        refresh_token: `${identity.sessionID}-refresh`,
                         expires_in: 3600,
                         token_type: 'Bearer',
                     },
@@ -185,6 +184,8 @@ test('已验证注册会话按登录路径写入并进入根路由', async ({ pa
         }
         if (pathname === '/api/projects') {
             projectListRequests += 1
+            projectListAuthorization =
+                route.request().headers().authorization ?? ''
             await fulfillJSON(route, { code: 0, data: [] })
             return
         }
@@ -197,9 +198,13 @@ test('已验证注册会话按登录路径写入并进入根路由', async ({ pa
     await expect(page).toHaveURL(/\/#\/$/u)
     await expect(page.getByTestId('no-authorized-projects')).toBeVisible()
     expect(projectListRequests).toBeGreaterThan(0)
+    expect(projectListAuthorization).toBe(`Bearer ${accessToken}`)
     await expect
-        .poll(() => page.evaluate(() => localStorage.getItem('token')))
-        .toBe(accessToken)
+        .poll(() => readAuthenticationStorage(page))
+        .toMatchObject({
+            token: null,
+            refreshToken: null,
+        })
     expect(
         await page.evaluate(() => {
             const tracedWindow = window as Window & {
@@ -207,7 +212,7 @@ test('已验证注册会话按登录路径写入并进入根路由', async ({ pa
             }
             return tracedWindow.__chronodeskAuthenticationWrites
         }),
-    ).toEqual(['refreshToken', 'user', 'tokenExpiresAt', 'token'])
+    ).toEqual(['user', 'tokenExpiresAt'])
 })
 
 test('已验证注册的残缺成功响应不写入部分会话', async ({ page }) => {
@@ -234,8 +239,7 @@ test('已验证注册的残缺成功响应不写入部分会话', async ({ page 
                         otp_enabled: false,
                         last_login_at: null,
                     },
-                    access_token: mockSessionToken(identity),
-                    refresh_token: '',
+                    access_token: '',
                     expires_in: 3600,
                     token_type: 'Bearer',
                 },
@@ -319,7 +323,6 @@ const validVerifiedRegistrationResult = () => ({
         last_login_at: null,
     },
     access_token: mockSessionToken(invalidRegistrationIdentity),
-    refresh_token: `${invalidRegistrationIdentity.sessionID}-refresh`,
     expires_in: 3600,
     token_type: 'Bearer',
 })
@@ -563,6 +566,8 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
     let oldPasswordAttempts = 0
     let newPasswordAttempts = 0
     let logoutRequests = 0
+    let refreshRequests = 0
+    let projectAuthorization = ''
 
     await context.route('**/api/**', async (route) => {
         const request = route.request()
@@ -600,7 +605,6 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
                     data: {
                         user,
                         access_token: accessToken,
-                        refresh_token: `${identity.sessionID}-refresh`,
                         expires_in: 3600,
                         token_type: 'Bearer',
                     },
@@ -612,6 +616,22 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
                 { code: 1, msg: '测试密码不在允许范围内' },
                 400,
             )
+            return
+        }
+        if (
+            pathname === '/api/auth/refresh' &&
+            request.method() === 'POST'
+        ) {
+            refreshRequests += 1
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    user,
+                    access_token: accessToken,
+                    expires_in: 3600,
+                    token_type: 'Bearer',
+                },
+            })
             return
         }
         if (
@@ -630,6 +650,8 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
             return
         }
         if (pathname === '/api/projects') {
+            projectAuthorization =
+                request.headers().authorization ?? ''
             await fulfillJSON(route, { code: 0, data: [access] })
             return
         }
@@ -715,7 +737,7 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
         .poll(() =>
             loginPage.evaluate(() => localStorage.getItem('token')),
         )
-        .toBe(accessToken)
+        .toBeNull()
     await expect
         .poll(() =>
             loginPage.evaluate(() => {
@@ -726,10 +748,8 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
             }),
         )
         .toEqual([
-            'refreshToken',
             'user',
             'tokenExpiresAt',
-            'token',
         ])
 
     for (const publicPage of [resetPage, verifyPage]) {
@@ -755,14 +775,16 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
     expect(oldPasswordAttempts).toBe(1)
     expect(newPasswordAttempts).toBe(1)
     expect(logoutRequests).toBe(0)
+    expect(refreshRequests).toBeGreaterThanOrEqual(2)
+    expect(projectAuthorization).toBe(`Bearer ${accessToken}`)
     await expect
         .poll(() =>
             loginPage.evaluate(() => localStorage.getItem('token')),
         )
-        .toBe(accessToken)
+        .toBeNull()
 })
 
-test('同一 Human session 刷新轮换不会重载受保护标签且下一请求使用新 bearer', async ({
+test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后续请求', async ({
     context,
     page: protectedPage,
 }) => {
@@ -832,7 +854,6 @@ test('同一 Human session 刷新轮换不会重载受保护标签且下一请�
                 data: {
                     user,
                     access_token: rotatedToken,
-                    refresh_token: `${identity.sessionID}-refresh-rotated`,
                     expires_in: 12 * 60 * 60,
                     token_type: 'Bearer',
                 },
@@ -904,7 +925,7 @@ test('同一 Human session 刷新轮换不会重载受保护标签且下一请�
         .poll(() =>
             protectedPage.evaluate(() => localStorage.getItem('token')),
         )
-        .toBe(oldToken)
+        .toBeNull()
     await expect(protectedPage.getByLabel('名字')).toHaveValue(
         '受保护标签未提交表单',
     )
@@ -958,11 +979,19 @@ test('同一 Human session 刷新轮换不会重载受保护标签且下一请�
 
     releaseRefreshResponse?.()
     await refreshNavigation
+    await protectedPage.evaluate(async (modulePath) => {
+        const authModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            bootstrapHumanSession: () => Promise<void>
+        }
+        await authModule.bootstrapHumanSession()
+    }, '/src/lib/authProvider.ts')
     await expect
         .poll(() =>
             protectedPage.evaluate(() => localStorage.getItem('token')),
         )
-        .toBe(rotatedToken)
+        .toBeNull()
     await protectedPage.waitForTimeout(100)
     await protectedPage.evaluate(() => {
         window.dispatchEvent(
@@ -971,7 +1000,7 @@ test('同一 Human session 刷新轮换不会重载受保护标签且下一请�
     })
     expect(await capturedRequest).toBe(200)
 
-    expect(refreshRequests).toBeGreaterThan(0)
+    expect(refreshRequests).toBeGreaterThanOrEqual(2)
     expect(logoutRequests).toBe(0)
     expect(capturedRequestBearer).toBe(`Bearer ${rotatedToken}`)
     expect(profileGetRequests).toBe(profileGetRequestsBeforeRotation)
@@ -1030,13 +1059,14 @@ for (const replacement of [
             ...defaultMockIdentity,
             sessionID: 'e2e-replacement-initial-session',
         }
-        const initialToken = await installMockSession(
+        await installMockSession(
             protectedPage,
             initialIdentity,
             projectA,
         )
         const replacementToken = mockSessionToken(replacement.identity)
         const access = authorizedProjectAccess(projectA, 'requester')
+        let replacementLoggedIn = false
         await protectedPage.addInitScript(() => {
             const key = 'chronodesk.e2e.replacement-load-count'
             const next = Number(sessionStorage.getItem(key) ?? '0') + 1
@@ -1060,6 +1090,58 @@ for (const replacement of [
                 email_verified: true,
                 otp_enabled: false,
                 last_login_at: null,
+            }
+            if (
+                pathname === '/api/auth/login' &&
+                route.request().method() === 'POST'
+            ) {
+                replacementLoggedIn = true
+                await fulfillJSON(route, {
+                    code: 0,
+                    data: {
+                        user: {
+                            id: replacement.identity.id,
+                            username: `e2e-${replacement.identity.id}`,
+                            email: replacement.identity.email,
+                            platform_role:
+                                replacement.identity.platformRole,
+                            status: 'active',
+                            email_verified: true,
+                            otp_enabled: false,
+                            last_login_at: null,
+                        },
+                        access_token: replacementToken,
+                        expires_in: 3600,
+                        token_type: 'Bearer',
+                    },
+                })
+                return
+            }
+            if (
+                pathname === '/api/auth/refresh' &&
+                route.request().method() === 'POST' &&
+                replacementLoggedIn
+            ) {
+                await fulfillJSON(route, {
+                    code: 0,
+                    data: {
+                        user: {
+                            id: replacement.identity.id,
+                            username: `e2e-${replacement.identity.id}`,
+                            email: replacement.identity.email,
+                            platform_role:
+                                replacement.identity.platformRole,
+                            status: 'active',
+                            email_verified: true,
+                            otp_enabled: false,
+                            last_login_at: null,
+                        },
+                        access_token: replacementToken,
+                        expires_in: 3600,
+                        token_type: 'Bearer',
+                    },
+                })
+                return
             }
             if (pathname === '/api/auth/me') {
                 await fulfillJSON(route, { code: 0, data: user })
@@ -1089,174 +1171,110 @@ for (const replacement of [
             .poll(() =>
                 protectedPage.evaluate(() => localStorage.getItem('token')),
             )
-            .toBe(initialToken)
+            .toBeNull()
 
         const committingPage = await context.newPage()
         await committingPage.goto('/#/login')
-        await committingPage.evaluate(
-            ({ identity, token }) => {
-                for (const key of [
-                    'token',
-                    'refreshToken',
-                    'user',
-                    'tokenExpiresAt',
-                ]) {
-                    localStorage.removeItem(key)
-                }
-                const payload = JSON.parse(
-                    atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')),
-                ) as { exp: number }
-                localStorage.setItem(
-                    'refreshToken',
-                    `${identity.sessionID}-refresh`,
-                )
-                localStorage.setItem(
-                    'user',
-                    JSON.stringify({
-                        id: identity.id,
-                        username: `e2e-${identity.id}`,
-                        email: identity.email,
-                        platform_role: identity.platformRole,
-                        status: 'active',
-                        email_verified: true,
-                        otp_enabled: false,
-                    }),
-                )
-                localStorage.setItem(
-                    'tokenExpiresAt',
-                    String(payload.exp * 1000),
-                )
-                localStorage.setItem('token', token)
-            },
-            {
-                identity: replacement.identity,
-                token: replacementToken,
-            },
-        )
+        await committingPage
+            .getByLabel('邮箱')
+            .fill(replacement.identity.email)
+        await committingPage
+            .getByLabel('密码')
+            .fill('CorrectPassword123!')
+        const protectedReload = protectedPage.waitForEvent('load')
+        await committingPage
+            .getByRole('button', {
+                name: '登录系统',
+                exact: true,
+            })
+            .click()
+        await expect(committingPage).toHaveURL(/\/#\/$/u)
+        await protectedReload
 
-        await expect
-            .poll(() =>
-                protectedPage.evaluate(() =>
-                    Number(
-                        sessionStorage.getItem(
-                            'chronodesk.e2e.replacement-load-count',
-                        ) ?? '0',
-                    ),
+        expect(
+            await protectedPage.evaluate(() =>
+                Number(
+                    sessionStorage.getItem(
+                        'chronodesk.e2e.replacement-load-count',
+                    ) ?? '0',
                 ),
-            )
-            .toBeGreaterThan(1)
+            ),
+        ).toBeGreaterThan(1)
         await expect
             .poll(() =>
                 protectedPage.evaluate(() => localStorage.getItem('token')),
             )
-            .toBe(replacementToken)
+            .toBeNull()
     })
 }
 
-for (const commitCase of [
-    { name: '残缺', kind: 'incomplete' as const },
-    { name: '畸形', kind: 'malformed' as const },
-]) {
-    test(`${commitCase.name} token-last 提交使 dataProvider Create 零目标网络`, async ({
-        page,
-    }) => {
-        const identity = {
-            ...defaultMockIdentity,
-            sessionID: `e2e-${commitCase.kind}-session-commit`,
-        }
-        const token = await installMockSession(page, identity, projectA)
-        const access = authorizedProjectAccess(projectA, 'requester')
-        const user = {
-            id: identity.id,
-            username: `e2e-${identity.id}`,
-            email: identity.email,
-            platform_role: identity.platformRole,
-            status: 'active',
-            email_verified: true,
-            otp_enabled: false,
-            last_login_at: null,
-            profile: {
-                first_name: '完整状态',
-                last_name: '测试用户',
-                timezone: 'Asia/Shanghai',
-                language: 'zh-CN',
-            },
-        }
-        let dataProviderCreateRequests = 0
-        await page.route('**/api/**', async (route) => {
-            const request = route.request()
-            const pathname = new URL(request.url()).pathname
-            if (
-                pathname === '/api/platform/users' &&
-                request.method() === 'POST'
-            ) {
-                dataProviderCreateRequests += 1
-                await fulfillJSON(route, { code: 0, data: user })
-                return
-            }
-            if (pathname === '/api/auth/me') {
-                await fulfillJSON(route, { code: 0, data: user })
-                return
-            }
-            if (pathname === '/api/projects') {
-                await fulfillJSON(route, { code: 0, data: [access] })
-                return
-            }
-            if (pathname === `/api/projects/${projectA.key}/context`) {
-                await fulfillJSON(route, { code: 0, data: access })
-                return
-            }
+test('页面加载后的持久化 bearer 注入被清除且不会替换内存会话', async ({
+    page,
+}) => {
+    const identity = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-late-persisted-bearer',
+    }
+    const token = await installMockSession(page, identity, projectA)
+    const access = authorizedProjectAccess(projectA, 'requester')
+    const user = {
+        id: identity.id,
+        username: `e2e-${identity.id}`,
+        email: identity.email,
+        platform_role: identity.platformRole,
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+    }
+    let capturedAuthorization = ''
+
+    await page.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        if (pathname === '/api/e2e/late-persisted-bearer') {
+            capturedAuthorization =
+                request.headers().authorization ?? ''
             await fulfillJSON(route, { code: 0, data: [] })
-        })
-
-        await page.goto('/#/account/profile')
-        await expect(page.getByTestId('account-profile-page')).toBeVisible()
-        await page.evaluate(
-            ({ committedToken, kind }) => {
-                if (kind === 'incomplete') {
-                    localStorage.removeItem('refreshToken')
-                    localStorage.setItem('token', committedToken)
-                    return
-                }
-                localStorage.setItem('token', 'not-a-jwt')
-            },
-            { committedToken: token, kind: commitCase.kind },
-        )
-        const providerCall = page.evaluate(
-            async ({ modulePath, email }) => {
-                const providerModule = await import(
-                    /* @vite-ignore */ modulePath
-                ) as {
-                    dataProvider: {
-                        create: (
-                            resource: string,
-                            params: { data: Record<string, unknown> },
-                        ) => Promise<unknown>
-                    }
-                }
-                try {
-                    await providerModule.dataProvider.create('users', {
-                        data: {
-                            username: 'blocked-data-provider-create',
-                            email,
-                        },
-                    })
-                    return 'resolved'
-                } catch {
-                    return 'rejected'
-                }
-            },
-            {
-                modulePath: '/src/lib/dataProvider.ts',
-                email: `blocked-${commitCase.kind}@example.test`,
-            },
-        ).catch(() => 'navigation-destroyed')
-
-        await providerCall
-        expect(dataProviderCreateRequests).toBe(0)
-        await expect(page).toHaveURL(/\/#\/login$/u)
+            return
+        }
+        if (pathname === '/api/auth/me') {
+            await fulfillJSON(route, { code: 0, data: user })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (pathname === `/api/projects/${projectA.key}/context`) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
     })
-}
+
+    await page.goto('/#/account/profile')
+    await expect(page.getByTestId('account-profile-page')).toBeVisible()
+    await page.evaluate(() => {
+        localStorage.setItem('token', 'late-malformed-bearer')
+        localStorage.setItem('refreshToken', 'late-refresh-bearer')
+    })
+    await page.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        await apiModule.apiFetch('/e2e/late-persisted-bearer')
+    }, '/src/lib/apiClient.ts')
+
+    expect(capturedAuthorization).toBe(`Bearer ${token}`)
+    expect(await readAuthenticationStorage(page)).toMatchObject({
+        token: null,
+        refreshToken: null,
+    })
+    await expect(page).toHaveURL(/\/#\/account\/profile$/u)
+})
 
 test('受保护标签在跨账号登录和退出后重载身份且不提交旧缓存', async ({
     context,
@@ -1283,6 +1301,7 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
     const accessA = authorizedProjectAccess(projectA, 'requester')
     const accessB = authorizedProjectAccess(projectB, 'observer')
     let logoutRequests = 0
+    let identityBSessionActive = false
     let markLoginRequestStarted: (() => void) | undefined
     const loginRequestStarted = new Promise<void>((resolve) => {
         markLoginRequestStarted = resolve
@@ -1342,6 +1361,7 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
             }
             markLoginRequestStarted?.()
             await loginResponseReleased
+            identityBSessionActive = true
             await fulfillJSON(route, {
                 code: 0,
                 data: {
@@ -1352,7 +1372,31 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
                         email: identityB.email,
                     },
                     access_token: tokenB,
-                    refresh_token: `${identityB.sessionID}-refresh`,
+                    expires_in: 3600,
+                    token_type: 'Bearer',
+                },
+            })
+            return
+        }
+        if (
+            pathname === '/api/auth/refresh' &&
+            request.method() === 'POST' &&
+            identityBSessionActive
+        ) {
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    user: {
+                        id: identityB.id,
+                        username: `e2e-${identityB.id}`,
+                        email: identityB.email,
+                        platform_role: identityB.platformRole,
+                        status: 'active',
+                        email_verified: true,
+                        otp_enabled: false,
+                        last_login_at: null,
+                    },
+                    access_token: tokenB,
                     expires_in: 3600,
                     token_type: 'Bearer',
                 },
@@ -1408,7 +1452,7 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
         .poll(() =>
             protectedPage.evaluate(() => localStorage.getItem('token')),
         )
-        .toBe(tokenA)
+        .toBeNull()
     await expect(
         protectedPage.getByTestId('account-menu'),
     ).toContainText(`e2e-${identityA.id}`)
@@ -1427,7 +1471,7 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
                 localStorage.getItem('token'),
             ),
         )
-        .toBe(tokenA)
+        .toBeNull()
     await expect(
         protectedPage.getByTestId('account-menu'),
     ).toContainText(`e2e-${identityA.id}`)
@@ -1444,7 +1488,7 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
                 localStorage.getItem('token'),
             ),
         )
-        .toBe(tokenA)
+        .toBeNull()
     await expect(
         protectedPage.getByTestId('account-menu'),
     ).toContainText(`e2e-${identityA.id}`)
@@ -1528,6 +1572,30 @@ test('全设备退出在同一应用路径内替换为登录 Hash 路由', async
 })
 
 test('无会话访问受保护资源仍由 checkAuth 强制跳转登录', async ({ page }) => {
+    let refreshRequests = 0
+    let logoutRequests = 0
+    await page.route('**/api/auth/**', async (route) => {
+        const pathname = new URL(route.request().url()).pathname
+        if (pathname === '/api/auth/refresh') {
+            refreshRequests += 1
+            await fulfillJSON(
+                route,
+                { code: 'unauthorized', message: '无有效会话' },
+                401,
+            )
+            return
+        }
+        if (pathname === '/api/auth/logout') {
+            logoutRequests += 1
+            await fulfillJSON(route, {
+                success: true,
+                message: '已退出当前会话',
+            })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
     await page.goto('/#/login')
     await expect(
         page.getByRole('button', { name: '登录系统', exact: true }),
@@ -1540,4 +1608,6 @@ test('无会话访问受保护资源仍由 checkAuth 强制跳转登录', async 
         page.getByRole('button', { name: '登录系统', exact: true }),
     ).toBeVisible()
     await expect(page.getByRole('heading', { name: '工单管理' })).toHaveCount(0)
+    expect(refreshRequests).toBe(1)
+    expect(logoutRequests).toBe(0)
 })

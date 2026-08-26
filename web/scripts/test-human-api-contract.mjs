@@ -71,6 +71,8 @@ const [
     integrationRuntime,
     integrationData,
     integrationTypes,
+    humanSessionRuntime,
+    humanSessionChannel,
 ] = await Promise.all([
     readWebSource('types', 'index.ts'),
     readWebSource('lib', 'types', 'crossProjectWorkbench.ts'),
@@ -106,6 +108,8 @@ const [
     readWebSource('admin', 'integrations', 'IntegrationRuntime.tsx'),
     readWebSource('admin', 'integrations', 'useIntegrationData.ts'),
     readWebSource('admin', 'integrations', 'integrationTypes.ts'),
+    readWebSource('lib', 'humanSessionRuntime.ts'),
+    readWebSource('lib', 'humanSessionChannel.ts'),
 ])
 const knowledgeClient = [
     knowledgeManagement,
@@ -161,8 +165,6 @@ for (const name of [
     'PlatformRole',
     'ProjectRole',
     'LoginRequest',
-    'RefreshTokenRequest',
-    'LogoutRequest',
     'RegenerateOTPBackupCodesRequest',
     'OTPBackupCodeRegenerationEnvelope',
     'HumanSessionUser',
@@ -1646,38 +1648,38 @@ assert.equal(
     '#/components/schemas/AuthSessionSuccessEnvelope',
 )
 assert.equal(
-    contract.paths['/auth/refresh'].post.requestBody.required,
-    true,
-)
-assert.equal(
-    contract.paths['/auth/refresh'].post.requestBody.content['application/json']
-        .schema.$ref,
-    '#/components/schemas/RefreshTokenRequest',
-)
-assert.equal(
-    contract.components.schemas.RefreshTokenRequest.additionalProperties,
-    false,
-)
-assert.deepEqual(contract.components.schemas.RefreshTokenRequest.required, [
-    'refresh_token',
-])
-assert.deepEqual(
-    Object.keys(contract.components.schemas.RefreshTokenRequest.properties),
-    ['refresh_token'],
-)
-assert.equal(contract.paths['/auth/logout'].post.requestBody.required, false)
-assert.equal(
-    contract.paths['/auth/logout'].post.requestBody.content['application/json']
-        .schema.$ref,
-    '#/components/schemas/LogoutRequest',
-)
-assert.equal(
-    contract.components.schemas.LogoutRequest.additionalProperties,
+    Object.hasOwn(contract.paths['/auth/refresh'].post, 'requestBody'),
     false,
 )
 assert.deepEqual(
-    Object.keys(contract.components.schemas.LogoutRequest.properties),
-    ['refresh_token'],
+    contract.paths['/auth/refresh'].post.security,
+    [{ humanRefreshCookie: [] }],
+)
+assert.equal(
+    Object.hasOwn(contract.paths['/auth/logout'].post, 'requestBody'),
+    false,
+)
+assert.deepEqual(
+    contract.paths['/auth/logout'].post.security,
+    [{ humanRefreshCookie: [] }],
+)
+assert.deepEqual(
+    contract.components.securitySchemes.humanRefreshCookie,
+    {
+        type: 'apiKey',
+        in: 'cookie',
+        name: 'chronodesk_refresh_token',
+        description:
+            'Rotating HttpOnly, SameSite=Strict browser credential scoped to /api/auth. Production deployments also require Secure.',
+    },
+)
+assert.deepEqual(
+    contract.components.schemas.AuthSession.required,
+    ['user', 'access_token', 'expires_in', 'token_type'],
+)
+assert.deepEqual(
+    Object.keys(contract.components.schemas.AuthSession.properties),
+    ['user', 'access_token', 'expires_in', 'token_type'],
 )
 for (const [operationPath, expectedStatuses] of [
     ['/auth/register', ['201', '400', '409', '413', '429', '500', '503']],
@@ -1689,8 +1691,11 @@ for (const [operationPath, expectedStatuses] of [
     ['/auth/verify-email', ['200', '400', '413', '429', '500', '503']],
     ['/auth/resend-verification', ['200', '400', '413', '429', '503']],
     ['/auth/login', ['200', '400', '401', '403', '413', '429', '503']],
-    ['/auth/refresh', ['200', '400', '401', '408', '413', '429', '503']],
-    ['/auth/logout', ['200', '400', '413', '429', '503']],
+    [
+        '/auth/refresh',
+        ['200', '400', '401', '403', '408', '413', '429', '503'],
+    ],
+    ['/auth/logout', ['200', '400', '401', '403', '413', '429', '503']],
     ['/auth/logout-all', ['200', '401', '429', '500', '503']],
 ]) {
     assert.deepEqual(
@@ -2492,6 +2497,30 @@ for (const routeHelper of [
     assert.match(authProvider, new RegExp(`humanApiRoutes\\.${routeHelper}`))
 }
 assert.doesNotMatch(authProvider, /buildUrl\(\s*['"`]\/auth\//)
+assert.doesNotMatch(
+    authProvider,
+    /localStorage\.(?:getItem|setItem)\(\s*['"`](?:token|refreshToken)['"`]/,
+)
+assert.match(
+    authProvider,
+    /refreshHumanSession\(\)[\s\S]*?method:\s*'POST'[\s\S]*?credentials:\s*'include'/,
+)
+assert.match(
+    authProvider,
+    /deleteHumanSession\(\)[\s\S]*?method:\s*'POST'[\s\S]*?credentials:\s*'include'/,
+)
+assert.match(
+    humanSessionRuntime,
+    /localStorage\.removeItem\('refreshToken'\)/,
+)
+assert.doesNotMatch(
+    humanSessionRuntime,
+    /localStorage\.setItem\(\s*['"`](?:token|refreshToken)['"`]/,
+)
+assert.doesNotMatch(
+    humanSessionChannel,
+    /\b(?:access_token|refresh_token)\b/,
+)
 
 for (const routeHelper of [
     'registerHuman',
@@ -2567,15 +2596,23 @@ assert.match(
 )
 assert.match(
     humanApiTypeTest,
+    /@ts-expect-error HttpOnly refresh credentials cannot be supplied in JSON/,
+)
+assert.match(
+    humanApiTypeTest,
     /@ts-expect-error Login has requestBody\.required=true/,
 )
 assert.equal(
-    contract.paths['/auth/logout'].post.requestBody.required,
+    Object.hasOwn(contract.paths['/auth/logout'].post, 'requestBody'),
     false,
 )
 assert.match(
     generated,
-    /deleteHumanSession: \{[\s\S]*?requestBody: "optional"/,
+    /deleteHumanSession: \{[\s\S]*?requestBody: "none"/,
+)
+assert.match(
+    generated,
+    /refreshHumanSession: \{[\s\S]*?requestBody: "none"/,
 )
 assert.match(
     generated,

@@ -126,8 +126,7 @@ export const installMockSession = async (
             }
             sessionStorage.setItem(initializationKey, 'installed');
             localStorage.clear();
-            localStorage.setItem('refreshToken', `${user.sessionID}-refresh`);
-            localStorage.setItem(
+            sessionStorage.setItem(
                 'user',
                 JSON.stringify({
                     id: user.id,
@@ -139,11 +138,11 @@ export const installMockSession = async (
                     otp_enabled: false,
                 }),
             );
-            localStorage.setItem(
+            sessionStorage.setItem(
                 'tokenExpiresAt',
                 String(tokenExpiresAt),
             );
-            // Match authProvider: token is the cross-tab commit marker.
+            // Seed the one-time legacy cutover before the runtime module loads.
             localStorage.setItem('token', authToken);
             if (selectedProject) {
                 sessionStorage.setItem(

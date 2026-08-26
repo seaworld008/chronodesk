@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: e3fad46fbc25d953af95d6a6576bfc15e01de0661d4f0403e9a5dde9c18fba79.
+ * Contract SHA-256: 513ece227ce1d37983f66b816e18056959987cfe3eb5df990aeafe963852afd4.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -36,10 +36,6 @@ export type LoginRequest = {
     device_name?: string
 }
 
-export type RefreshTokenRequest = {
-    refresh_token: string
-}
-
 export type ForgotPasswordRequest = {
     email: string
 }
@@ -55,10 +51,6 @@ export type VerifyHumanEmailRequest = {
 
 export type ResendHumanEmailVerificationRequest = {
     email: string
-}
-
-export type LogoutRequest = {
-    refresh_token?: string
 }
 
 export type UpdateHumanProfileRequest = {
@@ -153,7 +145,6 @@ export type HumanSessionUser = {
 export type AuthSession = {
     user: HumanSessionUser
     access_token: string
-    refresh_token: string
     expires_in: number
     token_type: "Bearer"
 }
@@ -161,7 +152,6 @@ export type AuthSession = {
 export type HumanRegistrationResult = {
     user: HumanSessionUser
     access_token: string
-    refresh_token: string
     expires_in: number
     token_type: "" | "Bearer"
 }
@@ -3437,7 +3427,7 @@ export type CreateHumanSessionOperationResponse = AuthSessionEnvelope
 
 export type RefreshHumanSessionOperationPathParameters = Record<string, never>
 export type RefreshHumanSessionOperationQuery = Record<string, never>
-export type RefreshHumanSessionOperationRequest = RefreshTokenRequest
+export type RefreshHumanSessionOperationRequest = never
 export type RefreshHumanSessionOperationResponse = AuthSessionSuccessEnvelope
 
 export type RequestHumanPasswordResetOperationPathParameters = Record<string, never>
@@ -3462,7 +3452,7 @@ export type ResendHumanEmailVerificationOperationResponse = AuthMessageSuccessEn
 
 export type DeleteHumanSessionOperationPathParameters = Record<string, never>
 export type DeleteHumanSessionOperationQuery = Record<string, never>
-export type DeleteHumanSessionOperationRequest = LogoutRequest
+export type DeleteHumanSessionOperationRequest = never
 export type DeleteHumanSessionOperationResponse = AuthMessageSuccessEnvelope
 
 export type DeleteAllHumanSessionsOperationPathParameters = Record<string, never>
@@ -5042,7 +5032,7 @@ export const humanApiOperations = {
         method: "POST",
         path: "/auth/refresh",
         successStatus: 200,
-        requestBody: "required",
+        requestBody: "none",
         listStrategy: null,
     },
     requestHumanPasswordReset: {
@@ -5077,7 +5067,7 @@ export const humanApiOperations = {
         method: "POST",
         path: "/auth/logout",
         successStatus: 200,
-        requestBody: "optional",
+        requestBody: "none",
         listStrategy: null,
     },
     deleteAllHumanSessions: {

@@ -10,13 +10,19 @@ import {
 const logoutWithoutBody: HumanApiRequestOptions<'deleteHumanSession'> = {
   pathParameters: {},
 }
-const logoutWithBody: HumanApiRequestOptions<'deleteHumanSession'> = {
-  pathParameters: {},
-  body: { refresh_token: 'opaque-refresh-token' },
-}
 
 buildHumanApiRequest('deleteHumanSession', logoutWithoutBody)
-buildHumanApiRequest('deleteHumanSession', logoutWithBody)
+buildHumanApiRequest('refreshHumanSession', { pathParameters: {} })
+buildHumanApiRequest('deleteHumanSession', {
+  pathParameters: {},
+  // @ts-expect-error HttpOnly refresh credentials cannot be supplied in JSON.
+  body: {},
+})
+buildHumanApiRequest('refreshHumanSession', {
+  pathParameters: {},
+  // @ts-expect-error Refresh accepts only the browser Cookie.
+  body: {},
+})
 buildHumanApiRequest('createHumanSession', {
   pathParameters: {},
   body: {

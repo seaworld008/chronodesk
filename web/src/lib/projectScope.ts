@@ -28,6 +28,7 @@ import {
     type HumanSessionBinding,
 } from './humanTabSession'
 import { joinApiUrl } from './apiUrl'
+import { readHumanAccessToken } from './humanSessionRuntime'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').toString().replace(/\/$/, '')
 export { projectAccessInvalidatedEvent }
@@ -418,7 +419,7 @@ export const loadAuthorizedProjects = async (
     projectRequestBinding = currentBindingKey
     projectRequestCompletedAt = undefined
     const request = (async () => {
-        const token = localStorage.getItem('token')
+        const token = readHumanAccessToken()
         const projects: AuthorizedProject[] = []
         const seenPublicIDs = new Set<string>()
         const seenKeys = new Set<string>()

@@ -14,6 +14,7 @@ import {
 } from './projectScope'
 import { humanApiRoutes } from './generated/human-api'
 import { joinApiUrl } from './apiUrl'
+import { readHumanAccessToken } from './humanSessionRuntime'
 import {
     projectAccessInvalidatedEvent,
     projectScopeChangedEvent,
@@ -85,7 +86,7 @@ const httpClient = async (
     snapshot?: ProjectScopeSnapshot,
 ) => {
     if (snapshot) assertProjectScopeSnapshot(snapshot)
-    const token = localStorage.getItem('token')
+    const token = readHumanAccessToken()
     const headers = new Headers(options.headers ?? { Accept: 'application/json' })
 
     if (!(options.body instanceof FormData)) {

@@ -34,8 +34,7 @@ const installSession = async (
             return
         }
         localStorage.setItem('token', accessToken)
-        localStorage.setItem('refreshToken', 'task3-refresh')
-        localStorage.setItem('tokenExpiresAt', String(exp * 1000))
+        sessionStorage.setItem('tokenExpiresAt', String(exp * 1000))
         const storedUser: Record<string, unknown> = {
             id: 1,
             username: 'task3-admin',
@@ -53,8 +52,8 @@ const installSession = async (
                 avatar: '',
             }
         }
-        localStorage.setItem('user', JSON.stringify(storedUser))
-        localStorage.setItem('chronodesk.activeProject', JSON.stringify({
+        sessionStorage.setItem('user', JSON.stringify(storedUser))
+        sessionStorage.setItem('chronodesk.activeProject', JSON.stringify({
             subject: '1',
             session_id: sid,
             project_key: 'OPS',
@@ -637,8 +636,8 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await page.evaluate(({ token, exp }) => {
             sessionStorage.setItem('task3-preserve-session', 'true')
             localStorage.setItem('token', token)
-            localStorage.setItem('tokenExpiresAt', String(exp * 1000))
-            localStorage.setItem('chronodesk.activeProject', JSON.stringify({
+            sessionStorage.setItem('tokenExpiresAt', String(exp * 1000))
+            sessionStorage.setItem('chronodesk.activeProject', JSON.stringify({
                 subject: '1',
                 session_id: 'task3-other-session',
                 project_key: 'OPS',

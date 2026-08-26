@@ -342,7 +342,9 @@ const waitForAuthenticatedShell = async (
         .getByTestId('active-project-switcher')
         .waitFor({ state: 'visible', timeout: 15_000 });
     await page.waitForFunction((projectKey) => {
-        const serialized = localStorage.getItem('chronodesk.activeProject');
+        const serialized = sessionStorage.getItem(
+            'chronodesk.activeProject',
+        );
         if (!serialized) return false;
         try {
             const selection = JSON.parse(serialized) as {
@@ -378,9 +380,10 @@ export const authenticatePage = async (
             'chronodesk.activeProject',
         ]) {
             localStorage.removeItem(key);
+            sessionStorage.removeItem(key);
         }
         localStorage.setItem('token', auth.access_token);
-        localStorage.setItem(
+        sessionStorage.setItem(
             'chronodesk.activeProject',
             JSON.stringify({
                 subject: sessionBinding.subject,
@@ -388,11 +391,8 @@ export const authenticatePage = async (
                 project_key: activeProjectKey,
             }),
         );
-        if (auth.refresh_token) {
-            localStorage.setItem('refreshToken', auth.refresh_token);
-        }
-        localStorage.setItem('user', JSON.stringify(auth.user));
-        localStorage.setItem(
+        sessionStorage.setItem('user', JSON.stringify(auth.user));
+        sessionStorage.setItem(
             'tokenExpiresAt',
             String(sessionBinding.expiresAt),
         );
@@ -417,7 +417,9 @@ export const selectDefaultProjectViaUI = async (page: Page) => {
     await waitForAuthenticatedShell(page, 'DEFAULT');
 
     const selectedProjectKey = await page.evaluate(() => {
-        const serialized = localStorage.getItem('chronodesk.activeProject');
+        const serialized = sessionStorage.getItem(
+            'chronodesk.activeProject',
+        );
         if (!serialized) {
             return null;
         }
