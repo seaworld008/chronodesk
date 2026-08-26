@@ -13,6 +13,9 @@ globalThis.window = {
     localStorage: {
         getItem: (key) => storedValues.get(key) ?? null,
     },
+    sessionStorage: {
+        getItem: (key) => storedValues.get(key) ?? null,
+    },
 }
 
 const selectActiveProject = (projectKey) => {

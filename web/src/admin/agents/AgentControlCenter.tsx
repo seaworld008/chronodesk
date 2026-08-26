@@ -51,7 +51,11 @@ import {
   TruncatedText,
   type ResizableColumn,
 } from '../../components/tables/EnterpriseTable'
-import { activeProjectStorageKey } from '../../lib/humanSessionStorage'
+import {
+  clearStoredProjectSelection,
+  readStoredProjectSelection,
+  writeStoredProjectSelection,
+} from '../../lib/humanSessionStorage'
 import { resolveActiveProjectKey } from '../../lib/projectScope'
 import { projectScopeChangedEvent } from '../../lib/projectScopeEvents'
 import {
@@ -214,7 +218,7 @@ const protectedCredentialForCurrentSession = () => {
     return protectedCredential
   }
   const currentBinding = projectSelectionSessionBinding(
-    window.localStorage.getItem(activeProjectStorageKey),
+    readStoredProjectSelection(),
   )
   if (
     !currentBinding
@@ -577,9 +581,7 @@ export const AgentControlCenter: React.FC<{
   }, [])
 
   const beginCredentialProtection = useCallback((scope: ScopeSnapshot) => {
-    const storedProjectSelection = window.localStorage.getItem(
-      activeProjectStorageKey,
-    )
+    const storedProjectSelection = readStoredProjectSelection()
     publishProtectedCredential({
       projectKey: scope.projectKey,
       storedProjectSelection,
@@ -845,7 +847,7 @@ export const AgentControlCenter: React.FC<{
       if (
         value
         && value.sessionBinding !== projectSelectionSessionBinding(
-          window.localStorage.getItem(activeProjectStorageKey),
+          readStoredProjectSelection(),
         )
       ) {
         protectedCredential = null
@@ -920,12 +922,9 @@ export const AgentControlCenter: React.FC<{
       const protection = protectedCredential
       if (nextProjectKey && protection) {
         if (protection.storedProjectSelection === null) {
-          window.localStorage.removeItem(activeProjectStorageKey)
+          clearStoredProjectSelection()
         } else {
-          window.localStorage.setItem(
-            activeProjectStorageKey,
-            protection.storedProjectSelection,
-          )
+          writeStoredProjectSelection(protection.storedProjectSelection)
         }
         event.preventDefault()
         event.stopImmediatePropagation()

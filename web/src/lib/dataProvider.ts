@@ -6,8 +6,11 @@ import {
     requireCommittedHumanBearerHeaders,
 } from './apiClient'
 import {
+    assertProjectScopeSnapshot,
+    captureProjectScopeSnapshot,
     projectResourcePath,
-    resolveActiveProjectKey,
+    resolveActiveProjectAccess,
+    type ProjectScopeSnapshot,
 } from './projectScope'
 import { humanApiRoutes } from './generated/human-api'
 import { joinApiUrl } from './apiUrl'
@@ -24,6 +27,8 @@ const apiUrl = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
 const projectScopedResources = new Set([
     'tickets',
+    'comments',
+    'ticket_history',
     'categories',
     'assignees',
     'notifications',
@@ -34,9 +39,20 @@ const projectScopedResources = new Set([
 const scopedApiPath = async (
     resource: string,
     apiPath: string,
+    snapshot?: ProjectScopeSnapshot,
 ): Promise<string> => {
     if (!projectScopedResources.has(resource)) return apiPath
-    const projectKey = await resolveActiveProjectKey()
+    const scope = snapshot ?? captureProjectScopeSnapshot()
+    const access = await resolveActiveProjectAccess()
+    assertProjectScopeSnapshot(scope)
+    if (access.project.key !== scope.project_key) {
+        throw new HttpError(
+            '项目范围已变化，请刷新页面后重试',
+            409,
+            { code: 'project_scope_changed' },
+        )
+    }
+    const projectKey = scope.project_key
     switch (resource) {
         case 'tickets':
             return humanApiRoutes.listProjectTickets({ projectKey })
@@ -47,16 +63,28 @@ const scopedApiPath = async (
         case 'automation-logs':
             return humanApiRoutes.listProjectAutomationLogs({ projectKey })
         default:
-            return projectResourcePath(apiPath)
+            return projectResourcePath(apiPath, scope)
     }
 }
+
+const captureResourceScope = (
+    resource: string,
+): ProjectScopeSnapshot | undefined =>
+    projectScopedResources.has(resource)
+        ? captureProjectScopeSnapshot()
+        : undefined
 
 /**
  * 自定义HTTP客户端，处理JWT认证和请求格式化
  */
 type HttpClientOptions = RequestInit & { headers?: Headers }
 
-const httpClient = async (url: string, options: HttpClientOptions = {}) => {
+const httpClient = async (
+    url: string,
+    options: HttpClientOptions = {},
+    snapshot?: ProjectScopeSnapshot,
+) => {
+    if (snapshot) assertProjectScopeSnapshot(snapshot)
     const token = localStorage.getItem('token')
     const headers = new Headers(options.headers ?? { Accept: 'application/json' })
 
@@ -185,10 +213,59 @@ const ticketIfMatchHeaders = (version: number): Headers => {
 }
 
 const ticketVersionCache = new Map<string, number>()
+const recordScopeCache = new Map<string, ProjectScopeSnapshot>()
+
+const recordScopeCacheKey = (
+    resource: string,
+    id: string | number,
+    projectKey: string,
+): string => `${projectKey}\u0000${resource}\u0000${String(id)}`
+
+const rememberRecordScopes = (
+    resource: string,
+    records: unknown[],
+    snapshot?: ProjectScopeSnapshot,
+): void => {
+    if (!snapshot) return
+    for (const record of records) {
+        if (!isRecord(record)) continue
+        const id = record.id
+        if (typeof id !== 'number' && typeof id !== 'string') continue
+        recordScopeCache.set(
+            recordScopeCacheKey(resource, id, snapshot.project_key),
+            snapshot,
+        )
+    }
+}
+
+const requireRecordScope = (
+    resource: string,
+    id: string | number,
+): ProjectScopeSnapshot => {
+    const current = captureProjectScopeSnapshot()
+    const snapshot = recordScopeCache.get(
+        recordScopeCacheKey(resource, id, current.project_key),
+    )
+    if (!snapshot) {
+        throw new HttpError(
+            '记录所属项目已变化，请刷新页面后重试',
+            409,
+            { code: 'project_scope_changed', resource_id: id },
+        )
+    }
+    assertProjectScopeSnapshot(snapshot)
+    return snapshot
+}
+
+const ticketVersionCacheKey = (
+    id: string | number,
+    snapshot: ProjectScopeSnapshot,
+): string => `${snapshot.project_key}\u0000${String(id)}`
 
 if (typeof window !== 'undefined') {
     const clearTicketVersionCache = () => {
         ticketVersionCache.clear()
+        recordScopeCache.clear()
     }
     window.addEventListener(
         projectAccessInvalidatedEvent,
@@ -198,7 +275,10 @@ if (typeof window !== 'undefined') {
     window.addEventListener(sessionInvalidatedEvent, clearTicketVersionCache)
 }
 
-const rememberTicketVersions = (records: unknown[]): void => {
+const rememberTicketVersions = (
+    records: unknown[],
+    snapshot: ProjectScopeSnapshot,
+): void => {
     for (const record of records) {
         if (!isRecord(record)) continue
         const { id, version } = record
@@ -208,16 +288,19 @@ const rememberTicketVersions = (records: unknown[]): void => {
             Number.isSafeInteger(version) &&
             version > 0
         ) {
-            ticketVersionCache.set(String(id), version)
+            ticketVersionCache.set(ticketVersionCacheKey(id, snapshot), version)
         }
     }
 }
 
 const ticketPreconditions = (
     ids: readonly (string | number)[],
+    snapshot: ProjectScopeSnapshot,
 ): Array<{ id: string | number; version: number }> =>
     ids.map((id) => {
-        const version = ticketVersionCache.get(String(id))
+        const version = ticketVersionCache.get(
+            ticketVersionCacheKey(id, snapshot),
+        )
         if (version === undefined) {
             throw new HttpError(
                 `工单 ${id} 的版本信息缺失，请刷新列表后重试`,
@@ -259,6 +342,7 @@ const parseListResponse = (resource: string, json: unknown, headers: Headers) =>
 export const dataProvider: DataProvider = {
     // 获取资源列表
     getList: async (resource, params) => {
+        const scope = captureResourceScope(resource)
         const { page, perPage } = params.pagination || { page: 1, perPage: 10 };
         const { field, order } = params.sort || { field: 'id', order: 'ASC' };
 
@@ -438,47 +522,51 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         const url = `${joinApiUrl(apiUrl, apiPath)}?${queryString.stringify(query)}`;
-        const { json, headers } = await httpClient(url);
+        const { json, headers } = await httpClient(url, {}, scope);
 
         const result = parseListResponse(resource, json, headers);
-        if (resource === 'tickets') {
-            rememberTicketVersions(result.data);
+        rememberRecordScopes(resource, result.data, scope)
+        if (resource === 'tickets' && scope) {
+            rememberTicketVersions(result.data, scope);
         }
         return result;
     },
 
     // 获取单个资源
     getOne: async (resource, params) => {
+        const scope = captureResourceScope(resource)
         let apiPath = resource;
         if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         const urlPath = resource === 'users'
             ? humanApiRoutes.getPlatformUser({ userID: Number(params.id) })
             : resource === 'tickets'
             ? humanApiRoutes.getProjectTicket(
-                { projectKey: await resolveActiveProjectKey(), ticketID: Number(params.id) },
+                { projectKey: scope?.project_key ?? '', ticketID: Number(params.id) },
             )
             : resource === 'automation-rules'
                 ? humanApiRoutes.getProjectAutomationRule(
-                    { projectKey: await resolveActiveProjectKey(), ruleID: Number(params.id) },
+                    { projectKey: scope?.project_key ?? '', ruleID: Number(params.id) },
                 )
                 : `${apiPath}/${params.id}`
         const url = joinApiUrl(apiUrl, urlPath);
-        const { json } = await httpClient(url);
+        const { json } = await httpClient(url, {}, scope);
         const data = extractResponseData(json);
-        if (resource === 'tickets') {
-            rememberTicketVersions([data]);
+        rememberRecordScopes(resource, [data], scope)
+        if (resource === 'tickets' && scope) {
+            rememberTicketVersions([data], scope);
         }
         return { data: extractTypedResponseData(json) };
     },
 
     // 获取多个资源
     getMany: async (resource, params) => {
+        const scope = captureResourceScope(resource)
         if (resource === 'users') {
             const records = await Promise.all(
                 params.ids.map(async (id) => {
@@ -506,21 +594,30 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/rules';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         const url = `${joinApiUrl(apiUrl, apiPath)}?${queryString.stringify(query)}`;
-        const { json } = await httpClient(url);
+        const { json } = await httpClient(url, {}, scope);
         
         const payload = extractResponseData(json);
         if (isRecord(payload) && Array.isArray(payload.items)) {
-            if (resource === 'tickets') rememberTicketVersions(payload.items);
+            rememberRecordScopes(resource, payload.items, scope)
+            if (resource === 'tickets' && scope) {
+                rememberTicketVersions(payload.items, scope)
+            }
             return { data: payload.items };
         }
         if (Array.isArray(payload)) {
-            if (resource === 'tickets') rememberTicketVersions(payload);
+            rememberRecordScopes(resource, payload, scope)
+            if (resource === 'tickets' && scope) {
+                rememberTicketVersions(payload, scope)
+            }
             return { data: payload };
         }
         if (isRecord(payload)) {
-            if (resource === 'tickets') rememberTicketVersions([payload]);
+            rememberRecordScopes(resource, [payload], scope)
+            if (resource === 'tickets' && scope) {
+                rememberTicketVersions([payload], scope)
+            }
             return { data: [payload] };
         }
         return { data: [] };
@@ -528,12 +625,13 @@ export const dataProvider: DataProvider = {
 
     // 获取引用资源
     getManyReference: async (resource, params) => {
+        const scope = captureResourceScope(resource)
         const { page, perPage } = params.pagination || { page: 1, perPage: 10 };
 
         if (params.target === 'ticket_id' && resource === 'ticket_history') {
             const route = humanApiRoutes.listProjectTicketHistory(
                 {
-                    projectKey: await resolveActiveProjectKey(),
+                    projectKey: scope?.project_key ?? '',
                     ticketID: Number(params.id),
                 },
                 {
@@ -543,8 +641,12 @@ export const dataProvider: DataProvider = {
             )
             const { json, headers } = await httpClient(
                 joinApiUrl(apiUrl, route),
+                {},
+                scope,
             )
-            return parseListResponse(resource, json, headers)
+            const result = parseListResponse(resource, json, headers)
+            rememberRecordScopes(resource, result.data, scope)
+            return result
         }
 
         const { field, order } = params.sort || { field: 'id', order: 'ASC' };
@@ -566,13 +668,15 @@ export const dataProvider: DataProvider = {
 
         if (params.target === 'ticket_id' && resource === 'comments') {
             const pathParameters = {
-                projectKey: await resolveActiveProjectKey(),
+                projectKey: scope?.project_key ?? '',
                 ticketID: Number(params.id),
             }
             const route = humanApiRoutes.listProjectTicketComments(pathParameters)
             const url = `${joinApiUrl(apiUrl, route)}?${queryString.stringify(query)}`
-            const { json, headers } = await httpClient(url)
-            return parseListResponse(resource, json, headers)
+            const { json, headers } = await httpClient(url, {}, scope)
+            const result = parseListResponse(resource, json, headers)
+            rememberRecordScopes(resource, result.data, scope)
+            return result
         }
 
         let apiPath = resource;
@@ -582,15 +686,18 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/rules';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         const url = `${joinApiUrl(apiUrl, apiPath)}?${queryString.stringify(query)}`;
-        const { json, headers } = await httpClient(url);
+        const { json, headers } = await httpClient(url, {}, scope);
 
-        return parseListResponse(resource, json, headers);
+        const result = parseListResponse(resource, json, headers)
+        rememberRecordScopes(resource, result.data, scope)
+        return result;
     },
 
     // 创建资源
     create: async (resource, params) => {
+        const scope = captureResourceScope(resource)
         let apiPath = resource;
         if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
@@ -598,20 +705,20 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         const urlPath = resource === 'users'
             ? humanApiRoutes.createPlatformUser()
             : resource === 'tickets'
             ? humanApiRoutes.createProjectTicket({
-                projectKey: await resolveActiveProjectKey(),
+                projectKey: scope?.project_key ?? '',
             })
             : resource === 'notifications'
                 ? humanApiRoutes.createProjectNotification({
-                    projectKey: await resolveActiveProjectKey(),
+                    projectKey: scope?.project_key ?? '',
                 })
                 : resource === 'automation-rules'
                     ? humanApiRoutes.createProjectAutomationRule({
-                        projectKey: await resolveActiveProjectKey(),
+                        projectKey: scope?.project_key ?? '',
                     })
                     : apiPath
         const url = joinApiUrl(apiUrl, urlPath);
@@ -620,10 +727,11 @@ export const dataProvider: DataProvider = {
             const { json } = await httpClient(url, {
                 method: 'POST',
                 body: JSON.stringify(params.data),
-            });
+            }, scope);
             const data = extractResponseData(json);
-            if (resource === 'tickets') {
-                rememberTicketVersions([data]);
+            rememberRecordScopes(resource, [data], scope)
+            if (resource === 'tickets' && scope) {
+                rememberTicketVersions([data], scope);
             }
             return { data: extractTypedResponseData(json) };
         } catch (error: unknown) {
@@ -633,6 +741,9 @@ export const dataProvider: DataProvider = {
 
     // 更新资源
     update: async (resource, params) => {
+        const scope = projectScopedResources.has(resource)
+            ? requireRecordScope(resource, params.id)
+            : undefined
         let apiPath = resource;
         if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
@@ -640,18 +751,18 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         const urlPath = resource === 'users'
             ? humanApiRoutes.updatePlatformUser({
                 userID: Number(params.id),
             })
             : resource === 'tickets'
             ? humanApiRoutes.updateProjectTicket(
-                { projectKey: await resolveActiveProjectKey(), ticketID: Number(params.id) },
+                { projectKey: scope?.project_key ?? '', ticketID: Number(params.id) },
             )
             : resource === 'automation-rules'
                 ? humanApiRoutes.updateProjectAutomationRule(
-                    { projectKey: await resolveActiveProjectKey(), ruleID: Number(params.id) },
+                    { projectKey: scope?.project_key ?? '', ruleID: Number(params.id) },
                 )
                 : `${apiPath}/${params.id}`
         const url = joinApiUrl(apiUrl, urlPath);
@@ -666,10 +777,11 @@ export const dataProvider: DataProvider = {
                 method: 'PUT',
                 body: JSON.stringify(params.data),
                 headers,
-            });
+            }, scope);
             const data = extractResponseData(json);
-            if (resource === 'tickets') {
-                rememberTicketVersions([data]);
+            rememberRecordScopes(resource, [data], scope)
+            if (resource === 'tickets' && scope) {
+                rememberTicketVersions([data], scope);
             }
             return { data: extractTypedResponseData(json) };
         } catch (error: unknown) {
@@ -679,6 +791,26 @@ export const dataProvider: DataProvider = {
 
     // 批量更新
     updateMany: async (resource, params) => {
+        const scope =
+            projectScopedResources.has(resource) && params.ids.length > 0
+                ? requireRecordScope(resource, params.ids[0])
+                : captureResourceScope(resource)
+        if (scope) {
+            for (const id of params.ids.slice(1)) {
+                const candidate = requireRecordScope(resource, id)
+                if (
+                    candidate.project_key !== scope.project_key ||
+                    candidate.epoch !== scope.epoch ||
+                    candidate.session_id !== scope.session_id
+                ) {
+                    throw new HttpError(
+                        '批量记录不属于同一项目范围，请刷新列表后重试',
+                        409,
+                        { code: 'project_scope_changed' },
+                    )
+                }
+            }
+        }
         // 如果后端支持批量更新
         if (resource === 'tickets') {
             const updates = params.data ?? {};
@@ -686,18 +818,19 @@ export const dataProvider: DataProvider = {
                 throw new HttpError('请先选择需要更新的字段', 400);
             }
 
-            const ticketsPath = await projectResourcePath('tickets')
+            const ticketsPath = await projectResourcePath('tickets', scope)
             const url = joinApiUrl(apiUrl, `${ticketsPath}/bulk-update`);
             const { json } = await httpClient(url, {
                 method: 'POST',
                 body: JSON.stringify({
-                    tickets: ticketPreconditions(params.ids),
+                    tickets: ticketPreconditions(params.ids, scope!),
                     updates,
                 }),
-            });
+            }, scope);
             const payload = extractResponseData(json);
             if (isRecord(payload) && Array.isArray(payload.tickets)) {
-                rememberTicketVersions(payload.tickets);
+                rememberRecordScopes(resource, payload.tickets, scope)
+                rememberTicketVersions(payload.tickets, scope!);
             }
             return { data: params.ids };
         }
@@ -710,7 +843,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         await Promise.all(
             params.ids.map(id =>
                 httpClient(joinApiUrl(
@@ -723,7 +856,7 @@ export const dataProvider: DataProvider = {
                 ), {
                     method: 'PUT',
                     body: JSON.stringify(params.data),
-                })
+                }, scope)
             )
         );
         
@@ -732,6 +865,9 @@ export const dataProvider: DataProvider = {
 
     // 删除资源
     delete: async (resource, params) => {
+        const scope = projectScopedResources.has(resource)
+            ? requireRecordScope(resource, params.id)
+            : undefined
         let apiPath = resource;
         if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
@@ -739,29 +875,29 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         const urlPath = resource === 'users'
             ? humanApiRoutes.deletePlatformUser({
                 userID: Number(params.id),
             })
             : resource === 'tickets'
             ? humanApiRoutes.deleteProjectTicket(
-                { projectKey: await resolveActiveProjectKey(), ticketID: Number(params.id) },
+                { projectKey: scope?.project_key ?? '', ticketID: Number(params.id) },
             )
             : resource === 'notifications'
                 ? humanApiRoutes.deleteProjectNotification({
-                    projectKey: await resolveActiveProjectKey(),
+                    projectKey: scope?.project_key ?? '',
                     notificationID: Number(params.id),
                 })
                 : resource === 'automation-rules'
                     ? humanApiRoutes.deleteProjectAutomationRule({
-                        projectKey: await resolveActiveProjectKey(),
+                        projectKey: scope?.project_key ?? '',
                         ruleID: Number(params.id),
                     })
                     : `${apiPath}/${params.id}`
         const url = joinApiUrl(apiUrl, urlPath);
-        const cachedVersion = resource === 'tickets'
-            ? ticketVersionCache.get(String(params.id))
+        const cachedVersion = resource === 'tickets' && scope
+            ? ticketVersionCache.get(ticketVersionCacheKey(params.id, scope))
             : undefined
         const headers = resource === 'tickets'
             ? ticketIfMatchHeaders(
@@ -776,10 +912,13 @@ export const dataProvider: DataProvider = {
         const { json } = await httpClient(url, {
             method: 'DELETE',
             headers,
-        });
+        }, scope);
 
-        if (resource === 'tickets') {
-            ticketVersionCache.delete(String(params.id))
+        if (resource === 'tickets' && scope) {
+            ticketVersionCache.delete(ticketVersionCacheKey(params.id, scope))
+            recordScopeCache.delete(
+                recordScopeCacheKey(resource, params.id, scope.project_key),
+            )
             return {
                 data: params.previousData ?? { id: params.id },
             }
@@ -794,16 +933,25 @@ export const dataProvider: DataProvider = {
 
     // 批量删除
     deleteMany: async (resource, params) => {
+        const scope =
+            projectScopedResources.has(resource) && params.ids.length > 0
+                ? requireRecordScope(resource, params.ids[0])
+                : captureResourceScope(resource)
+        if (scope) {
+            for (const id of params.ids.slice(1)) {
+                requireRecordScope(resource, id)
+            }
+        }
         // 如果后端支持批量删除
         if (resource === 'tickets') {
-            const ticketsPath = await projectResourcePath('tickets')
+            const ticketsPath = await projectResourcePath('tickets', scope)
             const url = joinApiUrl(apiUrl, `${ticketsPath}/bulk-delete`);
             const { json } = await httpClient(url, {
                 method: 'DELETE',
                 body: JSON.stringify({
-                    tickets: ticketPreconditions(params.ids),
+                    tickets: ticketPreconditions(params.ids, scope!),
                 }),
-            });
+            }, scope);
             const payload = extractResponseData(json)
             const deletedIds = isRecord(payload) && Array.isArray(payload.deleted_ids)
                 ? payload.deleted_ids
@@ -812,7 +960,14 @@ export const dataProvider: DataProvider = {
                 ? payload.failed_ids
                 : []
             for (const id of deletedIds) {
-                ticketVersionCache.delete(String(id))
+                ticketVersionCache.delete(ticketVersionCacheKey(id, scope!))
+                recordScopeCache.delete(
+                    recordScopeCacheKey(
+                        resource,
+                        id as string | number,
+                        scope!.project_key,
+                    ),
+                )
             }
             if (failedIds.length > 0) {
                 throw new HttpError(
@@ -834,7 +989,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
-        apiPath = await scopedApiPath(resource, apiPath)
+        apiPath = await scopedApiPath(resource, apiPath, scope)
         await Promise.all(
             params.ids.map(id =>
                 httpClient(joinApiUrl(
@@ -846,7 +1001,7 @@ export const dataProvider: DataProvider = {
                         : `${apiPath}/${id}`,
                 ), {
                     method: 'DELETE',
-                })
+                }, scope)
             )
         );
         

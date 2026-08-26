@@ -18,9 +18,10 @@ import {
     signalProjectScopeChanged,
 } from './projectScopeEvents'
 import {
-    activeProjectStorageKey,
     clearStoredProjectSelection,
     legacyActiveProjectStorageKey,
+    readStoredProjectSelection,
+    writeStoredProjectSelection,
 } from './humanSessionStorage'
 import {
     readHumanSessionBinding,
@@ -154,7 +155,15 @@ type ActiveProjectRecord = {
     subject: string
     session_id: string
     project_key: string
+    epoch: number
 }
+
+export type ProjectScopeSnapshot = Readonly<{
+    subject: string
+    session_id: string
+    project_key: string
+    epoch: number
+}>
 
 let projectRequest:
     | Promise<AuthorizedProject[]>
@@ -241,7 +250,11 @@ const parseActiveProjectRecord = (value: unknown): ActiveProjectRecord | null =>
         !isRecord(value) ||
         !nonEmptyString(value.subject) ||
         !nonEmptyString(value.session_id) ||
-        !nonEmptyString(value.project_key)
+        !nonEmptyString(value.project_key) ||
+        (
+            value.epoch !== undefined &&
+            !positiveInteger(value.epoch)
+        )
     ) {
         return null
     }
@@ -249,11 +262,12 @@ const parseActiveProjectRecord = (value: unknown): ActiveProjectRecord | null =>
         subject: value.subject,
         session_id: value.session_id,
         project_key: value.project_key,
+        epoch: value.epoch === undefined ? 1 : value.epoch,
     }
 }
 
 const readActiveProjectRecord = (): ActiveProjectRecord | null => {
-    const serialized = localStorage.getItem(activeProjectStorageKey)
+    const serialized = readStoredProjectSelection()
     if (!serialized) return null
     try {
         return parseActiveProjectRecord(JSON.parse(serialized))
@@ -381,7 +395,7 @@ export const loadAuthorizedProjects = async (
     const binding = readHumanSessionBinding()
     if (!binding) {
         resetAuthorizedProjectCache()
-        localStorage.removeItem(activeProjectStorageKey)
+        clearStoredProjectSelection()
         localStorage.removeItem(legacyActiveProjectStorageKey)
         throw new HttpError('登录会话无效，请重新登录', 401, {
             code: 'invalid_human_session',
@@ -513,10 +527,43 @@ export const activeProjectKey = (): string | undefined => {
     const binding = readHumanSessionBinding()
     const stored = readActiveProjectRecord()
     if (!binding || !stored || !sameBinding(binding, stored)) {
-        localStorage.removeItem(activeProjectStorageKey)
+        clearStoredProjectSelection()
         return undefined
     }
     return stored.project_key
+}
+
+export const captureProjectScopeSnapshot = (): ProjectScopeSnapshot => {
+    const binding = readHumanSessionBinding()
+    const stored = readActiveProjectRecord()
+    if (!binding || !stored || !sameBinding(binding, stored)) {
+        clearStoredProjectSelection()
+        throw new HttpError('项目范围已变化，请刷新页面后重试', 409, {
+            code: 'project_scope_changed',
+        })
+    }
+    return Object.freeze({
+        subject: binding.subject,
+        session_id: binding.session_id,
+        project_key: stored.project_key,
+        epoch: stored.epoch,
+    })
+}
+
+export const assertProjectScopeSnapshot = (
+    snapshot: ProjectScopeSnapshot,
+): void => {
+    const current = captureProjectScopeSnapshot()
+    if (
+        current.subject !== snapshot.subject ||
+        current.session_id !== snapshot.session_id ||
+        current.project_key !== snapshot.project_key ||
+        current.epoch !== snapshot.epoch
+    ) {
+        throw new HttpError('项目范围已变化，请刷新页面后重试', 409, {
+            code: 'project_scope_changed',
+        })
+    }
 }
 
 export const resolveActiveProjectAccess = async (): Promise<AuthorizedProject> => {
@@ -567,9 +614,18 @@ export const setActiveProjectKey = (
         subject: binding.subject,
         session_id: binding.session_id,
         project_key: projectKey,
+        epoch: 1,
     }
-    const previousProjectKey = activeProjectKey()
-    localStorage.setItem(activeProjectStorageKey, JSON.stringify(record))
+    const previous = readActiveProjectRecord()
+    const previousProjectKey =
+        previous && sameBinding(binding, previous)
+            ? previous.project_key
+            : undefined
+    record.epoch =
+        previous && sameBinding(binding, previous)
+            ? previous.epoch + (previous.project_key === projectKey ? 0 : 1)
+            : 1
+    writeStoredProjectSelection(JSON.stringify(record))
     if (previousProjectKey !== projectKey) {
         notifyActiveProjectSelectionChanged()
         signalProjectScopeChanged(projectKey)
@@ -581,9 +637,19 @@ export const clearActiveProjectSelection = (): void => {
     notifyActiveProjectSelectionChanged()
 }
 
-export const projectResourcePath = async (resourcePath: string): Promise<string> => {
-    const projectKey = await resolveActiveProjectKey()
-    return `projects/${encodeURIComponent(projectKey)}/${resourcePath.replace(/^\/+/, '')}`
+export const projectResourcePath = async (
+    resourcePath: string,
+    snapshot?: ProjectScopeSnapshot,
+): Promise<string> => {
+    const scope = snapshot ?? captureProjectScopeSnapshot()
+    const access = await resolveActiveProjectAccess()
+    assertProjectScopeSnapshot(scope)
+    if (access.project.key !== scope.project_key) {
+        throw new HttpError('项目范围已变化，请刷新页面后重试', 409, {
+            code: 'project_scope_changed',
+        })
+    }
+    return `projects/${encodeURIComponent(scope.project_key)}/${resourcePath.replace(/^\/+/, '')}`
 }
 
 export const invalidateProjectAccessCache = (): void => {

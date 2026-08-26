@@ -146,12 +146,13 @@ export const installMockSession = async (
             // Match authProvider: token is the cross-tab commit marker.
             localStorage.setItem('token', authToken);
             if (selectedProject) {
-                localStorage.setItem(
+                sessionStorage.setItem(
                     'chronodesk.activeProject',
                     JSON.stringify({
                         subject: String(user.id),
                         session_id: user.sessionID,
                         project_key: selectedProject.key,
+                        epoch: 1,
                     }),
                 );
             }

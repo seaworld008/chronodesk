@@ -50,7 +50,7 @@ const ticketForProject = (
     source: 'web',
     created_by_id: defaultMockIdentity.id,
     assigned_to_id: null,
-    version: projectKey === projectA.key ? 3 : 7,
+    version: 3,
     tags: [],
     internal_notes: `${projectKey} internal only`,
     sla_breached: false,
@@ -391,6 +391,91 @@ test.describe('项目资源缓存与会话失效隔离', () => {
         ).toBe(false);
     });
 
+    test('双标签同 ID 同版本：另一标签切换项目后旧表单仍只写原项目', async ({
+        page,
+    }) => {
+        const peer = await page.context().newPage();
+        await installMockSession(page, defaultMockIdentity, projectA);
+        await installMockSession(peer, defaultMockIdentity, projectA);
+        const accesses = [
+            authorizedProjectAccess(projectA, 'project_admin'),
+            authorizedProjectAccess(projectB, 'project_admin'),
+        ];
+        const primaryBackend = await mockProjectBackend(page, accesses);
+        const peerBackend = await mockProjectBackend(peer, accesses);
+
+        await page.goto(`/#/tickets/${ticketID}/show`);
+        await page
+            .getByRole('main')
+            .getByRole('link', { name: '编辑', exact: true })
+            .click();
+        await expect(
+            page.getByRole('heading', { name: '编辑工单', exact: true }),
+        ).toBeVisible();
+
+        await peer.goto('/#/');
+        await peer.getByTestId('active-project-switcher').click();
+        await peer
+            .getByRole('option', {
+                name: new RegExp(`^${projectB.name} · `, 'u'),
+            })
+            .click();
+        await expect.poll(() =>
+            peer.evaluate(() => {
+                const raw = sessionStorage.getItem(
+                    'chronodesk.activeProject',
+                );
+                return raw
+                    ? (JSON.parse(raw) as { project_key?: unknown })
+                        .project_key
+                    : null;
+            }),
+        ).toBe(projectB.key);
+        await expect.poll(() =>
+            page.evaluate(() => {
+                const raw = sessionStorage.getItem(
+                    'chronodesk.activeProject',
+                );
+                return raw
+                    ? (JSON.parse(raw) as { project_key?: unknown })
+                        .project_key
+                    : null;
+            }),
+        ).toBe(projectA.key);
+
+        await page.getByLabel('工单标题').fill('A 项目由旧标签安全更新');
+        const updateRequest = page.waitForRequest((request) =>
+            request.method() === 'PUT' &&
+            new URL(request.url()).pathname ===
+                `/api/projects/${projectA.key}/tickets/${ticketID}`,
+        );
+        await page.getByRole('button', { name: '保存更改' }).click();
+        await updateRequest;
+
+        const allRequests = [
+            ...primaryBackend.requests,
+            ...peerBackend.requests,
+        ];
+        expect(
+            allRequests.some(
+                ({ method, pathname }) =>
+                    method !== 'GET' &&
+                    pathname ===
+                        `/api/projects/${projectB.key}/tickets/${ticketID}`,
+            ),
+        ).toBe(false);
+        expect(
+            primaryBackend.requests.some(
+                ({ method, pathname }) =>
+                    method === 'PUT' &&
+                    pathname ===
+                        `/api/projects/${projectA.key}/tickets/${ticketID}`,
+            ),
+        ).toBe(true);
+
+        await peer.close();
+    });
+
     for (const forbiddenCode of [
         'project_role_denied',
         'ticket_access_denied',
@@ -438,7 +523,7 @@ test.describe('项目资源缓存与会话失效隔离', () => {
             ).toBe(forbiddenCode);
             await expect.poll(() =>
                 page.evaluate(() => {
-                    const raw = localStorage.getItem(
+                    const raw = sessionStorage.getItem(
                         'chronodesk.activeProject',
                     );
                     return raw
@@ -509,7 +594,7 @@ test.describe('项目资源缓存与会话失效隔离', () => {
         ).toBe('project_access_revoked');
         await expect.poll(() =>
             page.evaluate(() => {
-                const raw = localStorage.getItem(
+                const raw = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 return raw
@@ -647,7 +732,7 @@ test.describe('项目资源缓存与会话失效隔离', () => {
             user: localStorage.getItem('user'),
             tokenExpiresAt: localStorage.getItem('tokenExpiresAt'),
             permissions: localStorage.getItem('permissions'),
-            project: localStorage.getItem('chronodesk.activeProject'),
+            project: sessionStorage.getItem('chronodesk.activeProject'),
         }));
         expect(storage).toEqual({
             token: null,
