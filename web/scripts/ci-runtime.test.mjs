@@ -180,7 +180,7 @@ test('可信 CI policy 分离普通判定与 Dependabot 精确 SHA 批准', asyn
   assert.equal(policy.steps.length, 1)
   assert.equal(
     policy.steps[0].uses,
-    'actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd',
+    'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3',
   )
   assert.doesNotMatch(serialized, /actions\/checkout/u)
   assert.doesNotMatch(serialized, /download-artifact/u)
