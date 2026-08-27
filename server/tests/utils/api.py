@@ -29,14 +29,21 @@ DEFAULT_TIMEOUT = int(os.getenv("TEST_REQUEST_TIMEOUT", "15"))
 DEFAULT_MAX_RETRIES = int(os.getenv("TEST_REQUEST_MAX_RETRIES", "3"))
 DEFAULT_RETRY_DELAY = float(os.getenv("TEST_REQUEST_RETRY_DELAY", "1.0"))
 DEFAULT_BROWSER_ORIGIN = os.getenv("TEST_WEB_ORIGIN", "http://localhost:3000")
-_BROWSER_SESSION_POST_PATHS = frozenset(
+_BROWSER_SESSION_ESTABLISH_PATHS = frozenset(
     {
         "/auth/login",
-        "/auth/logout",
-        "/auth/logout-all",
         "/auth/refresh",
         "/auth/register",
     }
+)
+_BROWSER_SESSION_END_PATHS = frozenset(
+    {
+        "/auth/logout",
+        "/auth/logout-all",
+    }
+)
+_BROWSER_SESSION_POST_PATHS = (
+    _BROWSER_SESSION_ESTABLISH_PATHS | _BROWSER_SESSION_END_PATHS
 )
 PROJECT_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
 PROJECT_PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
@@ -114,6 +121,11 @@ class APIClient:
                     timeout=self.timeout,
                 )
                 register_response_secrets(response)
+                self._update_human_session_from_response(
+                    method,
+                    path,
+                    response,
+                )
 
                 if (
                     expected_status is not None
@@ -431,6 +443,37 @@ class APIClient:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _update_human_session_from_response(
+        self,
+        method: str,
+        path: str,
+        response: requests.Response,
+    ) -> None:
+        if (
+            method.upper() != "POST"
+            or path not in _BROWSER_SESSION_POST_PATHS
+            or not 200 <= response.status_code < 300
+        ):
+            return
+        try:
+            payload = response.json()
+        except ValueError:
+            return
+        if not isinstance(payload, Mapping):
+            return
+        if path in _BROWSER_SESSION_END_PATHS:
+            if payload.get("success") is True:
+                self._human_session_id = None
+            return
+        if path not in _BROWSER_SESSION_ESTABLISH_PATHS:
+            return
+        if path == "/auth/refresh":
+            if payload.get("success") is not True:
+                return
+        elif payload.get("code") != 0:
+            return
+        self._remember_human_session(payload.get("data"))
+
     def _browser_session_headers(
         self,
         method: str,
