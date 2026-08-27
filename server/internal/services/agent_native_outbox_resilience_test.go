@@ -722,6 +722,133 @@ func TestProcessOutboxBatchBoundsUnknownDestinationLane(t *testing.T) {
 	}
 }
 
+func TestProcessOutboxBatchRevisitsCapacitySkippedRowBeforeNewerTraffic(
+	t *testing.T,
+) {
+	db := openAgentNativeTestDB(t)
+	closeAgentNativeOutboxTestDB(t, db)
+	service := NewAgentNativeService(db, AgentNativeOptions{
+		OutboxLockTTL:             time.Second,
+		OutboxDeliveryTimeout:     100 * time.Millisecond,
+		OutboxDeliveryConcurrency: 2,
+	})
+	createOutboxResilienceEvent(t, service, 1)
+
+	var skipped models.OutboxDelivery
+	if err := db.First(&skipped).Error; err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Minute)
+	if err := db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", skipped.ID).
+		Updates(map[string]any{
+			"created_at":      base,
+			"next_attempt_at": base,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cursorClass := "non-webhook:" +
+		string(OutboxDeliveryLaneOther) +
+		":retry"
+	fixtureScope := models.ProjectScope{
+		OrganizationID: skipped.OrganizationID,
+		ProjectID:      skipped.ProjectID,
+	}
+	service.compareAndSetOutboxClaimScanCursor(
+		fixtureScope,
+		cursorClass,
+		outboxClaimScanCursor{},
+		outboxClaimScanCursor{
+			sortAt:    base.Add(time.Second),
+			createdAt: base.Add(time.Second),
+			stableID:  "ffffffff-ffff-7fff-bfff-ffffffffffff",
+		},
+	)
+
+	blockingPermit, blocked := service.tryAcquireOutboxDeliveryPermit(
+		OutboxDeliveryLaneOther,
+	)
+	if blockingPermit == nil || blocked != outboxPermitAvailable {
+		t.Fatalf("reserve blocking permit = %v, blocked=%d", blockingPermit, blocked)
+	}
+	defer blockingPermit.release()
+
+	saturated, err := service.ProcessOutboxBatch(
+		context.Background(),
+		"capacity-skipped-worker",
+		1,
+		OutboxDeliverFunc(func(
+			context.Context,
+			*models.OutboxDelivery,
+			CloudEventEnvelope,
+		) error {
+			return errors.New("capacity-skipped row reached adapter")
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saturated.Claimed != 0 ||
+		saturated.Status != OutboxBatchStatusSaturated ||
+		!outboxBatchHasSaturatedLane(
+			saturated,
+			OutboxDeliveryLaneOther,
+		) {
+		t.Fatalf("capacity-skipped batch = %+v", saturated)
+	}
+	blockingPermit.release()
+
+	createOutboxResilienceEvent(t, service, 1)
+	var successor models.OutboxDelivery
+	if err := db.Where("id <> ?", skipped.ID).First(&successor).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", successor.ID).
+		Updates(map[string]any{
+			"created_at":      base.Add(2 * time.Second),
+			"next_attempt_at": base.Add(2 * time.Second),
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var deliveredID string
+	recovered, err := service.ProcessOutboxBatch(
+		context.Background(),
+		"capacity-recovered-worker",
+		1,
+		OutboxDeliverFunc(func(
+			_ context.Context,
+			delivery *models.OutboxDelivery,
+			_ CloudEventEnvelope,
+		) error {
+			deliveredID = delivery.ID
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Delivered != 1 || deliveredID != skipped.ID {
+		t.Fatalf(
+			"capacity recovery delivered=%s batch=%+v, want skipped=%s before successor=%s",
+			deliveredID,
+			recovered,
+			skipped.ID,
+			successor.ID,
+		)
+	}
+	var remaining models.OutboxDelivery
+	if err := db.First(&remaining, "id = ?", successor.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if remaining.Status != models.OutboxDeliveryPending ||
+		remaining.Attempts != 0 ||
+		remaining.LockedAt != nil {
+		t.Fatalf("newer successor was claimed before skipped row: %+v", remaining)
+	}
+}
+
 func TestProcessOutboxBatchReportsGlobalSaturationWithoutClaiming(
 	t *testing.T,
 ) {

@@ -3174,8 +3174,16 @@ func (s *AgentNativeService) claimPendingOutbox(
 		)
 	}
 	batchCreatedBefore = batchCreatedBefore.UTC()
+	type claimCandidateCursor struct {
+		class    string
+		expected outboxClaimScanCursor
+		before   outboxClaimScanCursor
+	}
 	claimResult := outboxClaimResult{}
 	var scanCursorMutations []outboxClaimScanCursorMutation
+	capacitySkippedClaimClasses := make(
+		map[string]claimCandidateCursor,
+	)
 	operation, err := requireOutboxWorkerOperation(ctx)
 	if err != nil {
 		return outboxClaimResult{}, err
@@ -3264,6 +3272,10 @@ func (s *AgentNativeService) claimPendingOutbox(
 						[][]models.OutboxDelivery,
 						outboxClaimClassCount,
 					)
+					candidateClaimCursors := make(
+						map[string]claimCandidateCursor,
+						limit,
+					)
 					classStart := s.nextOutboxClaimClassStart(
 						operation.Scope,
 						len(claimClasses),
@@ -3309,13 +3321,20 @@ func (s *AgentNativeService) claimPendingOutbox(
 							}
 						}
 						next := outboxClaimScanCursor{}
-						if len(raw) > 0 {
-							last := raw[len(raw)-1]
+						before := cursor
+						for index := range raw {
+							candidateClaimCursors[raw[index].ID] =
+								claimCandidateCursor{
+									class:    class,
+									expected: expected,
+									before:   before,
+								}
 							next = outboxClaimScanCursor{
-								sortAt:    sortAt(last),
-								createdAt: last.CreatedAt,
-								stableID:  last.ID,
+								sortAt:    sortAt(raw[index]),
+								createdAt: raw[index].CreatedAt,
+								stableID:  raw[index].ID,
 							}
+							before = next
 						}
 						if expected != next {
 							scanCursorMutations = append(
@@ -3622,6 +3641,14 @@ func (s *AgentNativeService) claimPendingOutbox(
 									lane,
 									blocked,
 								)
+								if position, ok :=
+									candidateClaimCursors[candidate.ID]; ok {
+									if _, recorded :=
+										capacitySkippedClaimClasses[position.class]; !recorded {
+										capacitySkippedClaimClasses[position.class] =
+											position
+									}
+								}
 								// Capacity-skipped rows remain eligible and
 								// unclaimed. Do not consume the caller's
 								// logical batch budget so a cooperative lane
@@ -3742,11 +3769,27 @@ func (s *AgentNativeService) claimPendingOutbox(
 		)
 	}
 	for _, mutation := range scanCursorMutations {
+		if _, skipped :=
+			capacitySkippedClaimClasses[mutation.class]; skipped {
+			continue
+		}
 		s.compareAndSetOutboxClaimScanCursor(
 			operation.Scope,
 			mutation.class,
 			mutation.expected,
 			mutation.next,
+		)
+	}
+	for _, skipped := range capacitySkippedClaimClasses {
+		// Rewind to immediately before the earliest capacity-skipped
+		// candidate, including after a cursor wrap. Successfully claimed
+		// rows disappear from the next eligible page, while the skipped row
+		// is revisited before continuously arriving successors.
+		s.compareAndSetOutboxClaimScanCursor(
+			operation.Scope,
+			skipped.class,
+			skipped.expected,
+			skipped.before,
 		)
 	}
 	return claimResult, nil
