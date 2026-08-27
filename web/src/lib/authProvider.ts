@@ -62,6 +62,7 @@ const publicHumanAuthPaths = new Set([
     '/forgot-password',
     '/reset-password',
     '/verify-email',
+    '/resend-verification',
 ])
 
 const isPublicHumanAuthRoute = (): boolean => {
@@ -745,6 +746,9 @@ export const authProvider: AuthProvider = {
     getPermissions: async (): Promise<AccessPermissions> => {
         let user = readStoredUser()
         if (!user) {
+            if (isPublicHumanAuthRoute()) {
+                throw new Error('当前页面无需登录')
+            }
             await refreshStoredSession()
             user = readStoredUser()
         }
