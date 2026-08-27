@@ -1,6 +1,7 @@
 let accessToken: string | null = null
 let generation = 0
 let committedAt = 0
+const staleHumanSessionResponses = new WeakSet<object>()
 
 export type HumanAccessTokenSnapshot = Readonly<{
     accessToken: string
@@ -74,3 +75,17 @@ export const humanAccessTokenSnapshotIsCurrent = (
     snapshot !== null &&
     generation === snapshot.generation &&
     accessToken === snapshot.accessToken
+
+export const markStaleHumanSessionResponse = <T extends object>(
+    error: T,
+): T => {
+    staleHumanSessionResponses.add(error)
+    return error
+}
+
+export const isStaleHumanSessionResponse = (
+    error: unknown,
+): boolean =>
+    typeof error === 'object' &&
+    error !== null &&
+    staleHumanSessionResponses.has(error)

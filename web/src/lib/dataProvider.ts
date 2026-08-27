@@ -17,6 +17,8 @@ import { joinApiUrl } from './apiUrl'
 import {
     captureHumanAccessTokenSnapshot,
     humanAccessTokenSnapshotIsCurrent,
+    isStaleHumanSessionResponse,
+    markStaleHumanSessionResponse,
     readHumanAccessToken,
     type HumanAccessTokenSnapshot,
 } from './humanSessionRuntime'
@@ -165,8 +167,15 @@ function handleHttpError(
     requestSession?: HumanAccessTokenSnapshot | null,
 ): never {
     if (error instanceof HttpError) {
+        const staleResponse =
+            isStaleHumanSessionResponse(error) ||
+            (
+                requestSession !== undefined &&
+                !humanAccessTokenSnapshotIsCurrent(requestSession)
+            )
         if (
             error.status === 401 &&
+            requestSession !== undefined &&
             humanAccessTokenSnapshotIsCurrent(requestSession ?? null)
         ) {
             signalSessionInvalidated()
@@ -179,7 +188,11 @@ function handleHttpError(
             signalProjectAccessInvalidated()
         }
         const message = localizedApiErrorMessage(error.body, error.status)
-        throw new HttpError(message, error.status, error.body)
+        const localizedError =
+            new HttpError(message, error.status, error.body)
+        throw staleResponse
+            ? markStaleHumanSessionResponse(localizedError)
+            : localizedError
     }
 
     const rawMessage = error instanceof Error ? error.message : ''

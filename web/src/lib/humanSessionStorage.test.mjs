@@ -69,6 +69,8 @@ const {
     commitHumanAccessToken,
     humanAccessTokenSnapshotIsCurrent,
     humanSessionCommittedAt,
+    isStaleHumanSessionResponse,
+    markStaleHumanSessionResponse,
     readHumanAccessToken,
 } = await import('./humanSessionRuntime.ts')
 const {
@@ -108,6 +110,17 @@ test('旧 bearer 只迁移到内存并立即清除浏览器持久化', () => {
     assert.equal(readHumanAccessToken(), null)
     assert.equal(local.getItem('token'), null)
     assert.equal(local.getItem('refreshToken'), null)
+})
+
+test('延迟响应标记只绑定本地错误对象且不会进入响应载荷', () => {
+    const staleError = new Error('stale response')
+    const currentError = new Error('current response')
+
+    markStaleHumanSessionResponse(staleError)
+
+    assert.equal(isStaleHumanSessionResponse(staleError), true)
+    assert.equal(isStaleHumanSessionResponse(currentError), false)
+    assert.deepEqual(Object.keys(staleError), [])
 })
 
 test('跨标签消息只广播稳定会话元数据，不包含 bearer', () => {

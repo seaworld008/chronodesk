@@ -1217,7 +1217,6 @@ test('旧 bearer 的延迟 401 不撤销刷新后提交的新会话', async ({
     const staleResponseReleased = new Promise<void>((resolve) => {
         releaseStaleResponse = resolve
     })
-
     await page.route('**/api/**', async (route) => {
         const request = route.request()
         const pathname = new URL(request.url()).pathname
@@ -1328,6 +1327,270 @@ test('旧 bearer 的延迟 401 不撤销刷新后提交的新会话', async ({
     expect(probeAuthorization).not.toBe(`Bearer ${oldToken}`)
     await expect(page.getByTestId('account-menu')).toBeVisible()
     await expect(page).toHaveURL(/\/#\/$/u)
+})
+
+test('DataProvider 的延迟 401 不会经 checkError 清除新会话', async ({
+    page,
+}) => {
+    const identity = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-stale-data-provider-401',
+    }
+    await installMockSession(page, identity, projectA)
+    const rotatedToken = mockSessionToken(
+        identity,
+        Math.floor(Date.now() / 1000) + 7200,
+    )
+    const access = authorizedProjectAccess(projectA, 'requester')
+    const user = {
+        id: identity.id,
+        username: `e2e-${identity.id}`,
+        email: identity.email,
+        platform_role: identity.platformRole,
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+    }
+    let probeAuthorization = ''
+    let markStaleRequestStarted: (() => void) | undefined
+    const staleRequestStarted = new Promise<void>((resolve) => {
+        markStaleRequestStarted = resolve
+    })
+    let releaseStaleResponse: (() => void) | undefined
+    const staleResponseReleased = new Promise<void>((resolve) => {
+        releaseStaleResponse = resolve
+    })
+    let holdCurrentUserResponse = false
+    let markCurrentUserRequestStarted: (() => void) | undefined
+    const currentUserRequestStarted = new Promise<void>((resolve) => {
+        markCurrentUserRequestStarted = resolve
+    })
+    let releaseCurrentUserResponse: (() => void) | undefined
+    const currentUserResponseReleased = new Promise<void>((resolve) => {
+        releaseCurrentUserResponse = resolve
+    })
+
+    await page.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        if (pathname === '/api/e2e-stale-data-provider') {
+            markStaleRequestStarted?.()
+            await staleResponseReleased
+            await fulfillJSON(
+                route,
+                {
+                    code: 'unauthorized',
+                    message: '旧 DataProvider bearer 已失效',
+                },
+                401,
+            )
+            return
+        }
+        if (
+            pathname === '/api/auth/refresh' &&
+            request.method() === 'POST'
+        ) {
+            await fulfillJSON(route, {
+                success: true,
+                message: '登录令牌刷新成功',
+                data: {
+                    user,
+                    access_token: rotatedToken,
+                    expires_in: 7200,
+                    token_type: 'Bearer',
+                },
+            })
+            return
+        }
+        if (pathname === '/api/e2e/stale-data-provider-probe') {
+            probeAuthorization =
+                request.headers().authorization ?? ''
+            await fulfillJSON(route, { code: 0, data: [] })
+            return
+        }
+        if (pathname === '/api/auth/me') {
+            if (holdCurrentUserResponse) {
+                holdCurrentUserResponse = false
+                markCurrentUserRequestStarted?.()
+                await currentUserResponseReleased
+                await fulfillJSON(
+                    route,
+                    {
+                        code: 'unauthorized',
+                        message: '旧身份查询已失效',
+                    },
+                    401,
+                )
+                return
+            }
+            await fulfillJSON(route, { code: 0, data: user })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (pathname === `/api/projects/${projectA.key}/context`) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    await page.goto('/#/')
+    await expect(page.getByTestId('account-menu')).toBeVisible()
+
+    const staleRequest = page.evaluate(
+        async ({ authModulePath, dataModulePath }) => {
+            const dataModule = await import(
+                /* @vite-ignore */ dataModulePath
+            ) as {
+                dataProvider: {
+                    getList: (
+                        resource: string,
+                        params: {
+                            filter: Record<string, unknown>
+                            pagination: {
+                                page: number
+                                perPage: number
+                            }
+                            sort: {
+                                field: string
+                                order: 'ASC' | 'DESC'
+                            }
+                        },
+                    ) => Promise<unknown>
+                }
+            }
+            const authModule = await import(
+                /* @vite-ignore */ authModulePath
+            ) as {
+                authProvider: {
+                    checkError: (error: unknown) => Promise<void>
+                }
+            }
+            try {
+                await dataModule.dataProvider.getList(
+                    'e2e-stale-data-provider',
+                    {
+                        filter: {},
+                        pagination: { page: 1, perPage: 10 },
+                        sort: { field: 'id', order: 'ASC' },
+                    },
+                )
+                return {
+                    checkErrorRejected: false,
+                    message: null,
+                }
+            } catch (error) {
+                let checkErrorRejected = false
+                try {
+                    await authModule.authProvider.checkError(error)
+                } catch {
+                    checkErrorRejected = true
+                }
+                return {
+                    checkErrorRejected,
+                    message:
+                        error instanceof Error
+                            ? error.message
+                            : String(error),
+                }
+            }
+        },
+        {
+            authModulePath: '/src/lib/authProvider.ts',
+            dataModulePath: '/src/lib/dataProvider.ts',
+        },
+    )
+    await staleRequestStarted
+
+    await page.evaluate(async (modulePath) => {
+        const authModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            bootstrapHumanSession: () => Promise<void>
+        }
+        await authModule.bootstrapHumanSession()
+    }, '/src/lib/authProvider.ts')
+
+    releaseStaleResponse?.()
+    const result = await staleRequest
+    expect(result.message).toContain('登录状态已失效')
+    expect(result.checkErrorRejected).toBe(false)
+
+    await page.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        await apiModule.apiFetch('/e2e/stale-data-provider-probe')
+    }, '/src/lib/apiClient.ts')
+
+    expect(probeAuthorization).toBe(`Bearer ${rotatedToken}`)
+    await expect(page.getByTestId('account-menu')).toBeVisible()
+    await expect(page).toHaveURL(/\/#\/$/u)
+
+    holdCurrentUserResponse = true
+    const staleIdentityRequest = page.evaluate(
+        async (modulePath) => {
+            const authModule = await import(
+                /* @vite-ignore */ modulePath
+            ) as {
+                authProvider: {
+                    getIdentity: () => Promise<{
+                        id: string | number
+                        email?: string
+                    }>
+                }
+            }
+            const originalGetItem = Storage.prototype.getItem
+            let hideStoredUserOnce = true
+            Storage.prototype.getItem = function getItem(key: string) {
+                if (
+                    this === sessionStorage &&
+                    key === 'user' &&
+                    hideStoredUserOnce
+                ) {
+                    hideStoredUserOnce = false
+                    return null
+                }
+                return originalGetItem.call(this, key)
+            }
+            try {
+                return await authModule.authProvider.getIdentity()
+            } finally {
+                Storage.prototype.getItem = originalGetItem
+            }
+        },
+        '/src/lib/authProvider.ts',
+    )
+    await currentUserRequestStarted
+    await page.evaluate(async (modulePath) => {
+        const authModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            bootstrapHumanSession: () => Promise<void>
+        }
+        await authModule.bootstrapHumanSession()
+    }, '/src/lib/authProvider.ts')
+    releaseCurrentUserResponse?.()
+
+    const currentIdentity = await staleIdentityRequest
+    expect(currentIdentity.id).toBe(identity.id)
+    expect(currentIdentity.email).toBe(identity.email)
+    await page.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        await apiModule.apiFetch('/e2e/stale-data-provider-probe')
+    }, '/src/lib/apiClient.ts')
+    expect(probeAuthorization).toBe(`Bearer ${rotatedToken}`)
+    await expect(page.getByTestId('account-menu')).toBeVisible()
 })
 
 test('延迟的全设备退出不会清除操作后新建的同账号会话', async ({

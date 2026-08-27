@@ -36,8 +36,11 @@ import {
 } from './humanTabSession'
 import {
     clearHumanAccessToken,
+    captureHumanAccessTokenSnapshot,
     commitHumanAccessToken,
+    humanAccessTokenSnapshotIsCurrent,
     humanSessionCommittedAt,
+    isStaleHumanSessionResponse,
     readHumanAccessToken,
 } from './humanSessionRuntime'
 import {
@@ -505,6 +508,7 @@ const fetchCurrentUser = async (): Promise<HumanSessionUser> => {
         clearAuthenticationState()
         throw new Error('未找到有效登录令牌，请重新登录')
     }
+    const requestSession = captureHumanAccessTokenSnapshot(token)
     const response = await safeFetch(
         buildUrl(humanApiRoutes.getHumanSessionUser()),
         {
@@ -514,6 +518,13 @@ const fetchCurrentUser = async (): Promise<HumanSessionUser> => {
         '获取当前用户身份失败',
     )
     const body: unknown = await response.json().catch(() => ({}))
+    if (!humanAccessTokenSnapshotIsCurrent(requestSession)) {
+        const committedUser = readStoredUser()
+        if (committedUser !== null) {
+            return committedUser
+        }
+        throw new Error('登录状态已更新，请重试')
+    }
     const user = parseHumanSessionUser(responseData(body))
     if (
         !response.ok ||
@@ -702,6 +713,9 @@ export const authProvider: AuthProvider = {
     checkError: async (error) => {
         const status = isRecord(error) ? error.status : undefined
         if (status === 401) {
+            if (isStaleHumanSessionResponse(error)) {
+                return
+            }
             clearAuthenticationState()
             throw new Error('身份认证失败，请重新登录')
         }
