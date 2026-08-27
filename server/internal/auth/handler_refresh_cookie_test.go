@@ -540,6 +540,89 @@ func TestLogoutRejectsCookieFromAReplacementBrowserSession(t *testing.T) {
 	}
 }
 
+func TestLogoutRejectsMissingOrAmbiguousSessionPrecondition(t *testing.T) {
+	repository, manager, handler := setupSessionRevocationTest(t)
+	_, refreshToken := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		42,
+		PlatformRolePlatformAdmin,
+		"logout-precondition-session",
+	)
+
+	router := gin.New()
+	router.POST("/api/auth/logout", func(c *gin.Context) {
+		handler.Logout(NewGinHTTPContext(c))
+	})
+	for _, test := range []struct {
+		name      string
+		sessionID []string
+	}{
+		{name: "missing header"},
+		{
+			name:      "empty header",
+			sessionID: []string{""},
+		},
+		{
+			name: "duplicate header",
+			sessionID: []string{
+				"logout-precondition-session",
+				"replacement-session-sentinel",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/auth/logout",
+				nil,
+			)
+			request.Header.Set("Origin", testBrowserOrigin)
+			for _, sessionID := range test.sessionID {
+				request.Header.Add(humanSessionIDHeader, sessionID)
+			}
+			request.AddCookie(&http.Cookie{
+				Name:  refreshTokenCookieName,
+				Value: refreshToken,
+				Path:  refreshTokenCookiePath,
+			})
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status = %d, want 400; body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			var problem ErrorResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+				t.Fatal(err)
+			}
+			if problem.Error != "session_precondition_required" ||
+				problem.Code != "session_precondition_required" {
+				t.Fatalf("precondition failure = %+v", problem)
+			}
+			if len(response.Header().Values("Set-Cookie")) != 0 {
+				t.Fatal("precondition failure cleared the browser Cookie")
+			}
+			active, err := repository.IsSessionActive(
+				context.Background(),
+				42,
+				"logout-precondition-session",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !active {
+				t.Fatal("precondition failure revoked the active session")
+			}
+		})
+	}
+}
+
 func TestLogoutAllRejectsCookieFromAReplacementBrowserSession(t *testing.T) {
 	repository, manager, handler := setupSessionRevocationTest(t)
 	_, _ = issueSessionTokens(
@@ -606,6 +689,107 @@ func TestLogoutAllRejectsCookieFromAReplacementBrowserSession(t *testing.T) {
 		if !active {
 			t.Fatalf("stale logout-all revoked session %q", session.sessionID)
 		}
+	}
+}
+
+func TestLogoutAllRejectsPresentInvalidRefreshCookies(t *testing.T) {
+	repository, manager, handler := setupSessionRevocationTest(t)
+	_, currentRefresh := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		42,
+		PlatformRolePlatformAdmin,
+		"logout-all-current-session",
+	)
+	_, replacementRefresh := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		84,
+		PlatformRoleMember,
+		"logout-all-replacement-session",
+	)
+
+	router := gin.New()
+	router.POST("/api/auth/logout-all", func(c *gin.Context) {
+		c.Set("user_id", uint(42))
+		c.Set("session_id", "logout-all-current-session")
+		handler.LogoutAll(NewGinHTTPContext(c))
+	})
+	for _, test := range []struct {
+		name    string
+		cookies []string
+	}{
+		{
+			name:    "empty Cookie",
+			cookies: []string{""},
+		},
+		{
+			name: "duplicate replacement Cookies",
+			cookies: []string{
+				currentRefresh,
+				replacementRefresh,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/auth/logout-all",
+				nil,
+			)
+			for _, refreshToken := range test.cookies {
+				request.AddCookie(&http.Cookie{
+					Name:  refreshTokenCookieName,
+					Value: refreshToken,
+					Path:  refreshTokenCookiePath,
+				})
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf(
+					"invalid Cookie status = %d, want 401; body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			var problem ErrorResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+				t.Fatal(err)
+			}
+			if problem.Error != "invalid_token" ||
+				problem.Code != "invalid_token" {
+				t.Fatalf("invalid Cookie failure = %+v", problem)
+			}
+			if len(response.Header().Values("Set-Cookie")) != 0 {
+				t.Fatal("invalid Cookie rejection cleared a browser Cookie")
+			}
+			for _, session := range []struct {
+				userID    uint
+				sessionID string
+			}{
+				{userID: 42, sessionID: "logout-all-current-session"},
+				{userID: 84, sessionID: "logout-all-replacement-session"},
+			} {
+				active, err := repository.IsSessionActive(
+					context.Background(),
+					session.userID,
+					session.sessionID,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !active {
+					t.Fatalf(
+						"invalid Cookie rejection revoked session %q",
+						session.sessionID,
+					)
+				}
+			}
+		})
 	}
 }
 

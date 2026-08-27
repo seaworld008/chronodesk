@@ -455,10 +455,20 @@ func rejectLegacyRefreshCredentials(c HTTPContext) bool {
 	return false
 }
 
-func refreshTokenFromCookie(c HTTPContext) (string, bool) {
+type refreshTokenCookieState uint8
+
+const (
+	refreshTokenCookieAbsent refreshTokenCookieState = iota
+	refreshTokenCookieValid
+	refreshTokenCookieInvalid
+)
+
+func readRefreshTokenCookie(
+	c HTTPContext,
+) (string, refreshTokenCookieState) {
 	request := c.Request()
 	if request == nil {
-		return "", false
+		return "", refreshTokenCookieAbsent
 	}
 	var token string
 	count := 0
@@ -469,10 +479,28 @@ func refreshTokenFromCookie(c HTTPContext) (string, bool) {
 		count++
 		token = cookie.Value
 	}
-	if count != 1 || token == "" || strings.TrimSpace(token) != token {
-		return "", false
+	rawCount := 0
+	for _, header := range request.Header.Values("Cookie") {
+		for _, pair := range strings.Split(header, ";") {
+			name, _, present := strings.Cut(
+				strings.TrimSpace(pair),
+				"=",
+			)
+			if present && name == refreshTokenCookieName {
+				rawCount++
+			}
+		}
 	}
-	return token, true
+	if rawCount == 0 && count == 0 {
+		return "", refreshTokenCookieAbsent
+	}
+	if rawCount != 1 ||
+		count != 1 ||
+		token == "" ||
+		strings.TrimSpace(token) != token {
+		return "", refreshTokenCookieInvalid
+	}
+	return token, refreshTokenCookieValid
 }
 
 func writeMissingRefreshCookie(c HTTPContext) {
@@ -483,17 +511,21 @@ func writeMissingRefreshCookie(c HTTPContext) {
 	})
 }
 
+func writeSessionPreconditionRequired(c HTTPContext) {
+	c.JSON(http.StatusBadRequest, ErrorResponse{
+		Error:   "session_precondition_required",
+		Message: "缺少有效的浏览器会话前置条件",
+		Code:    "session_precondition_required",
+	})
+}
+
 func (h *AuthHandler) requireRefreshCookieSession(
 	c HTTPContext,
 	refreshToken, expectedSessionID string,
 ) bool {
 	expectedSessionID = strings.TrimSpace(expectedSessionID)
 	if expectedSessionID == "" || len(expectedSessionID) > 128 {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "session_precondition_required",
-			Message: "缺少有效的浏览器会话前置条件",
-			Code:    "session_precondition_required",
-		})
+		writeSessionPreconditionRequired(c)
 		return false
 	}
 	if h.authService == nil || h.authService.jwtManager == nil {
@@ -748,8 +780,8 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 	if rejectLegacyRefreshCredentials(c) {
 		return
 	}
-	refreshToken, ok := refreshTokenFromCookie(c)
-	if !ok {
+	refreshToken, cookieState := readRefreshTokenCookie(c)
+	if cookieState != refreshTokenCookieValid {
 		writeMissingRefreshCookie(c)
 		return
 	}
@@ -861,27 +893,26 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 	if rejectLegacyRefreshCredentials(c) {
 		return
 	}
-	refreshToken, ok := refreshTokenFromCookie(c)
-	if !ok {
+	refreshToken, cookieState := readRefreshTokenCookie(c)
+	if cookieState != refreshTokenCookieValid {
 		writeMissingRefreshCookie(c)
 		return
 	}
 	request := c.Request()
 	if request == nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "session_precondition_required",
-			Message: "缺少有效的浏览器会话前置条件",
-			Code:    "session_precondition_required",
-		})
+		writeSessionPreconditionRequired(c)
 		return
 	}
 	sessionIDs := request.Header.Values(humanSessionIDHeader)
-	if len(sessionIDs) != 1 ||
-		!h.requireRefreshCookieSession(
-			c,
-			refreshToken,
-			sessionIDs[0],
-		) {
+	if len(sessionIDs) != 1 {
+		writeSessionPreconditionRequired(c)
+		return
+	}
+	if !h.requireRefreshCookieSession(
+		c,
+		refreshToken,
+		sessionIDs[0],
+	) {
 		return
 	}
 
@@ -933,7 +964,12 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 		})
 		return
 	}
-	if refreshToken, hasRefreshCookie := refreshTokenFromCookie(c); hasRefreshCookie {
+	refreshToken, cookieState := readRefreshTokenCookie(c)
+	if cookieState == refreshTokenCookieInvalid {
+		writeMissingRefreshCookie(c)
+		return
+	}
+	if cookieState == refreshTokenCookieValid {
 		sessionID, exists := c.Get("session_id")
 		expectedSessionID, validSessionID := sessionID.(string)
 		if !exists ||
