@@ -703,13 +703,10 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         const refreshedProjectSwitcher =
             page.getByTestId('active-project-switcher')
         await expect(refreshedProjectSwitcher)
-            .toContainText('选择工作项目')
-        await refreshedProjectSwitcher.click()
-        await page.getByRole('option', {
-            name: '运营项目 · 项目管理员',
-            exact: true,
-        }).click()
-        await expect(refreshedProjectSwitcher).toContainText('运营项目')
+            .toContainText('运营项目')
+        await expect(
+            page.getByTestId('active-project-selection-required'),
+        ).toHaveCount(0)
 
         const accountTrigger = page.getByTestId('account-menu').locator('button').first()
         await accountTrigger.click()
