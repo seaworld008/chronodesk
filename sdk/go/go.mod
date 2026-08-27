@@ -1,3 +1,3 @@
 module github.com/seaworld008/chronodesk/sdk/go
 
-go 1.26.5
+go 1.26.7

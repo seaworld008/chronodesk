@@ -64,6 +64,7 @@ const NotificationDeliveryStatusSuppressedByPreference = "suppressed_by_preferen
 // NotificationService 通知服务
 type NotificationService struct {
 	db                         *gorm.DB
+	webhookAttemptGateClock    func() time.Time
 	emailNotificationService   EmailNotificationServiceInterface
 	outboxWebhookTimeout       time.Duration
 	environment                string
@@ -284,6 +285,7 @@ func NewNotificationServiceWithClientFactory(
 	auditRoot, cancelAudit := context.WithCancel(context.Background())
 	return &NotificationService{
 		db:                        db,
+		webhookAttemptGateClock:   time.Now,
 		outboxWebhookTimeout:      defaultOutboxWebhookAttemptTimeout,
 		environment:               getRuntimeEnvironment(),
 		secretStore:               protector,

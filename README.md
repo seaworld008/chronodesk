@@ -281,7 +281,7 @@ make docker-down
 
 Requirements:
 
-- Go `1.26.5`
+- Go `1.26.7`
 - Node.js `24`
 - Python `3.12+`
 - PostgreSQL `18`
