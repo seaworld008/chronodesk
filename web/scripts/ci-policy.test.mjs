@@ -249,8 +249,8 @@ test('本仓库 PR 的作者和事件 sender 都有写权限时可修改控制�
   const result = await runPolicy({
     files: [{ filename: 'web/package-lock.json' }],
     permissions: {
-      'author-writer': 'write',
-      'release-maintainer': 'maintain',
+      'author-writer': 'push',
+      'release-maintainer': 'push',
     },
     pull,
     pullSnapshots: [pull, pull],
@@ -390,6 +390,15 @@ const dependabotDispatch = ({
     pullSnapshots: pullSnapshots ?? [pull, pull],
   })
 }
+
+test('GitHub API 返回 push 权限的维护者可批准 Dependabot 精确 SHA', async () => {
+  const result = await dependabotDispatch({
+    permissions: { 'release-maintainer': 'push' },
+  })
+
+  assertStatus(result, 'success')
+  assert.deepEqual(result.calls.permissions, ['release-maintainer'])
+})
 
 test('Dependabot 元数据编辑不覆盖当前 head 的精确 SHA 判定', async () => {
   const approved = await dependabotDispatch()

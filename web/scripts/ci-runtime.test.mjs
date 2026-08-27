@@ -221,7 +221,7 @@ test('可信 CI policy 分离普通判定与 Dependabot 精确 SHA 批准', asyn
     script,
     /const shaPattern = \/\^\[0-9a-f\]\{40\}\$/u,
   )
-  assert.doesNotMatch(
+  assert.match(
     script,
     /writerPermissions[\s\S]*?'push'/u,
   )

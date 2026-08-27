@@ -45,6 +45,7 @@ jobs:
             const writerPermissions = new Set([
               'admin',
               'maintain',
+              'push',
               'write',
             ]);
             const shaPattern = /^[0-9a-f]{40}$/u;
