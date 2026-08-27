@@ -51,6 +51,7 @@ func newBrowserSessionAuthRouteTestRouter(
 		browserSessionAuthMiddleware{
 			originGate:                 originGate,
 			anonymousIPRateLimit:       recordMiddleware("anonymous-ip-limit"),
+			refreshIdentityProjection:  recordMiddleware("refresh-identity"),
 			anonymousIdentityRateLimit: recordMiddleware("anonymous-identity-limit"),
 			requireAuth:                recordMiddleware("require-auth"),
 			authenticatedRateLimit:     recordMiddleware("authenticated-limit"),
@@ -96,6 +97,7 @@ func TestBrowserSessionAuthRoutesGateOriginBeforeRateLimit(t *testing.T) {
 			want: []string{
 				"origin",
 				"anonymous-ip-limit",
+				"refresh-identity",
 				"anonymous-identity-limit",
 				"refresh",
 			},
@@ -105,6 +107,7 @@ func TestBrowserSessionAuthRoutesGateOriginBeforeRateLimit(t *testing.T) {
 			want: []string{
 				"origin",
 				"anonymous-ip-limit",
+				"refresh-identity",
 				"anonymous-identity-limit",
 				"logout",
 			},
@@ -140,6 +143,70 @@ func TestBrowserSessionAuthRoutesGateOriginBeforeRateLimit(t *testing.T) {
 			}
 			if !reflect.DeepEqual(steps, test.want) {
 				t.Fatalf("middleware order = %v, want %v", steps, test.want)
+			}
+		})
+	}
+}
+
+func TestBrowserSessionAuthRoutesStopBeforeRefreshIdentityWhenIPLimitRejects(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+
+	for _, path := range []string{
+		"/api/auth/refresh",
+		"/api/auth/logout",
+	} {
+		t.Run(path, func(t *testing.T) {
+			steps := make([]string, 0, 3)
+			router := gin.New()
+			record := func(name string) gin.HandlerFunc {
+				return func(context *gin.Context) {
+					steps = append(steps, name)
+					context.Next()
+				}
+			}
+			rejectIPLimit := func(context *gin.Context) {
+				steps = append(steps, "anonymous-ip-limit")
+				context.AbortWithStatus(http.StatusTooManyRequests)
+			}
+			unexpectedHandler := func(context *gin.Context) {
+				steps = append(steps, "handler")
+				context.Status(http.StatusNoContent)
+			}
+			registerBrowserSessionAuthRoutes(
+				router.Group("/api/auth"),
+				browserSessionAuthMiddleware{
+					originGate:                 record("origin"),
+					anonymousIPRateLimit:       rejectIPLimit,
+					refreshIdentityProjection:  record("refresh-identity"),
+					anonymousIdentityRateLimit: record("anonymous-identity-limit"),
+					requireAuth:                record("require-auth"),
+					authenticatedRateLimit:     record("authenticated-limit"),
+				},
+				browserSessionAuthHandlers{
+					register:  unexpectedHandler,
+					login:     unexpectedHandler,
+					logout:    unexpectedHandler,
+					refresh:   unexpectedHandler,
+					logoutAll: unexpectedHandler,
+				},
+			)
+			request := httptest.NewRequest(http.MethodPost, path, nil)
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusTooManyRequests {
+				t.Fatalf(
+					"status = %d, want %d",
+					response.Code,
+					http.StatusTooManyRequests,
+				)
+			}
+			want := []string{"origin", "anonymous-ip-limit"}
+			if !reflect.DeepEqual(steps, want) {
+				t.Fatalf("middleware steps = %v, want %v", steps, want)
 			}
 		})
 	}

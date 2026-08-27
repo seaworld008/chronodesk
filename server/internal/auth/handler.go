@@ -477,6 +477,16 @@ const (
 	refreshTokenCookieInvalid
 )
 
+// RefreshRateLimitIdentity is a cryptographically verified, non-authorizing
+// projection used only to keep one Human refresh session in one rate-limit
+// bucket across token rotation. It must never be treated as authenticated
+// request state; AuthService still performs the authoritative repository and
+// session checks inside RefreshToken and Logout.
+type RefreshRateLimitIdentity struct {
+	UserID    uint
+	SessionID string
+}
+
 func readRefreshTokenCookie(
 	c HTTPContext,
 ) (string, refreshTokenCookieState) {
@@ -515,6 +525,38 @@ func readRefreshTokenCookie(
 		return "", refreshTokenCookieInvalid
 	}
 	return token, refreshTokenCookieValid
+}
+
+// ProjectRefreshRateLimitIdentity verifies the one strict refresh Cookie and
+// projects its signed Human/session identifiers without querying storage.
+// Invalid, expired, missing, or ambiguous Cookies deliberately produce no
+// identity so the anonymous limiter can use its shared unidentified bucket.
+func (h *AuthHandler) ProjectRefreshRateLimitIdentity(
+	c HTTPContext,
+) (RefreshRateLimitIdentity, bool) {
+	if h == nil ||
+		h.authService == nil ||
+		h.authService.jwtManager == nil {
+		return RefreshRateLimitIdentity{}, false
+	}
+	refreshToken, cookieState := readRefreshTokenCookie(c)
+	if cookieState != refreshTokenCookieValid {
+		return RefreshRateLimitIdentity{}, false
+	}
+	claims, err := h.authService.jwtManager.VerifyRefreshToken(refreshToken)
+	if err != nil ||
+		claims == nil ||
+		claims.Type != "refresh" ||
+		claims.UserID == 0 ||
+		claims.SessionID == "" ||
+		claims.SessionID != strings.TrimSpace(claims.SessionID) ||
+		len(claims.SessionID) > 128 {
+		return RefreshRateLimitIdentity{}, false
+	}
+	return RefreshRateLimitIdentity{
+		UserID:    claims.UserID,
+		SessionID: claims.SessionID,
+	}, true
 }
 
 func writeMissingRefreshCookie(c HTTPContext) {

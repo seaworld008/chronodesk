@@ -306,7 +306,7 @@ func InfrastructureRouteRateLimitSkip(c HTTPContext) bool {
 
 const anonymousCredentialBodyLimit = 64 << 10
 
-const humanRefreshCookieName = "chronodesk_refresh_token"
+const anonymousRefreshSessionIdentityContextKey = "chronodesk.rate_limit.refresh_session_identity"
 
 // AnonymousIPRouteKeyFunc is the coarse anti-abuse layer for unauthenticated
 // credential endpoints. It limits the trusted client IP and matched route,
@@ -329,6 +329,32 @@ func AnonymousCredentialKeyFunc(c HTTPContext) string {
 	return route + "|subject_" + hex.EncodeToString(sum[:16])
 }
 
+// BindAnonymousRefreshSessionIdentity stores one already-verified Human
+// refresh-session identity for AnonymousCredentialKeyFunc. The versioned,
+// length-delimited encoding is stable across JWT rotation and unambiguous
+// across user/session pairs. Callers must bind only claims returned by the
+// authoritative refresh-token verifier.
+func BindAnonymousRefreshSessionIdentity(
+	c HTTPContext,
+	userID uint,
+	sessionID string,
+) {
+	if c == nil ||
+		userID == 0 ||
+		sessionID == "" ||
+		sessionID != strings.TrimSpace(sessionID) ||
+		len(sessionID) > 128 {
+		return
+	}
+	subject := "human_refresh_session:v1\x00" +
+		strconv.FormatUint(uint64(userID), 10) +
+		"\x00" +
+		strconv.Itoa(len(sessionID)) +
+		":" +
+		sessionID
+	c.Set(anonymousRefreshSessionIdentityContextKey, subject)
+}
+
 func anonymousCredentialSubject(c HTTPContext) string {
 	ginContext, ok := c.(*GinHTTPContext)
 	if !ok || ginContext.Context.Request == nil {
@@ -337,19 +363,17 @@ func anonymousCredentialSubject(c HTTPContext) string {
 	request := ginContext.Context.Request
 	switch getRoutePattern(c) {
 	case "/api/auth/refresh", "/api/auth/logout":
-		var credential string
-		count := 0
-		for _, cookie := range request.Cookies() {
-			if cookie.Name != humanRefreshCookieName {
-				continue
-			}
-			count++
-			credential = cookie.Value
-		}
-		if count == 1 &&
-			credential != "" &&
-			strings.TrimSpace(credential) == credential {
-			return "refresh_cookie:" + credential
+		value, exists := c.Get(
+			anonymousRefreshSessionIdentityContextKey,
+		)
+		subject, valid := value.(string)
+		if exists &&
+			valid &&
+			strings.HasPrefix(
+				subject,
+				"human_refresh_session:v1\x00",
+			) {
+			return subject
 		}
 		return ""
 	}

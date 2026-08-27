@@ -45,6 +45,7 @@ func ginAdapter(handler func(auth.HTTPContext)) gin.HandlerFunc {
 type browserSessionAuthMiddleware struct {
 	originGate                 gin.HandlerFunc
 	anonymousIPRateLimit       gin.HandlerFunc
+	refreshIdentityProjection  gin.HandlerFunc
 	anonymousIdentityRateLimit gin.HandlerFunc
 	requireAuth                gin.HandlerFunc
 	authenticatedRateLimit     gin.HandlerFunc
@@ -60,23 +61,32 @@ type browserSessionAuthHandlers struct {
 
 // registerBrowserSessionAuthRoutes keeps the deployment-owned browser Origin
 // gate ahead of every limiter that protects a Cookie-issuing or
-// Cookie-revoking Human authentication write. This prevents an untrusted
-// sibling Origin from consuming a victim's rate-limit bucket.
+// Cookie-revoking Human authentication write. Refresh/logout additionally
+// project the signed user/session pair only after the coarse IP limiter and
+// before the stable identity limiter.
 func registerBrowserSessionAuthRoutes(
 	routes *gin.RouterGroup,
 	middlewares browserSessionAuthMiddleware,
 	handlers browserSessionAuthHandlers,
 ) {
-	publicWrites := routes.Group("")
-	publicWrites.Use(middlewares.originGate)
-	publicWrites.Use(
+	emailCredentialWrites := routes.Group("")
+	emailCredentialWrites.Use(middlewares.originGate)
+	emailCredentialWrites.Use(
 		middlewares.anonymousIPRateLimit,
 		middlewares.anonymousIdentityRateLimit,
 	)
-	publicWrites.POST("/register", handlers.register)
-	publicWrites.POST("/login", handlers.login)
-	publicWrites.POST("/logout", handlers.logout)
-	publicWrites.POST("/refresh", handlers.refresh)
+	emailCredentialWrites.POST("/register", handlers.register)
+	emailCredentialWrites.POST("/login", handlers.login)
+
+	refreshCredentialWrites := routes.Group("")
+	refreshCredentialWrites.Use(middlewares.originGate)
+	refreshCredentialWrites.Use(
+		middlewares.anonymousIPRateLimit,
+		middlewares.refreshIdentityProjection,
+		middlewares.anonymousIdentityRateLimit,
+	)
+	refreshCredentialWrites.POST("/logout", handlers.logout)
+	refreshCredentialWrites.POST("/refresh", handlers.refresh)
 
 	authenticatedWrites := routes.Group("")
 	authenticatedWrites.Use(middlewares.originGate)
@@ -1011,7 +1021,23 @@ func Run() error {
 					originGate: ginAdapter(
 						authModule.Handler.RequireAllowedBrowserOrigin,
 					),
-					anonymousIPRateLimit:       anonymousIPRateLimit,
+					anonymousIPRateLimit: anonymousIPRateLimit,
+					refreshIdentityProjection: func(
+						context *gin.Context,
+					) {
+						identity, ok := authModule.Handler.
+							ProjectRefreshRateLimitIdentity(
+								auth.NewGinHTTPContext(context),
+							)
+						if ok {
+							middleware.BindAnonymousRefreshSessionIdentity(
+								middleware.NewGinHTTPContext(context),
+								identity.UserID,
+								identity.SessionID,
+							)
+						}
+						context.Next()
+					},
 					anonymousIdentityRateLimit: anonymousIdentityRateLimit,
 					requireAuth: ginAdapter(
 						authModule.Handler.RequireAuth,
