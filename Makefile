@@ -168,10 +168,11 @@ test-redis-integration:
 	@test "$(CHRONODESK_REDIS_INTEGRATION)" = "1" || \
 		{ echo "CHRONODESK_REDIS_INTEGRATION 必须显式设为 1"; exit 1; }
 	@test -n "$(REDIS_URL)" || \
-		{ echo "REDIS_URL 未配置，拒绝跳过 Redis execution guard 集成测试"; exit 1; }
+		{ echo "REDIS_URL 未配置，拒绝跳过 Redis 发布门禁集成测试"; exit 1; }
 	cd server && CHRONODESK_REDIS_INTEGRATION=1 REDIS_URL="$(REDIS_URL)" \
 		go test ./internal/services \
-		-run '^TestRedisAgentExecutionGuardIntegration$$' -count=1
+		-run '^(TestRedisAgentExecutionGuardIntegration|TestSchedulerRedisLeaseIntegration)$$' \
+		-count=1
 
 test-web:
 	cd web && npm run check:human-api

@@ -38,6 +38,7 @@ func TestSecurityWorkflowPreservesIndependentGoReleaseGates(t *testing.T) {
 		"run: go test -race ./... -count=1",
 		"  redis-integration:\n",
 		"image: redis:7.4-alpine",
+		"-run '^(TestRedisAgentExecutionGuardIntegration|TestSchedulerRedisLeaseIntegration)$'",
 		"  go-vuln:\n",
 		"component: server",
 		"component: sdk",

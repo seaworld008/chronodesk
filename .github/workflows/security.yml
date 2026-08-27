@@ -136,10 +136,10 @@ jobs:
           check-latest: true
           cache-dependency-path: server/go.sum
 
-      - name: Verify Redis Agent execution guard integration
+      - name: Verify Redis release-gate integrations
         run: >-
           go test ./internal/services
-          -run '^TestRedisAgentExecutionGuardIntegration$'
+          -run '^(TestRedisAgentExecutionGuardIntegration|TestSchedulerRedisLeaseIntegration)$'
           -count=1
 
   go-vuln:
