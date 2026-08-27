@@ -12,7 +12,11 @@ import (
 
 func TestAuthHandlerLoginValidationMessagesAreChinese(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	handler := NewAuthHandler(nil, nil)
+	handler := NewAuthHandler(
+		nil,
+		nil,
+		WithAllowedBrowserOrigin(testBrowserOrigin),
+	)
 	router := gin.New()
 	router.POST("/login", func(c *gin.Context) {
 		handler.Login(NewGinHTTPContext(c))
@@ -36,6 +40,7 @@ func TestAuthHandlerLoginValidationMessagesAreChinese(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/login", bytes.NewBufferString(test.body))
 			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Origin", testBrowserOrigin)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 

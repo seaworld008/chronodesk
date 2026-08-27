@@ -999,6 +999,41 @@ func (r *GormTokenRepository) RotateRefreshToken(
 	replacement *RefreshToken,
 	rotatedAt time.Time,
 ) error {
+	return r.rotateRefreshToken(ctx, currentToken, replacement, rotatedAt, nil)
+}
+
+func (r *GormTokenRepository) RotateRefreshTokenAndRefreshSession(
+	ctx context.Context,
+	currentToken string,
+	replacement *RefreshToken,
+	rotatedAt time.Time,
+	ipAddress, userAgent string,
+) error {
+	return r.rotateRefreshToken(
+		ctx,
+		currentToken,
+		replacement,
+		rotatedAt,
+		func(tx *gorm.DB, stored *RefreshToken, at time.Time) error {
+			return refreshLoginSessionWithDB(
+				tx,
+				stored.UserID,
+				stored.SessionID,
+				ipAddress,
+				userAgent,
+				at,
+			)
+		},
+	)
+}
+
+func (r *GormTokenRepository) rotateRefreshToken(
+	ctx context.Context,
+	currentToken string,
+	replacement *RefreshToken,
+	rotatedAt time.Time,
+	afterStore func(*gorm.DB, *RefreshToken, time.Time) error,
+) error {
 	if strings.TrimSpace(currentToken) == "" ||
 		replacement == nil ||
 		strings.TrimSpace(replacement.Token) == "" ||
@@ -1016,31 +1051,19 @@ func (r *GormTokenRepository) RotateRefreshToken(
 	rotatedAt = rotatedAt.UTC().Truncate(time.Microsecond)
 	storedReplacement.CreatedAt = rotatedAt
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&RefreshToken{}).
-			Where(
-				"token = ? AND revoked = ? AND expires_at > ? AND user_id = ? AND session_id = ?",
-				bearerTokenDigest("refresh-token", currentToken),
-				false,
-				rotatedAt,
-				replacement.UserID,
-				replacement.SessionID,
-			).
-			Updates(map[string]interface{}{
-				"revoked":           true,
-				"revoked_at":        &rotatedAt,
-				"rotated_at":        &rotatedAt,
-				"replaced_by_token": storedReplacement.Token,
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			return ErrInvalidToken
-		}
-		if err := ctx.Err(); err != nil {
+		if err := rotateRefreshTokenWithDB(
+			tx,
+			ctx,
+			currentToken,
+			&storedReplacement,
+			rotatedAt,
+		); err != nil {
 			return err
 		}
-		return tx.Create(&storedReplacement).Error
+		if afterStore != nil {
+			return afterStore(tx, &storedReplacement, rotatedAt)
+		}
+		return nil
 	})
 	if err != nil {
 		return err
@@ -1048,6 +1071,40 @@ func (r *GormTokenRepository) RotateRefreshToken(
 	replacement.ID = storedReplacement.ID
 	replacement.CreatedAt = storedReplacement.CreatedAt
 	return nil
+}
+
+func rotateRefreshTokenWithDB(
+	tx *gorm.DB,
+	ctx context.Context,
+	currentToken string,
+	storedReplacement *RefreshToken,
+	rotatedAt time.Time,
+) error {
+	result := tx.Model(&RefreshToken{}).
+		Where(
+			"token = ? AND revoked = ? AND expires_at > ? AND user_id = ? AND session_id = ?",
+			bearerTokenDigest("refresh-token", currentToken),
+			false,
+			rotatedAt,
+			storedReplacement.UserID,
+			storedReplacement.SessionID,
+		).
+		Updates(map[string]interface{}{
+			"revoked":           true,
+			"revoked_at":        &rotatedAt,
+			"rotated_at":        &rotatedAt,
+			"replaced_by_token": storedReplacement.Token,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrInvalidToken
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return tx.Create(storedReplacement).Error
 }
 
 // RevokeAllUserTokens atomically revokes every persisted authentication state
@@ -2028,18 +2085,34 @@ func (r *GormLoginHistoryRepository) Create(ctx context.Context, history *models
 
 // RefreshSession 刷新会话活跃信息
 func (r *GormLoginHistoryRepository) RefreshSession(ctx context.Context, userID uint, sessionID, ipAddress, userAgent string, at time.Time) error {
+	return refreshLoginSessionWithDB(
+		r.db.WithContext(ctx),
+		userID,
+		sessionID,
+		ipAddress,
+		userAgent,
+		at,
+	)
+}
+
+func refreshLoginSessionWithDB(
+	db *gorm.DB,
+	userID uint,
+	sessionID, ipAddress, userAgent string,
+	at time.Time,
+) error {
 	if sessionID == "" {
 		return nil
 	}
 
 	var history models.LoginHistory
-	err := r.db.WithContext(ctx).
+	err := db.
 		Where("user_id = ? AND session_id = ?", userID, sessionID).
 		Order("login_time DESC").
 		First(&history).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			assignErr := r.db.WithContext(ctx).
+			assignErr := db.
 				Where("user_id = ? AND session_id = '' AND is_active = ?", userID, true).
 				Order("login_time DESC").
 				First(&history).Error
@@ -2050,7 +2123,7 @@ func (r *GormLoginHistoryRepository) RefreshSession(ctx context.Context, userID 
 				return assignErr
 			}
 
-			if updateErr := r.db.WithContext(ctx).Model(&history).Update("session_id", sessionID).Error; updateErr != nil {
+			if updateErr := db.Model(&history).Update("session_id", sessionID).Error; updateErr != nil {
 				return updateErr
 			}
 		} else {
@@ -2072,7 +2145,7 @@ func (r *GormLoginHistoryRepository) RefreshSession(ctx context.Context, userID 
 		updates["session_duration"] = duration
 	}
 
-	return r.db.WithContext(ctx).Model(&history).Updates(updates).Error
+	return db.Model(&history).Updates(updates).Error
 }
 
 // EndSession 结束指定会话

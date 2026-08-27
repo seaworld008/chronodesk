@@ -110,6 +110,25 @@ func normalizeBrowserOrigin(raw string) (string, error) {
 	return scheme + "://" + authority, nil
 }
 
+// BrowserOriginAllowed applies the exact browser-origin policy shared by
+// authentication handlers and route middleware. Both the configured origin
+// and the request Origin must be one canonical absolute HTTP(S) origin.
+func BrowserOriginAllowed(request *http.Request, allowedOrigin string) bool {
+	if request == nil {
+		return false
+	}
+	normalizedAllowedOrigin, err := normalizeBrowserOrigin(allowedOrigin)
+	if err != nil {
+		return false
+	}
+	origins := request.Header.Values("Origin")
+	if len(origins) != 1 {
+		return false
+	}
+	origin, err := normalizeBrowserOrigin(origins[0])
+	return err == nil && origin == normalizedAllowedOrigin
+}
+
 // Logger 日志接口
 type Logger interface {
 	Info(msg string, fields ...interface{})
@@ -355,22 +374,7 @@ type SuccessResponse struct {
 }
 
 func (h *AuthHandler) requireAllowedBrowserOrigin(c HTTPContext) bool {
-	request := c.Request()
-	if request == nil {
-		c.JSON(http.StatusForbidden, ErrorResponse{
-			Error:   "origin_not_allowed",
-			Message: "浏览器来源不受信任",
-			Code:    "origin_not_allowed",
-		})
-		return false
-	}
-	origins := request.Header.Values("Origin")
-	if len(origins) != 1 || h.allowedBrowserOrigin == "" {
-		h.rejectBrowserOrigin(c)
-		return false
-	}
-	origin, err := normalizeBrowserOrigin(origins[0])
-	if err != nil || origin != h.allowedBrowserOrigin {
+	if !BrowserOriginAllowed(c.Request(), h.allowedBrowserOrigin) {
 		h.rejectBrowserOrigin(c)
 		return false
 	}
@@ -379,7 +383,7 @@ func (h *AuthHandler) requireAllowedBrowserOrigin(c HTTPContext) bool {
 
 func (h *AuthHandler) rejectBrowserOrigin(c HTTPContext) {
 	h.logger.Warn(
-		"Rejected refresh-cookie request from an untrusted browser origin",
+		"Rejected browser authentication request from an untrusted origin",
 		"request_id", authLogRequestID(c),
 		"reason", "origin_not_allowed",
 	)
@@ -388,6 +392,16 @@ func (h *AuthHandler) rejectBrowserOrigin(c HTTPContext) {
 		Message: "浏览器来源不受信任",
 		Code:    "origin_not_allowed",
 	})
+	c.Abort()
+}
+
+// RequireAllowedBrowserOrigin is the route-middleware projection of the same
+// exact Origin check used inside every browser authentication handler.
+func (h *AuthHandler) RequireAllowedBrowserOrigin(c HTTPContext) {
+	if !h.requireAllowedBrowserOrigin(c) {
+		return
+	}
+	c.Next()
 }
 
 // rejectLegacyRefreshCredentials ensures the browser refresh credential has
@@ -562,6 +576,9 @@ func (h *AuthHandler) requireRefreshCookieSession(
 
 // Register 用户注册
 func (h *AuthHandler) Register(c HTTPContext) {
+	if !h.requireAllowedBrowserOrigin(c) {
+		return
+	}
 	var req RegisterRequest
 	if err := c.Bind(&req); err != nil {
 		if rejectOversizedAuthenticationRequest(c, err) {
@@ -666,6 +683,9 @@ func registrationFailureHTTPResponse(err error) (int, string) {
 
 // Login 用户登录
 func (h *AuthHandler) Login(c HTTPContext) {
+	if !h.requireAllowedBrowserOrigin(c) {
+		return
+	}
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
 		if rejectOversizedAuthenticationRequest(c, err) {

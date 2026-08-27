@@ -553,6 +553,14 @@ type TokenRepository interface {
 		replacement *RefreshToken,
 		rotatedAt time.Time,
 	) error
+	// 原子轮换刷新令牌并更新对应登录历史；任一步失败都会保留旧令牌。
+	RotateRefreshTokenAndRefreshSession(
+		ctx context.Context,
+		currentToken string,
+		replacement *RefreshToken,
+		rotatedAt time.Time,
+		ipAddress, userAgent string,
+	) error
 	// 撤销用户所有令牌
 	RevokeAllUserTokens(ctx context.Context, userID uint) error
 	// 一次性撤销在给定时刻之前建立的全部浏览器会话。该能力仅供显式
@@ -1426,7 +1434,10 @@ func (s *AuthService) refreshToken(
 	// 保存替代令牌摘要和轮换时间，绝不保存可用的 bearer 明文。
 	tokenRecord, err := s.tokenRepo.GetRefreshTokenForRotation(ctx, req.RefreshToken)
 	if err != nil {
-		return nil, ErrInvalidToken
+		if errors.Is(err, ErrInvalidToken) {
+			return nil, ErrInvalidToken
+		}
+		return nil, fmt.Errorf("failed to load refresh authority: %w", err)
 	}
 	sessionID := tokenRecord.SessionID
 	if sessionID == "" || claims.SessionID != sessionID || claims.UserID != tokenRecord.UserID {
@@ -1443,7 +1454,10 @@ func (s *AuthService) refreshToken(
 	// 获取用户
 	user, err := s.userRepo.GetByID(ctx, claims.UserID)
 	if err != nil {
-		return nil, ErrUserNotFound
+		if errors.Is(err, ErrUserNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("failed to load refresh principal: %w", err)
 	}
 
 	// 检查用户状态
@@ -1461,6 +1475,16 @@ func (s *AuthService) refreshToken(
 	if user.PasswordChangedAt != nil && !tokenRecord.CreatedAt.After(*user.PasswordChangedAt) {
 		_ = s.tokenRepo.RevokeSession(ctx, tokenRecord.UserID, sessionID)
 		return nil, ErrInvalidToken
+	}
+
+	// All fallible reads happen before a new refresh authority is committed.
+	// After rotation succeeds, response construction is in-memory only.
+	if s.profileRepo == nil {
+		return nil, errors.New("authentication profile repository is unavailable")
+	}
+	profile, profileErr := s.profileRepo.GetByUserID(ctx, user.ID)
+	if profileErr != nil && !errors.Is(profileErr, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("failed to load authentication profile: %w", profileErr)
 	}
 
 	// Persist the high-precision rotation time so a session created in the
@@ -1510,11 +1534,13 @@ func (s *AuthService) refreshToken(
 		if err != nil {
 			return nil, err
 		}
-		if err := s.tokenRepo.RotateRefreshToken(
+		if err := s.tokenRepo.RotateRefreshTokenAndRefreshSession(
 			ctx,
 			req.RefreshToken,
 			replacement,
 			issuedAt,
+			ipAddress,
+			userAgent,
 		); err != nil {
 			if allowConcurrentReplay && errors.Is(err, ErrInvalidToken) && ctx.Err() == nil {
 				// Another request may have won the conditional rotation. Reload
@@ -1523,23 +1549,6 @@ func (s *AuthService) refreshToken(
 			}
 			return nil, fmt.Errorf("failed to rotate refresh token: %w", err)
 		}
-	}
-
-	if s.loginHistoryRepo != nil && sessionID != "" {
-		if err := s.loginHistoryRepo.RefreshSession(ctx, user.ID, sessionID, ipAddress, userAgent, time.Now()); err != nil {
-			return nil, fmt.Errorf("failed to persist refresh session audit: %w", err)
-		}
-	} else {
-		return nil, errors.New("login session repository is unavailable")
-	}
-
-	// 获取用户资料
-	if s.profileRepo == nil {
-		return nil, errors.New("authentication profile repository is unavailable")
-	}
-	profile, profileErr := s.profileRepo.GetByUserID(ctx, user.ID)
-	if profileErr != nil && !errors.Is(profileErr, gorm.ErrRecordNotFound) {
-		return nil, fmt.Errorf("failed to load authentication profile: %w", profileErr)
 	}
 
 	return &AuthResponse{

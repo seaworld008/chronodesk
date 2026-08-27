@@ -128,7 +128,11 @@ func TestOTPRequiredLoginPersistsAuditWithoutChangingResponse(t *testing.T) {
 			RequireEmailVerification: false,
 		},
 	}
-	handler := NewAuthHandler(service, nil)
+	handler := NewAuthHandler(
+		service,
+		nil,
+		WithAllowedBrowserOrigin(testBrowserOrigin),
+	)
 	router := gin.New()
 	router.POST("/api/auth/login", func(c *gin.Context) {
 		handler.Login(NewGinHTTPContext(c))
@@ -147,6 +151,7 @@ func TestOTPRequiredLoginPersistsAuditWithoutChangingResponse(t *testing.T) {
 		bytes.NewReader(requestBody),
 	)
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", testBrowserOrigin)
 	request.Header.Set("User-Agent", "ChronoDesk-OTP-Audit-Test")
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
