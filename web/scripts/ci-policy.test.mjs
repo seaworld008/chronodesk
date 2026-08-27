@@ -60,6 +60,7 @@ const apiError = () =>
   })
 
 const runPolicy = async ({
+  action = 'opened',
   actor = 'maintainer',
   eventName = 'pull_request_target',
   failApi,
@@ -75,6 +76,7 @@ const runPolicy = async ({
     permissions: [],
     pullReads: [],
     fileReads: [],
+    notices: [],
     statuses: [],
   }
   const failures = []
@@ -140,6 +142,7 @@ const runPolicy = async ({
       eventName === 'workflow_dispatch'
         ? { inputs }
         : {
+            action,
             pull_request: {
               number: pull.number,
               head: structuredClone(pull.head),
@@ -154,6 +157,7 @@ const runPolicy = async ({
     serverUrl: 'https://github.com',
   }
   const core = {
+    notice: (message) => calls.notices.push(message),
     setFailed: (message) => failures.push(message),
   }
 
@@ -356,6 +360,7 @@ test('Dependabot pull_request_target 默认写 failure', async () => {
 const dependabotDispatch = ({
   actor = 'release-maintainer',
   expectedHeadSha = SHA_A,
+  files = [{ filename: '.github/workflows/smoke.yml' }],
   headRef = 'dependabot/github_actions/actions/checkout-7',
   headRepo = REPOSITORY,
   permissions = { 'release-maintainer': 'write' },
@@ -366,18 +371,19 @@ const dependabotDispatch = ({
   const pull = createPull({
     author: userLogin,
     authorType: userType,
+    changedFiles: files.length,
     headRef,
     headRepo,
   })
   return runPolicy({
     actor,
     eventName: 'workflow_dispatch',
-    files: [{ filename: '.github/workflows/smoke.yml' }],
+    files,
     inputs: {
       approve_dependabot_update: true,
       expected_head_sha: expectedHeadSha,
       pull_request: pull.number,
-      reason: '批准固定版本的 GitHub Actions 更新',
+      reason: '批准固定版本的 Dependabot 依赖更新',
     },
     permissions,
     pull,
@@ -385,11 +391,61 @@ const dependabotDispatch = ({
   })
 }
 
-test('仓库写入者可批准当前 Dependabot Actions 精确 SHA', async () => {
-  const result = await dependabotDispatch()
+test('Dependabot 元数据编辑不覆盖当前 head 的精确 SHA 判定', async () => {
+  const approved = await dependabotDispatch()
+  assertStatus(approved, 'success')
 
-  assertStatus(result, 'success')
-  assert.deepEqual(result.calls.permissions, ['release-maintainer'])
+  const pull = createPull({
+    author: 'dependabot[bot]',
+    authorType: 'Bot',
+    headRef: 'dependabot/github_actions/actions/checkout-7',
+  })
+  const edited = await runPolicy({
+    action: 'edited',
+    files: [{ filename: '.github/workflows/smoke.yml' }],
+    pull,
+    pullSnapshots: [pull],
+    sender: 'dependabot[bot]',
+  })
+
+  assert.equal(edited.calls.statuses.length, 0)
+  assert.equal(edited.failures.length, 0)
+  assert.equal(edited.calls.notices.length, 1)
+  assert.match(edited.calls.notices[0], /不覆盖/u)
+})
+
+test('仓库写入者可批准已配置生态的当前 Dependabot 精确 SHA', async (t) => {
+  const ecosystems = [
+    {
+      files: [{ filename: '.github/workflows/smoke.yml' }],
+      headRef: 'dependabot/github_actions/actions/checkout-7',
+      name: 'GitHub Actions',
+    },
+    {
+      files: [
+        { filename: 'server/go.mod' },
+        { filename: 'server/go.sum' },
+      ],
+      headRef: 'dependabot/go_modules/go-dependencies-2026-08-27',
+      name: 'Go modules',
+    },
+    {
+      files: [
+        { filename: 'web/package.json' },
+        { filename: 'web/package-lock.json' },
+      ],
+      headRef: 'dependabot/npm_and_yarn/web-dependencies-2026-08-27',
+      name: 'npm',
+    },
+  ]
+
+  for (const { files, headRef, name } of ecosystems) {
+    await t.test(name, async () => {
+      const result = await dependabotDispatch({ files, headRef })
+      assertStatus(result, 'success')
+      assert.deepEqual(result.calls.permissions, ['release-maintainer'])
+    })
+  }
 })
 
 test('Dependabot 人工批准对错误 SHA 和无权限 actor 失败关闭', async (t) => {
@@ -411,7 +467,7 @@ test('Dependabot 人工批准对错误 SHA 和无权限 actor 失败关闭', asy
   })
 })
 
-test('Dependabot 身份、同仓库和 head ref 前缀任一不匹配都失败关闭', async (t) => {
+test('Dependabot 身份、同仓库和已配置生态任一不匹配都失败关闭', async (t) => {
   const invalidCases = [
     {
       name: '伪装身份',
@@ -422,9 +478,9 @@ test('Dependabot 身份、同仓库和 head ref 前缀任一不匹配都失败�
       options: { headRepo: 'external-fork/chronodesk' },
     },
     {
-      name: '错误 ecosystem',
+      name: '未配置 ecosystem',
       options: {
-        headRef: 'dependabot/npm_and_yarn/web/react-20',
+        headRef: 'dependabot/pip/server/pytest-10',
       },
     },
   ]
@@ -434,6 +490,51 @@ test('Dependabot 身份、同仓库和 head ref 前缀任一不匹配都失败�
       const result = await dependabotDispatch(options)
       assert.equal(result.calls.statuses.length, 0)
       assert.equal(result.failures.length, 1)
+    })
+  }
+})
+
+test('Dependabot 生态与文件路径不匹配或包含越界文件时失败关闭', async (t) => {
+  const invalidCases = [
+    {
+      name: 'Go ref 修改 npm 清单',
+      options: {
+        files: [{ filename: 'web/package.json' }],
+        headRef: 'dependabot/go_modules/go-dependencies-2026-08-27',
+      },
+    },
+    {
+      name: 'npm ref 修改 Go 清单',
+      options: {
+        files: [{ filename: 'server/go.mod' }],
+        headRef: 'dependabot/npm_and_yarn/web-dependencies-2026-08-27',
+      },
+    },
+    {
+      name: 'Actions ref 修改 Go 清单',
+      options: {
+        files: [{ filename: 'server/go.sum' }],
+        headRef: 'dependabot/github_actions/actions/checkout-7',
+      },
+    },
+    {
+      name: '允许文件混入越界文档',
+      options: {
+        files: [
+          { filename: 'web/package-lock.json' },
+          { filename: 'docs/README.md' },
+        ],
+        headRef: 'dependabot/npm_and_yarn/web-dependencies-2026-08-27',
+      },
+    },
+  ]
+
+  for (const { name, options } of invalidCases) {
+    await t.test(name, async () => {
+      const result = await dependabotDispatch(options)
+      assert.equal(result.calls.statuses.length, 0)
+      assert.equal(result.failures.length, 1)
+      assert.match(result.failures[0], /范围外/u)
     })
   }
 })

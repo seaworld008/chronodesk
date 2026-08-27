@@ -198,9 +198,24 @@ test('可信 CI policy 分离普通判定与 Dependabot 精确 SHA 批准', asyn
     script,
     /pull\.user\?\.login === 'dependabot\[bot\]'/u,
   )
+  for (const headPrefix of [
+    'dependabot/github_actions/',
+    'dependabot/go_modules/',
+    'dependabot/npm_and_yarn/',
+  ]) {
+    assert.ok(script.includes(headPrefix), headPrefix)
+  }
+  for (const allowedPath of [
+    'server/go.mod',
+    'server/go.sum',
+    'web/package.json',
+    'web/package-lock.json',
+  ]) {
+    assert.ok(script.includes(allowedPath), allowedPath)
+  }
   assert.match(
     script,
-    /dependabot\/github_actions\//u,
+    /context\.payload\.action === 'edited'/u,
   )
   assert.match(
     script,

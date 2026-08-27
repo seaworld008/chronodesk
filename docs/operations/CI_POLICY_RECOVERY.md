@@ -28,7 +28,7 @@ gh api "repos/$repo/commits/$head_sha/status" \
 ```
 
 从 `target_url` 打开对应运行并确认事件类型。可信自动判定只能来自
-`pull_request_target`；Dependabot GitHub Actions 人工批准只能来自
+`pull_request_target`；已配置生态的 Dependabot 人工批准只能来自
 `workflow_dispatch`。出现 `workflow_run`、未知 workflow 或 SHA 不一致时，将其
 视为不可接受证据。
 
@@ -51,8 +51,8 @@ gh api "repos/$repo/commits/$head_sha/status" \
 gh run rerun <run-id> --repo "$repo" --failed
 ```
 
-不要通过普通 `workflow_dispatch` 重评任意 PR；该入口只批准 Dependabot GitHub
-Actions 精确 SHA。
+不要通过普通 `workflow_dispatch` 重评任意 PR；该入口只批准已配置 Go、npm 或
+GitHub Actions Dependabot PR 的精确 SHA。
 
 ### head 在判定期间更新
 
@@ -64,20 +64,23 @@ policy 会拒绝在竞态期间写状态。等待 `synchronize` 为新 head 启�
 GitHub Pull Request Files API 最多可可靠枚举 3000 个文件。计数不一致、无效计数
 或超过上限时必须拆分 PR；不得添加白名单、忽略剩余文件或手工补成功状态。
 
-### Dependabot GitHub Actions
+### Dependabot 依赖更新
 
-机器人 PR 默认失败。只有当前仓库写入者可按
-[CI 流水线文档](../testing/CI_PIPELINE.md#dependabot-github-actions-批准)批准本仓库
-`dependabot/github_actions/` PR 的当前精确 SHA。批准前至少检查：
+机器人的创建、重新打开、就绪和 head 更新事件默认失败。只有当前仓库写入者可按
+[CI 流水线文档](../testing/CI_PIPELINE.md#dependabot-依赖更新批准)批准本仓库已配置
+Go、npm 或 GitHub Actions Dependabot PR 的当前精确 SHA。批准前至少检查：
 
 1. PR 作者确为 `dependabot[bot]`，head 仓库为本仓库；
-2. 所有变更都位于 `.github/workflows/` 或 `.github/actions/`；
-3. Action 固定到已审阅的不可变提交，权限没有扩大；
+2. head ref 是 `dependabot/go_modules/`、`dependabot/npm_and_yarn/` 或
+   `dependabot/github_actions/`；
+3. 文件分别只位于 `server/go.mod` 或 `server/go.sum`、`web/package.json` 或
+   `web/package-lock.json`、`.github/workflows/` 或 `.github/actions/`，且与
+   head ref 的生态匹配；
 4. 输入 SHA 等于刚从 GitHub API 读取的 `headRefOid`；
 5. 原因可供后续审计，且不包含凭据或其他敏感信息。
 
 错误批准运行不会给当前 head 写 success。Dependabot 更新 head 后必须重新审阅并
-以新 SHA 批准。
+以新 SHA 批准；只编辑标题或正文不会覆盖当前 head 已有的精确 SHA 判定。
 
 ## policy 自身损坏时的最小恢复
 
@@ -116,10 +119,11 @@ gh api "repos/$repo/branches/main/protection"
 1. 外部 fork 只修改普通文档：`ci-policy` success；
 2. 外部 fork 修改受保护控制面：failure；
 3. 本仓库作者与 sender 都有写权限并修改控制面：success；
-4. Dependabot GitHub Actions 新 head：默认 failure；
+4. Go、npm 和 GitHub Actions Dependabot 新 head：默认 failure；
 5. 错误 SHA 或无权限 actor 的人工批准：运行失败且不产生 success；
-6. 正确 SHA 的人工批准：只给该 SHA success；
-7. Dependabot 再次更新 head：新 SHA 默认 failure，旧批准不继承；
-8. 直接推送、force push 与删除 `main` 继续被分支保护拒绝。
+6. 生态与文件路径错配或包含越界文件：运行失败且不产生 success；
+7. 正确 SHA 的人工批准：只给该 SHA success，标题或正文编辑不覆盖；
+8. Dependabot 再次更新 head：新 SHA 默认 failure，旧批准不继承；
+9. 直接推送、force push 与删除 `main` 继续被分支保护拒绝。
 
 完成 canary 后删除一次性分支；保留运行 URL、SHA 与 API 回读作为验收证据。

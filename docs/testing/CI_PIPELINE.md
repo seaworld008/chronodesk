@@ -46,17 +46,19 @@ checks，要求 PR 基于最新目标分支后重新通过门禁。因此 squash
   关闭。
 - 每次判定开始时固定 PR head SHA，写 status 前重新读取 PR。SHA 在评估期间发生
   变化时不向旧 SHA 或新 SHA 写入结果，等待 `synchronize` 对新 head 重新判定。
-- 所有机器人 PR 默认写 `ci-policy: failure`。唯一人工例外是同仓库
-  `dependabot/github_actions/` PR：仓库写入者通过 `workflow_dispatch` 提交 PR
-  编号、当前 40 位小写 head SHA、显式批准布尔值与原因。流程会再次验证 actor
-  权限、Dependabot 身份、同仓库、head ref、完整文件清单和 SHA；成功只写给输入的
-  精确 SHA。PR 更新后旧批准不会继承，新 head 会恢复为默认 failure。
+- 机器人 PR 的创建、重新打开、就绪和 head 更新事件默认写
+  `ci-policy: failure`。同仓库且来自已配置 `github-actions`、`gomod` 或 `npm`
+  生态的 Dependabot PR 可由仓库写入者通过 `workflow_dispatch` 提交 PR 编号、当前
+  40 位小写 head SHA、显式批准布尔值与原因。流程会再次验证 actor 权限、
+  Dependabot 身份、同仓库、生态对应的完整文件清单和 SHA；成功只写给输入的精确
+  SHA。标题或正文编辑不会覆盖这个 head 绑定的结果；PR 更新后旧批准不会继承，新
+  head 会恢复为默认 failure。
 
 Playwright 在 CI、本地、共享和远端环境均使用单 worker，`fullyParallel` 固定为
 `false`，避免长链路导航、视觉截图、全局配置与账号会话在并发负载下产生假阴性。
 测试数据仍通过进程 ID 和本轮 run ID 隔离。
 
-## Dependabot GitHub Actions 批准
+## Dependabot 依赖更新批准
 
 先从 GitHub 读取当前 SHA，不得使用通知邮件、旧日志或本地分支记录中的 SHA：
 
@@ -73,7 +75,7 @@ gh workflow run ci-policy.yml --repo "$repo" --ref main \
   -f pull_request="$pr" \
   -f expected_head_sha="$head_sha" \
   -f approve_dependabot_update=true \
-  -f reason='已审阅固定 Action 版本、上游发布说明与权限差异'
+  -f reason='已审阅固定依赖版本、上游发布说明与变更文件'
 ```
 
 批准运行成功后必须回读精确提交状态，并确认 `ci-policy` 的最新状态来自该运行：
@@ -85,8 +87,16 @@ gh api "repos/$repo/commits/$head_sha/status" \
     [.state, .sha, .target_url] | @tsv'
 ```
 
-错误 SHA、非 GitHub Actions ecosystem、fork、非 Dependabot 身份或无写权限 actor
-不得通过。不要用 GitHub API 手工伪造 commit status。异常与受控恢复步骤见
+批准范围严格绑定 Dependabot head ref 与文件路径：
+
+- `dependabot/github_actions/` 只能修改 `.github/workflows/` 或
+  `.github/actions/`；
+- `dependabot/go_modules/` 只能修改 `server/go.mod` 或 `server/go.sum`；
+- `dependabot/npm_and_yarn/` 只能修改 `web/package.json` 或
+  `web/package-lock.json`。
+
+错误 SHA、未配置或错配的 ecosystem、越界文件、fork、非 Dependabot 身份或无写
+权限 actor 不得通过。不要用 GitHub API 手工伪造 commit status。异常与受控恢复步骤见
 [CI policy 安全恢复](../operations/CI_POLICY_RECOVERY.md)。
 
 ## 变更验证
@@ -122,5 +132,5 @@ npx playwright test --workers=1
 3. 分支保护 API 与仓库声明一致；
 4. 直接推送、force push 与删除 `main` 均被拒绝。
 5. `ci-policy` live canary 覆盖外部普通文件成功、外部控制面失败、同仓库双写权限
-   成功、Dependabot 默认失败、错误 SHA 批准失败，以及正确 SHA 批准成功后更新
-   head 再次失败。
+   成功、三类 Dependabot 默认失败、错误 SHA 和越界文件批准失败、正确 SHA 批准
+   成功、元数据编辑不覆盖，以及更新 head 后再次失败。

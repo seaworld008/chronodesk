@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       pull_request:
-        description: 要批准的 Dependabot GitHub Actions 开放 PR 编号
+        description: 要批准的 Dependabot Go、npm 或 GitHub Actions 开放 PR 编号
         required: true
         type: number
       expected_head_sha:
@@ -79,6 +79,29 @@ jobs:
               'pyproject.toml',
               'yarn.lock',
             ]);
+            const dependabotEcosystemPolicies = [
+              {
+                headPrefix: 'dependabot/github_actions/',
+                label: 'GitHub Actions',
+                permits: (pathname) =>
+                  pathname.startsWith('.github/workflows/') ||
+                  pathname.startsWith('.github/actions/'),
+              },
+              {
+                headPrefix: 'dependabot/go_modules/',
+                label: 'Go modules',
+                permits: (pathname) =>
+                  pathname === 'server/go.mod' ||
+                  pathname === 'server/go.sum',
+              },
+              {
+                headPrefix: 'dependabot/npm_and_yarn/',
+                label: 'npm',
+                permits: (pathname) =>
+                  pathname === 'web/package.json' ||
+                  pathname === 'web/package-lock.json',
+              },
+            ];
 
             class PolicyFailure extends Error {}
 
@@ -295,6 +318,12 @@ jobs:
                 (typeof authorLogin === 'string' &&
                   authorLogin.endsWith('[bot]'));
               if (isBot) {
+                if (context.payload.action === 'edited') {
+                  core.notice(
+                    '机器人 PR 的元数据编辑不覆盖当前 head 已有判定。',
+                  );
+                  return;
+                }
                 await publishStatus(
                   pull,
                   false,
@@ -369,15 +398,18 @@ jobs:
 
               const pull = await readPull(pullNumber);
               requireOpenMainPull(pull);
+              const ecosystemPolicy =
+                dependabotEcosystemPolicies.find(
+                  ({ headPrefix }) =>
+                    typeof pull.head?.ref === 'string' &&
+                    pull.head.ref.startsWith(headPrefix),
+                );
               requirePolicy(
                 pull.user?.login === 'dependabot[bot]' &&
                   pull.user?.type === 'Bot' &&
                   sameRepository(pull.head?.repo?.full_name) &&
-                  typeof pull.head?.ref === 'string' &&
-                  pull.head.ref.startsWith(
-                    'dependabot/github_actions/',
-                  ),
-                '仅允许批准本仓库 Dependabot GitHub Actions PR。',
+                  ecosystemPolicy !== undefined,
+                '仅允许批准本仓库已配置的 Dependabot Go、npm 或 GitHub Actions PR。',
               );
               requirePolicy(
                 pull.head.sha === expectedHeadSha,
@@ -388,12 +420,10 @@ jobs:
               const paths = changedPaths(files);
               requirePolicy(
                 paths.length > 0 &&
-                  paths.every(
-                    (pathname) =>
-                      pathname.startsWith('.github/workflows/') ||
-                      pathname.startsWith('.github/actions/'),
+                  paths.every((pathname) =>
+                    ecosystemPolicy.permits(pathname),
                   ),
-                'Dependabot GitHub Actions PR 只能修改 Actions 控制面文件。',
+                `Dependabot ${ecosystemPolicy.label} PR 包含生态范围外的文件。`,
               );
 
               const stablePull = await requireStableHead(pull, {
@@ -414,7 +444,7 @@ jobs:
                 sha: expectedHeadSha,
                 state: 'success',
                 context: 'ci-policy',
-                description: 'Dependabot Actions 精确 SHA 已由写入者批准',
+                description: `Dependabot ${ecosystemPolicy.label} 精确 SHA 已由写入者批准`,
                 target_url: targetUrl,
               });
             };
