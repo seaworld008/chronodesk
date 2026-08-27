@@ -277,6 +277,26 @@ const readActiveProjectRecord = (): ActiveProjectRecord | null => {
     }
 }
 
+export type StoredProjectSelectionBinding = Readonly<
+    Pick<HumanSessionBinding, 'subject' | 'session_id'>
+>
+
+export const captureStoredProjectSelectionBinding =
+    (): StoredProjectSelectionBinding | null => {
+        const stored = readActiveProjectRecord()
+        return stored === null
+            ? null
+            : Object.freeze({
+                  subject: stored.subject,
+                  session_id: stored.session_id,
+              })
+    }
+
+export const storedProjectSelectionBindingMatchesHumanSession = (
+    stored: StoredProjectSelectionBinding | null,
+    binding: Pick<HumanSessionBinding, 'subject' | 'session_id'>,
+): boolean => stored !== null && sameBinding(binding, stored)
+
 const parseAuthorizedProject = (value: unknown): AuthorizedProject | null => {
     if (!isRecord(value)) return null
     const project = value.project
@@ -396,7 +416,6 @@ export const loadAuthorizedProjects = async (
     const binding = readHumanSessionBinding()
     if (!binding) {
         resetAuthorizedProjectCache()
-        clearStoredProjectSelection()
         localStorage.removeItem(legacyActiveProjectStorageKey)
         throw new HttpError('登录会话无效，请重新登录', 401, {
             code: 'invalid_human_session',
@@ -527,7 +546,13 @@ export const activeProjectKey = (): string | undefined => {
     localStorage.removeItem(legacyActiveProjectStorageKey)
     const binding = readHumanSessionBinding()
     const stored = readActiveProjectRecord()
-    if (!binding || !stored || !sameBinding(binding, stored)) {
+    // A reload intentionally starts without an in-memory bearer while the
+    // HttpOnly cookie refresh is pending. Deny project access for now, but let
+    // the refresh commit decide whether this bound selection is still valid.
+    if (!binding) {
+        return undefined
+    }
+    if (!stored || !sameBinding(binding, stored)) {
         clearStoredProjectSelection()
         return undefined
     }
@@ -537,7 +562,12 @@ export const activeProjectKey = (): string | undefined => {
 export const captureProjectScopeSnapshot = (): ProjectScopeSnapshot => {
     const binding = readHumanSessionBinding()
     const stored = readActiveProjectRecord()
-    if (!binding || !stored || !sameBinding(binding, stored)) {
+    if (!binding) {
+        throw new HttpError('项目范围已变化，请刷新页面后重试', 409, {
+            code: 'project_scope_changed',
+        })
+    }
+    if (!stored || !sameBinding(binding, stored)) {
         clearStoredProjectSelection()
         throw new HttpError('项目范围已变化，请刷新页面后重试', 409, {
             code: 'project_scope_changed',

@@ -3,6 +3,7 @@ import {
     authorizedProjectAccess,
     defaultMockIdentity,
     fulfillJSON,
+    fulfillMockSessionRefresh,
     installMockSession,
     mockSessionToken,
     projectA,
@@ -1083,6 +1084,285 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
         ),
     ).toBe('1')
 })
+
+const reloadProjectSelectionScenarios = [
+    {
+        name: '同一 subject 和 session ID 时保留项目选择',
+        refreshedIdentity: {
+            ...defaultMockIdentity,
+            sessionID: 'e2e-reload-project-same-session',
+            email: 'reload-project-same-session@example.test',
+        },
+        storedSelection: 'valid',
+        shouldPreserve: true,
+    },
+    {
+        name: 'session ID 变化时清除项目选择',
+        refreshedIdentity: {
+            ...defaultMockIdentity,
+            sessionID: 'e2e-reload-project-replaced-session',
+            email: 'reload-project-replaced-session@example.test',
+        },
+        storedSelection: 'valid',
+        shouldPreserve: false,
+    },
+    {
+        name: 'subject 变化时清除项目选择',
+        refreshedIdentity: {
+            ...defaultMockIdentity,
+            id: defaultMockIdentity.id + 1,
+            sessionID: 'e2e-reload-project-other-subject',
+            email: 'reload-project-other-subject@example.test',
+        },
+        storedSelection: 'valid',
+        shouldPreserve: false,
+    },
+    {
+        name: '项目绑定记录畸形时清除项目选择',
+        refreshedIdentity: {
+            ...defaultMockIdentity,
+            sessionID: 'e2e-reload-project-malformed-selection',
+            email: 'reload-project-malformed-selection@example.test',
+        },
+        storedSelection: 'malformed',
+        shouldPreserve: false,
+    },
+] as const
+
+for (const scenario of reloadProjectSelectionScenarios) {
+    test(`页面 reload 后 cookie refresh ${scenario.name}`, async ({ page }) => {
+        const originalIdentity = {
+            ...scenario.refreshedIdentity,
+            id: defaultMockIdentity.id,
+            sessionID:
+                scenario.name === 'session ID 变化时清除项目选择'
+                    ? 'e2e-reload-project-original-session'
+                    : scenario.refreshedIdentity.sessionID,
+            email: 'reload-project-original@example.test',
+        }
+        const access = authorizedProjectAccess(projectA, 'requester')
+        await installMockSession(page, originalIdentity, projectA)
+        let refreshRequests = 0
+
+        await page.route('**/api/**', async (route) => {
+            const request = route.request()
+            const pathname = new URL(request.url()).pathname
+            if (
+                pathname === '/api/auth/refresh' &&
+                request.method() === 'POST'
+            ) {
+                refreshRequests += 1
+                await fulfillMockSessionRefresh(
+                    route,
+                    scenario.refreshedIdentity,
+                )
+                return
+            }
+            if (pathname === '/api/projects') {
+                await fulfillJSON(route, { code: 0, data: [access] })
+                return
+            }
+            if (pathname === `/api/projects/${projectA.key}/context`) {
+                await fulfillJSON(route, { code: 0, data: access })
+                return
+            }
+            await fulfillJSON(route, { code: 0, data: [] })
+        })
+
+        await page.goto('/#/')
+        await expect(page.getByTestId('active-project-switcher')).toBeVisible()
+        expect(refreshRequests).toBe(0)
+        if (scenario.storedSelection === 'malformed') {
+            await page.evaluate(() => {
+                sessionStorage.setItem(
+                    'chronodesk.activeProject',
+                    JSON.stringify({
+                        subject: String(42),
+                        project_key: 'OPS',
+                        epoch: 1,
+                    }),
+                )
+            })
+        }
+        await page.reload()
+        await expect.poll(() => refreshRequests).toBe(1)
+
+        if (scenario.shouldPreserve) {
+            await expect(
+                page.getByTestId('active-project-switcher'),
+            ).toBeVisible()
+            await expect
+                .poll(() =>
+                    page.evaluate(() => {
+                        const serialized = sessionStorage.getItem(
+                            'chronodesk.activeProject',
+                        )
+                        return serialized
+                            ? JSON.parse(serialized).project_key
+                            : null
+                    }),
+                )
+                .toBe(projectA.key)
+            return
+        }
+
+        await expect(
+            page.getByTestId('active-project-selection-required'),
+        ).toBeVisible()
+        await expect
+            .poll(() =>
+                page.evaluate(() =>
+                    sessionStorage.getItem('chronodesk.activeProject'),
+                ),
+            )
+            .toBeNull()
+    })
+}
+
+const reloadRefreshFailureScenarios = [
+    {
+        name: '401',
+        outcome: 'unauthorized',
+        shouldClearSelection: true,
+    },
+    {
+        name: '无效成功响应',
+        outcome: 'invalid',
+        shouldClearSelection: true,
+    },
+    {
+        name: '网络瞬态失败',
+        outcome: 'transient',
+        shouldClearSelection: false,
+    },
+] as const
+
+for (const scenario of reloadRefreshFailureScenarios) {
+    test(`页面 reload 后 cookie refresh ${scenario.name} 不授予项目访问`, async ({
+        page,
+    }) => {
+        const identity = {
+            ...defaultMockIdentity,
+            sessionID: `e2e-reload-refresh-${scenario.outcome}`,
+            email: `reload-refresh-${scenario.outcome}@example.test`,
+        }
+        const access = authorizedProjectAccess(projectA, 'requester')
+        await installMockSession(page, identity, projectA)
+        let refreshRequests = 0
+
+        await page.route('**/api/**', async (route) => {
+            const request = route.request()
+            const pathname = new URL(request.url()).pathname
+            if (
+                pathname === '/api/auth/refresh' &&
+                request.method() === 'POST'
+            ) {
+                refreshRequests += 1
+                if (scenario.outcome === 'unauthorized') {
+                    await fulfillJSON(
+                        route,
+                        { code: 'unauthorized', message: '无有效会话' },
+                        401,
+                    )
+                    return
+                }
+                if (scenario.outcome === 'invalid') {
+                    await fulfillJSON(route, {
+                        success: true,
+                        message: '登录令牌刷新成功',
+                        data: {
+                            user: {
+                                id: identity.id,
+                                username: `e2e-${identity.id}`,
+                                email: identity.email,
+                                platform_role: identity.platformRole,
+                                status: 'active',
+                                email_verified: true,
+                                otp_enabled: false,
+                                last_login_at: null,
+                            },
+                            access_token: 'invalid-session-token',
+                            expires_in: 3600,
+                            token_type: 'Bearer',
+                        },
+                    })
+                    return
+                }
+                await fulfillJSON(
+                    route,
+                    {
+                        code: 'temporarily_unavailable',
+                        message: '刷新服务暂时不可用',
+                    },
+                    503,
+                )
+                return
+            }
+            if (pathname === '/api/projects') {
+                await fulfillJSON(route, { code: 0, data: [access] })
+                return
+            }
+            if (pathname === `/api/projects/${projectA.key}/context`) {
+                await fulfillJSON(route, { code: 0, data: access })
+                return
+            }
+            await fulfillJSON(route, { code: 0, data: [] })
+        })
+
+        await page.goto('/#/')
+        await expect(page.getByTestId('active-project-switcher')).toBeVisible()
+        expect(refreshRequests).toBe(0)
+
+        await page.evaluate(() => {
+            window.location.hash = '#/login'
+        })
+        await page.reload()
+        await expect(page).toHaveURL(/\/#\/login$/u)
+        expect(refreshRequests).toBe(0)
+        const refreshError = await page.evaluate(async (modulePath) => {
+            const auth = await import(
+                /* @vite-ignore */ modulePath
+            ) as {
+                bootstrapHumanSession: () => Promise<void>
+            }
+            try {
+                await auth.bootstrapHumanSession()
+                return null
+            } catch (error) {
+                return error instanceof Error ? error.message : String(error)
+            }
+        }, '/src/lib/authProvider.ts')
+        await expect.poll(() => refreshRequests).toBe(1)
+        expect(refreshError).not.toBeNull()
+        await expect(page.getByTestId('active-project-switcher')).toHaveCount(0)
+
+        const readableProjectKey = await page.evaluate(async (modulePath) => {
+            const projectScope = await import(
+                /* @vite-ignore */ modulePath
+            ) as {
+                activeProjectKey: () => string | undefined
+            }
+            return projectScope.activeProjectKey() ?? null
+        }, '/src/lib/projectScope.ts')
+        expect(readableProjectKey).toBeNull()
+
+        const storedProjectKey = await page.evaluate(() => {
+            const serialized = sessionStorage.getItem(
+                'chronodesk.activeProject',
+            )
+            if (!serialized) return null
+            const parsed = JSON.parse(serialized) as {
+                project_key?: unknown
+            }
+            return typeof parsed.project_key === 'string'
+                ? parsed.project_key
+                : null
+        })
+        expect(storedProjectKey).toBe(
+            scenario.shouldClearSelection ? null : projectA.key,
+        )
+    })
+}
 
 test('当前退出和全设备退出失败时保留已提交会话', async ({ page }) => {
     const identity = {

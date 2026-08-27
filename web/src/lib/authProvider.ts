@@ -19,11 +19,13 @@ import {
     type AccessPermissions,
 } from './accessControl'
 import {
+    captureStoredProjectSelectionBinding,
     clearProjectScopeCache,
     hasProjectCapability,
     parseProjectRole,
     readHumanSessionBinding,
     resolveActiveProjectAccess,
+    storedProjectSelectionBindingMatchesHumanSession,
 } from './projectScope'
 import {
     authenticationStorageKeys,
@@ -409,8 +411,14 @@ export const consumeRegistrationResult = (
 
 let refreshSessionRequest: Promise<void> | null = null
 
-const performSessionRefresh = (): Promise<void> =>
-    withHumanSessionLifecycleLock(async () => {
+const performSessionRefresh = (): Promise<void> => {
+    // Capture the tab-local project binding before waiting for the cross-tab
+    // lifecycle lock. Auth-gated UI may render while the refresh is queued,
+    // but only the validated refresh response may decide whether it is safe
+    // to retain this selection.
+    const previousProjectBinding =
+        captureStoredProjectSelectionBinding()
+    return withHumanSessionLifecycleLock(async () => {
         const previousBinding = readHumanSessionBinding()
 
         const response = await safeFetch(
@@ -454,8 +462,16 @@ const performSessionRefresh = (): Promise<void> =>
             clearAuthenticationState({ notifyPeers: false })
             throw new Error('登录状态刷新响应无效，请重新登录')
         }
-        storeAuthSession(session, previousBinding !== null)
+        storeAuthSession(
+            session,
+            previousBinding !== null ||
+                storedProjectSelectionBindingMatchesHumanSession(
+                    previousProjectBinding,
+                    nextBinding,
+                ),
+        )
     })
+}
 
 const refreshStoredSession = async (): Promise<void> => {
     if (refreshSessionRequest) return refreshSessionRequest
@@ -727,9 +743,12 @@ export const authProvider: AuthProvider = {
     },
 
     getPermissions: async (): Promise<AccessPermissions> => {
-        const user = readStoredUser()
+        let user = readStoredUser()
         if (!user) {
-            clearAuthenticationState()
+            await refreshStoredSession()
+            user = readStoredUser()
+        }
+        if (!user) {
             throw new Error('登录会话无效，请重新登录')
         }
         try {
