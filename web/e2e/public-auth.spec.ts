@@ -2507,7 +2507,7 @@ test('旧标签退出响应提交后新标签才允许登录', async ({
     expect(replacementProbeAuthorization).toBe(`Bearer ${tokenB}`)
 })
 
-test('三个标签页生命周期锁内 refresh 网络响应保持全局串行', async ({
+test('三个最小标签页 bootstrap refresh 通过生产生命周期锁全局串行', async ({
     context,
     page: firstPage,
 }) => {
@@ -2539,25 +2539,30 @@ test('三个标签页生命周期锁内 refresh 网络响应保持全局串行',
     let inFlight = 0
     let maximumInFlight = 0
 
+    const lifecycleShellPath =
+        '/__e2e__/human-session-lifecycle-lock.html'
+    await context.route(`**${lifecycleShellPath}`, async (route) => {
+        await route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body:
+                '<!doctype html><html><head><meta charset="utf-8">' +
+                '<title>Human session lifecycle lock probe</title>' +
+                '</head><body></body></html>',
+        })
+    })
     await context.route('**/api/**', async (route) => {
         const request = route.request()
         const pathname = new URL(request.url()).pathname
         if (pathname === '/api/auth/refresh') {
-            const isLifecycleLockProbe =
-                request.headers()['x-chronodesk-e2e-refresh-lock-probe'] ===
-                '1'
-            const sequence = isLifecycleLockProbe
-                ? refreshRequests + 1
-                : 0
-            if (isLifecycleLockProbe) {
-                refreshRequests = sequence
-                events.push(`refresh:${sequence}:start`)
-                inFlight += 1
-                maximumInFlight = Math.max(maximumInFlight, inFlight)
-                await new Promise((resolve) => setTimeout(resolve, 100))
-                inFlight -= 1
-                events.push(`refresh:${sequence}:end`)
-            }
+            refreshRequests += 1
+            const sequence = refreshRequests
+            events.push(`refresh:${sequence}:start`)
+            inFlight += 1
+            maximumInFlight = Math.max(maximumInFlight, inFlight)
+            await new Promise((resolve) => setTimeout(resolve, 100))
+            inFlight -= 1
+            events.push(`refresh:${sequence}:end`)
             const expiresAt =
                 Math.floor(Date.now() / 1000) + 7200 + sequence
             await fulfillJSON(route, {
@@ -2591,45 +2596,18 @@ test('三个标签页生命周期锁内 refresh 网络响应保持全局串行',
     })
 
     for (const page of pages) {
-        await page.goto('/#/')
-        await expect(page.getByTestId('account-menu')).toBeVisible()
+        await page.goto(lifecycleShellPath)
     }
-    await expect.poll(() => inFlight).toBe(0)
-    refreshRequests = 0
-    maximumInFlight = 0
-    events.splice(0)
     await Promise.all(
         pages.map((page) =>
             page.evaluate(async (modulePath) => {
-                const lifecycleModule = await import(
+                const authModule = await import(
                     /* @vite-ignore */ modulePath
                 ) as {
-                    withHumanSessionLifecycleLock: <T>(
-                        operation: () => Promise<T>,
-                    ) => Promise<T>
+                    bootstrapHumanSession: () => Promise<void>
                 }
-                await lifecycleModule.withHumanSessionLifecycleLock(
-                    async () => {
-                        const response = await fetch(
-                            '/api/auth/refresh',
-                            {
-                                method: 'POST',
-                                credentials: 'include',
-                                headers: {
-                                    'X-ChronoDesk-E2E-Refresh-Lock-Probe':
-                                        '1',
-                                },
-                            },
-                        )
-                        if (!response.ok) {
-                            throw new Error(
-                                'refresh lifecycle lock probe failed',
-                            )
-                        }
-                        await response.json()
-                    },
-                )
-            }, '/src/lib/humanSessionLifecycle.ts'),
+                await authModule.bootstrapHumanSession()
+            }, '/src/lib/authProvider.ts'),
         ),
     )
 
