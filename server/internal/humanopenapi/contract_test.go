@@ -905,8 +905,21 @@ func TestHumanSessionRequestsMatchStrictRuntimeDTOs(t *testing.T) {
 		if _, hasBody := operation["requestBody"]; hasBody {
 			t.Errorf("%s must not publish a request body", path)
 		}
-		if _, hasParameters := operation["parameters"]; hasParameters {
+		parameters, hasParameters := operation["parameters"].([]any)
+		if path == "/auth/refresh" && hasParameters {
 			t.Errorf("%s must not publish a legacy refresh-token parameter", path)
+		}
+		if path == "/auth/logout" {
+			if !hasParameters || len(parameters) != 1 {
+				t.Fatalf("%s parameters = %v", path, operation["parameters"])
+			}
+			precondition, ok := parameters[0].(map[string]any)
+			if !ok ||
+				precondition["name"] != "X-Chronodesk-Session-ID" ||
+				precondition["in"] != "header" ||
+				precondition["required"] != true {
+				t.Errorf("%s session precondition = %v", path, parameters[0])
+			}
 		}
 		security, ok := operation["security"].([]any)
 		if !ok || len(security) != 1 {
@@ -2259,11 +2272,11 @@ func TestAuthOperationsPublishEveryRuntimeStatus(t *testing.T) {
 		},
 		{
 			path: "/auth/logout",
-			want: []string{"200", "400", "401", "403", "413", "429", "503"},
+			want: []string{"200", "400", "401", "403", "409", "413", "429", "503"},
 		},
 		{
 			path: "/auth/logout-all",
-			want: []string{"200", "401", "429", "500", "503"},
+			want: []string{"200", "401", "409", "429", "500", "503"},
 		},
 		{
 			path: "/auth/profile",

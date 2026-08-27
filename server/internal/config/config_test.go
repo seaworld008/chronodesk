@@ -153,6 +153,19 @@ func TestCORSConfigFromEnv(t *testing.T) {
 	if cfg.CORS.AllowedOrigins[0] != "https://a.com" || cfg.CORS.AllowedOrigins[1] != "https://b.com" {
 		t.Fatalf("unexpected origins: %v", cfg.CORS.AllowedOrigins)
 	}
+	hasSessionPreconditionHeader := false
+	for _, header := range cfg.CORS.AllowedHeaders {
+		if strings.EqualFold(header, "X-Chronodesk-Session-ID") {
+			hasSessionPreconditionHeader = true
+			break
+		}
+	}
+	if !hasSessionPreconditionHeader {
+		t.Fatalf(
+			"default CORS headers omit browser session precondition: %v",
+			cfg.CORS.AllowedHeaders,
+		)
+	}
 }
 
 func TestBrowserSessionSiteContractAcceptsSameSchemefulSite(t *testing.T) {

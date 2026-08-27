@@ -18,6 +18,9 @@ ChronoDesk 浏览器会话采用协调式硬切换。后端与 Web 必须在同�
 - `POST /api/auth/refresh` 和 `POST /api/auth/logout` 必须携带 Cookie 和与
   `WEB_URL` 完全匹配的 `Origin`，且请求体必须为空。`X-Refresh-Token` 和 JSON
   或 query refresh bearer 一律返回 `400`。
+- 当前会话 logout 还必须携带 `X-Chronodesk-Session-ID`，其值来自本标签页
+  access token 的稳定 `sid`。服务端会与 refresh Cookie 的签名 `sid` 比对；
+  新登录已替换共享 Cookie 时，旧标签页请求返回 `409` 且不撤销或清除新会话。
 - refresh 成功才覆盖 Cookie。refresh 失败不写 `Set-Cookie`，避免一个并发失败
   响应清除另一个标签页刚轮换成功的新 Cookie。
 - 当前会话 logout 成功后只清 refresh Cookie；logout-all 的数据库事务成功后才
@@ -38,7 +41,8 @@ Origin 显式列入 `CORS_ALLOWED_ORIGINS`；凭据型 CORS 不接受 `*`。
    读取、存储或广播 refresh bearer。
 2. 确认 `WEB_URL` 是无凭据、无 query/fragment 的绝对 HTTP(S) URL；生产必须为
    HTTPS，且与 `APP_URL` 属于同一 schemeful site。
-3. 确认 `CORS_ALLOWED_ORIGINS` 包含 Web 的精确 Origin，且不包含 `*`。
+3. 确认 `CORS_ALLOWED_ORIGINS` 包含 Web 的精确 Origin，且不包含 `*`；
+   自定义 `CORS_ALLOWED_HEADERS` 时保留 `X-Chronodesk-Session-ID`。
 4. 运行认证包、Human OpenAPI、race 和浏览器多标签页用例。
 5. 发布后检查浏览器存储中没有 bearer，refresh Cookie 对 JavaScript 不可见。
 

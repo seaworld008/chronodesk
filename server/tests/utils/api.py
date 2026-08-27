@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
 import os
 import re
@@ -60,6 +63,7 @@ class APIClient:
             self.bind_project(self.project_key)
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        self._human_session_id: str | None = None
 
     # ------------------------------------------------------------------
     # Core request helper
@@ -296,6 +300,7 @@ class APIClient:
         register_secret(token)
         clone = self.clone()
         clone.session.headers["Authorization"] = f"Bearer {token}"
+        clone._human_session_id = self._access_token_session_id(token)
         return clone
 
     def clone(self, *, include_cookies: bool = True) -> APIClient:
@@ -310,6 +315,7 @@ class APIClient:
         clone.session.headers.update(self.session.headers)
         if include_cookies:
             clone.session.cookies.update(self.session.cookies)
+        clone._human_session_id = self._human_session_id
         return clone
 
     def close(self) -> None:
@@ -332,7 +338,9 @@ class APIClient:
         data = response.json()
         if data.get("code") != 0 or "data" not in data:
             raise APIError("Unexpected login response payload", response=response)
-        return data["data"]
+        result = data["data"]
+        self._remember_human_session(result)
+        return result
 
     def refresh(self) -> dict[str, Any]:
         response = self.request(
@@ -342,7 +350,9 @@ class APIClient:
         )
         if response.status_code != 200:
             raise APIError("Refresh token failed", response=response)
-        return response.json().get("data", {})
+        result = response.json().get("data", {})
+        self._remember_human_session(result)
+        return result
 
     def register_user(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self.post_json("/auth/register", payload)
@@ -352,13 +362,20 @@ class APIClient:
         data = response.json()
         if data.get("code") != 0 or "data" not in data:
             raise APIError("Unexpected registration payload", response=response)
-        return data["data"]
+        result = data["data"]
+        self._remember_human_session(result)
+        return result
 
     def logout(self) -> dict[str, Any]:
+        if self._human_session_id is None:
+            raise APIError("Logout requires a committed human session")
         response = self.request(
             "POST",
             "/auth/logout",
-            headers={"Origin": self.browser_origin},
+            headers={
+                "Origin": self.browser_origin,
+                "X-Chronodesk-Session-ID": self._human_session_id,
+            },
         )
         if response.status_code != 200:
             raise APIError("Logout failed", response=response)
@@ -366,7 +383,40 @@ class APIClient:
         body = response.json()
         if not body.get("success"):
             raise APIError("Unexpected logout response", response=response)
+        self._human_session_id = None
         return body
+
+    def _remember_human_session(self, data: Any) -> None:
+        if not isinstance(data, Mapping):
+            return
+        access_token = data.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            return
+        self._human_session_id = self._access_token_session_id(access_token)
+
+    @staticmethod
+    def _access_token_session_id(token: str) -> str:
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise APIError("Human access token does not contain a stable session")
+        try:
+            encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(
+                base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+            )
+        except (
+            ValueError,
+            UnicodeError,
+            json.JSONDecodeError,
+            binascii.Error,
+        ) as exc:
+            raise APIError(
+                "Human access token does not contain a stable session"
+            ) from exc
+        session_id = payload.get("sid") if isinstance(payload, dict) else None
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+            raise APIError("Human access token does not contain a stable session")
+        return session_id
 
     # ------------------------------------------------------------------
     # Internal helpers

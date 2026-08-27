@@ -75,6 +75,35 @@ test('公开注册页无需会话并提交严格 Human API DTO', async ({ page }
     })
     let submitted: Record<string, unknown> | null = null
     let projectListRequests = 0
+    await page.addInitScript(() => {
+        const tracedWindow = window as Window & {
+            __chronodeskRegistrationCredentials?: Array<
+                RequestCredentials | undefined
+            >
+        }
+        tracedWindow.__chronodeskRegistrationCredentials = []
+        const originalFetch = window.fetch.bind(window)
+        window.fetch = (
+            input: RequestInfo | URL,
+            init?: RequestInit,
+        ): Promise<Response> => {
+            const target =
+                typeof input === 'string'
+                    ? input
+                    : input instanceof URL
+                      ? input.toString()
+                      : input.url
+            if (
+                new URL(target, window.location.origin).pathname ===
+                '/api/auth/register'
+            ) {
+                tracedWindow.__chronodeskRegistrationCredentials?.push(
+                    init?.credentials,
+                )
+            }
+            return originalFetch(input, init)
+        }
+    })
     await page.route('**/api/projects**', async (route) => {
         projectListRequests += 1
         await fulfillJSON(route, { code: 0, data: [] })
@@ -113,6 +142,16 @@ test('公开注册页无需会话并提交严格 Human API DTO', async ({ page }
         confirm_password: 'ExamplePassword123!',
     })
     expect(projectListRequests).toBe(0)
+    expect(
+        await page.evaluate(() => {
+            const tracedWindow = window as Window & {
+                __chronodeskRegistrationCredentials?: Array<
+                    RequestCredentials | undefined
+                >
+            }
+            return tracedWindow.__chronodeskRegistrationCredentials
+        }),
+    ).toEqual(['include'])
     expect(await readAuthenticationStorage(page)).toEqual(
         emptyAuthenticationStorage,
     )
@@ -1043,6 +1082,352 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
             ),
         ),
     ).toBe('1')
+})
+
+test('当前退出和全设备退出失败时保留已提交会话', async ({ page }) => {
+    const identity = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-failed-logout-preserves-session',
+    }
+    const token = await installMockSession(page, identity, projectA)
+    const access = authorizedProjectAccess(projectA, 'requester')
+    const user = {
+        id: identity.id,
+        username: `e2e-${identity.id}`,
+        email: identity.email,
+        platform_role: identity.platformRole,
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+    }
+    let logoutRequests = 0
+    let logoutAllRequests = 0
+    let probeAuthorization = ''
+
+    await page.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        if (pathname === '/api/auth/logout') {
+            logoutRequests += 1
+            await fulfillJSON(
+                route,
+                {
+                    code: 'logout_failed',
+                    message: '退出登录失败，请稍后重试',
+                },
+                503,
+            )
+            return
+        }
+        if (pathname === '/api/auth/logout-all') {
+            logoutAllRequests += 1
+            await fulfillJSON(
+                route,
+                {
+                    code: 'logout_failed',
+                    message: '无法从所有设备退出登录',
+                },
+                503,
+            )
+            return
+        }
+        if (pathname === '/api/e2e/logout-session-probe') {
+            probeAuthorization =
+                request.headers().authorization ?? ''
+            await fulfillJSON(route, { code: 0, data: [] })
+            return
+        }
+        if (pathname === '/api/auth/me') {
+            await fulfillJSON(route, { code: 0, data: user })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (pathname === `/api/projects/${projectA.key}/context`) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    await page.goto('/#/')
+    await expect(page.getByTestId('account-menu')).toBeVisible()
+    await page.getByTestId('account-menu').locator('button').first().click()
+    await page
+        .getByRole('menuitem', { name: '退出登录', exact: true })
+        .click()
+
+    await expect(page).toHaveURL(/\/#\/$/u)
+    await expect(page.getByTestId('account-menu')).toBeVisible()
+    await expect(page.getByText('退出登录失败，请稍后重试')).toBeVisible()
+    expect(logoutRequests).toBe(1)
+
+    await page.getByTestId('account-menu').locator('button').first().click()
+    await page.getByTestId('logout-all-sessions').click()
+
+    await expect(page).toHaveURL(/\/#\/$/u)
+    await expect(page.getByTestId('account-menu')).toBeVisible()
+    await expect(page.getByText('无法从所有设备退出登录')).toBeVisible()
+    expect(logoutAllRequests).toBe(1)
+
+    await page.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        await apiModule.apiFetch('/e2e/logout-session-probe')
+    }, '/src/lib/apiClient.ts')
+    expect(probeAuthorization).toBe(`Bearer ${token}`)
+})
+
+test('旧标签退出响应提交后新标签才允许登录', async ({
+    context,
+    page: logoutPage,
+}) => {
+    const identityA = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-lifecycle-lock-session-a',
+        email: 'lifecycle-lock-a@example.test',
+    }
+    const identityB = {
+        ...defaultMockIdentity,
+        id: 188,
+        sessionID: 'e2e-lifecycle-lock-session-b',
+        email: 'lifecycle-lock-b@example.test',
+    }
+    await installMockSession(logoutPage, identityA, projectA)
+    const tokenB = mockSessionToken(identityB)
+    const accessA = authorizedProjectAccess(projectA, 'requester')
+    const accessB = authorizedProjectAccess(projectB, 'observer')
+    const events: string[] = []
+    let logoutSessionID = ''
+    let loginRequests = 0
+    let markLogoutStarted: (() => void) | undefined
+    const logoutStarted = new Promise<void>((resolve) => {
+        markLogoutStarted = resolve
+    })
+    let releaseLogout: (() => void) | undefined
+    const logoutReleased = new Promise<void>((resolve) => {
+        releaseLogout = resolve
+    })
+
+    await context.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        const authorization = request.headers().authorization ?? ''
+        const usingB = authorization === `Bearer ${tokenB}`
+        const identity = usingB ? identityB : identityA
+        const access = usingB ? accessB : accessA
+        const user = {
+            id: identity.id,
+            username: `e2e-${identity.id}`,
+            email: identity.email,
+            platform_role: identity.platformRole,
+            status: 'active',
+            email_verified: true,
+            otp_enabled: false,
+            last_login_at: null,
+        }
+        if (pathname === '/api/auth/logout') {
+            events.push('logout:start')
+            logoutSessionID =
+                request.headers()['x-chronodesk-session-id'] ?? ''
+            markLogoutStarted?.()
+            await logoutReleased
+            events.push('logout:end')
+            await fulfillJSON(route, {
+                success: true,
+                message: '退出登录成功',
+            })
+            return
+        }
+        if (pathname === '/api/auth/login') {
+            loginRequests += 1
+            events.push('login:start')
+            await fulfillJSON(route, {
+                code: 0,
+                msg: '登录成功',
+                data: {
+                    user: {
+                        id: identityB.id,
+                        username: `e2e-${identityB.id}`,
+                        email: identityB.email,
+                        platform_role: identityB.platformRole,
+                        status: 'active',
+                        email_verified: true,
+                        otp_enabled: false,
+                        last_login_at: null,
+                    },
+                    access_token: tokenB,
+                    expires_in: 3600,
+                    token_type: 'Bearer',
+                },
+            })
+            return
+        }
+        if (pathname === '/api/auth/me') {
+            await fulfillJSON(route, { code: 0, data: user })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (
+            pathname ===
+            `/api/projects/${access.project.key}/context`
+        ) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    await logoutPage.goto('/#/')
+    await expect(logoutPage.getByTestId('account-menu')).toBeVisible()
+    const loginPage = await context.newPage()
+    await loginPage.goto('/#/login')
+
+    await logoutPage
+        .getByTestId('account-menu')
+        .locator('button')
+        .first()
+        .click()
+    const logoutAction = logoutPage
+        .getByRole('menuitem', { name: '退出登录', exact: true })
+        .click()
+    await logoutStarted
+
+    await loginPage.getByLabel('邮箱').fill(identityB.email)
+    await loginPage.getByLabel('密码').fill('CorrectPassword123!')
+    const loginAction = loginPage
+        .getByRole('button', { name: '登录系统', exact: true })
+        .click()
+    await loginPage.waitForTimeout(150)
+    expect(loginRequests).toBe(0)
+
+    releaseLogout?.()
+    await logoutAction
+    await loginAction
+    await expect(loginPage).toHaveURL(/\/#\/$/u)
+    await expect(loginPage.getByTestId('account-menu')).toContainText(
+        `e2e-${identityB.id}`,
+    )
+    expect(logoutSessionID).toBe(identityA.sessionID)
+    expect(events.slice(0, 3)).toEqual([
+        'logout:start',
+        'logout:end',
+        'login:start',
+    ])
+})
+
+test('三个标签页 refresh 的网络响应保持全局串行', async ({
+    context,
+    page: firstPage,
+}) => {
+    const identity = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-three-tab-refresh-lock',
+    }
+    const access = authorizedProjectAccess(projectA, 'requester')
+    const pages = [
+        firstPage,
+        await context.newPage(),
+        await context.newPage(),
+    ]
+    for (const page of pages) {
+        await installMockSession(page, identity, projectA)
+    }
+    const user = {
+        id: identity.id,
+        username: `e2e-${identity.id}`,
+        email: identity.email,
+        platform_role: identity.platformRole,
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+    }
+    const events: string[] = []
+    let refreshRequests = 0
+    let inFlight = 0
+    let maximumInFlight = 0
+
+    await context.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        if (pathname === '/api/auth/refresh') {
+            refreshRequests += 1
+            const sequence = refreshRequests
+            events.push(`refresh:${sequence}:start`)
+            inFlight += 1
+            maximumInFlight = Math.max(maximumInFlight, inFlight)
+            await new Promise((resolve) => setTimeout(resolve, 100))
+            inFlight -= 1
+            events.push(`refresh:${sequence}:end`)
+            const expiresAt =
+                Math.floor(Date.now() / 1000) + 7200 + sequence
+            await fulfillJSON(route, {
+                success: true,
+                message: '登录令牌刷新成功',
+                data: {
+                    user,
+                    access_token: mockSessionToken(
+                        identity,
+                        expiresAt,
+                    ),
+                    expires_in: 7200 + sequence,
+                    token_type: 'Bearer',
+                },
+            })
+            return
+        }
+        if (pathname === '/api/auth/me') {
+            await fulfillJSON(route, { code: 0, data: user })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (pathname === `/api/projects/${projectA.key}/context`) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    for (const page of pages) {
+        await page.goto('/#/')
+        await expect(page.getByTestId('account-menu')).toBeVisible()
+    }
+    await Promise.all(
+        pages.map((page) =>
+            page.evaluate(async (modulePath) => {
+                const authModule = await import(
+                    /* @vite-ignore */ modulePath
+                ) as {
+                    bootstrapHumanSession: () => Promise<void>
+                }
+                await authModule.bootstrapHumanSession()
+            }, '/src/lib/authProvider.ts'),
+        ),
+    )
+
+    expect(refreshRequests).toBe(3)
+    expect(maximumInFlight).toBe(1)
+    expect(events).toEqual([
+        'refresh:1:start',
+        'refresh:1:end',
+        'refresh:2:start',
+        'refresh:2:end',
+        'refresh:3:start',
+        'refresh:3:end',
+    ])
 })
 
 for (const replacement of [

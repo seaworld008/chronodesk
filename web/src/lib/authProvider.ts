@@ -43,6 +43,7 @@ import {
     publishAuthenticatedHumanSession,
     publishSignedOutHumanSession,
 } from './humanSessionChannel'
+import { withHumanSessionLifecycleLock } from './humanSessionLifecycle'
 import { joinApiUrl } from './apiUrl'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -375,50 +376,51 @@ export const consumeRegistrationResult = (
 
 let refreshSessionRequest: Promise<void> | null = null
 
-const performSessionRefresh = async (): Promise<void> => {
-    const previousBinding = readHumanSessionBinding()
+const performSessionRefresh = (): Promise<void> =>
+    withHumanSessionLifecycleLock(async () => {
+        const previousBinding = readHumanSessionBinding()
 
-    try {
-        const response = await safeFetch(
-            buildUrl(humanApiRoutes.refreshHumanSession()),
-            {
-                method: 'POST',
-                credentials: 'include',
-            },
-            '登录状态刷新失败',
-        )
-        const body: unknown = await response.json().catch(() => ({}))
-        const session = parseHumanRefreshSessionResponse(body)
-        const nextBinding = session
-            ? readHumanSessionBinding(session.access_token)
-            : null
-        if (
-            !response.ok ||
-            session === null ||
-            nextBinding === null ||
-            (
-                previousBinding !== null &&
+        try {
+            const response = await safeFetch(
+                buildUrl(humanApiRoutes.refreshHumanSession()),
+                {
+                    method: 'POST',
+                    credentials: 'include',
+                },
+                '登录状态刷新失败',
+            )
+            const body: unknown = await response.json().catch(() => ({}))
+            const session = parseHumanRefreshSessionResponse(body)
+            const nextBinding = session
+                ? readHumanSessionBinding(session.access_token)
+                : null
+            if (
+                !response.ok ||
+                session === null ||
+                nextBinding === null ||
                 (
-                    nextBinding.subject !== previousBinding.subject ||
-                    nextBinding.session_id !== previousBinding.session_id
+                    previousBinding !== null &&
+                    (
+                        nextBinding.subject !== previousBinding.subject ||
+                        nextBinding.session_id !== previousBinding.session_id
+                    )
                 )
-            )
-        ) {
-            throw new Error(
-                localizedApiErrorMessage(
-                    body,
-                    response.status,
-                    '登录状态刷新失败',
-                ),
-            )
+            ) {
+                throw new Error(
+                    localizedApiErrorMessage(
+                        body,
+                        response.status,
+                        '登录状态刷新失败',
+                    ),
+                )
+            }
+            storeAuthSession(session, previousBinding !== null)
+        } catch (error) {
+            remoteSignOutObserved = true
+            clearAuthenticationState({ notifyPeers: false })
+            throw error
         }
-        storeAuthSession(session, previousBinding !== null)
-    } catch (error) {
-        remoteSignOutObserved = true
-        clearAuthenticationState({ notifyPeers: false })
-        throw error
-    }
-}
+    })
 
 const refreshStoredSession = async (): Promise<void> => {
     if (refreshSessionRequest) return refreshSessionRequest
@@ -498,34 +500,75 @@ const fetchCurrentUser = async (): Promise<HumanSessionUser> => {
     return user
 }
 
-export const logoutAllSessions = async (): Promise<void> => {
-    const token = readHumanAccessToken()
-    try {
-        if (token) {
-            const response = await safeFetch(
-                buildUrl(humanApiRoutes.deleteAllHumanSessions()),
-                {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: { Authorization: `Bearer ${token}` },
-                },
-                '从所有设备退出失败',
-            )
-            if (!response.ok) {
-                const body: unknown = await response.json().catch(() => ({}))
-                throw new Error(
-                    localizedApiErrorMessage(
-                        body,
-                        response.status,
-                        '从所有设备退出失败',
-                    ),
-                )
+export const logoutAllSessions = (): Promise<void> =>
+    withHumanSessionLifecycleLock(async () => {
+        const token = readHumanAccessToken()
+        const binding = readHumanSessionBinding(token)
+        if (!token || binding === null) {
+            if (remoteSignOutObserved) {
+                clearAuthenticationState({ notifyPeers: false })
+                return
             }
+            throw new Error('未找到有效登录会话，无法从所有设备退出')
         }
-    } finally {
+        const response = await safeFetch(
+            buildUrl(humanApiRoutes.deleteAllHumanSessions()),
+            {
+                method: 'POST',
+                credentials: 'include',
+                headers: { Authorization: `Bearer ${token}` },
+            },
+            '从所有设备退出失败',
+        )
+        if (!response.ok) {
+            const body: unknown = await response.json().catch(() => ({}))
+            throw new Error(
+                localizedApiErrorMessage(
+                    body,
+                    response.status,
+                    '从所有设备退出失败',
+                ),
+            )
+        }
         clearAuthenticationState({ notifyPeers: true })
-    }
-}
+    })
+
+export const logoutCurrentSession = (): Promise<void> =>
+    withHumanSessionLifecycleLock(async () => {
+        if (remoteSignOutObserved) {
+            clearAuthenticationState({ notifyPeers: false })
+            return
+        }
+        const token = readHumanAccessToken()
+        const binding = readHumanSessionBinding(token)
+        if (!token || binding === null) {
+            throw new Error('未找到有效登录会话，无法安全退出')
+        }
+        const headers = new Headers({
+            Authorization: `Bearer ${token}`,
+            'X-Chronodesk-Session-ID': binding.session_id,
+        })
+        const response = await safeFetch(
+            buildUrl(humanApiRoutes.deleteHumanSession()),
+            {
+                method: 'POST',
+                credentials: 'include',
+                headers,
+            },
+            '退出登录请求失败',
+        )
+        if (!response.ok) {
+            const body: unknown = await response.json().catch(() => ({}))
+            throw new Error(
+                localizedApiErrorMessage(
+                    body,
+                    response.status,
+                    '退出登录请求失败',
+                ),
+            )
+        }
+        clearAuthenticationState({ notifyPeers: true })
+    })
 
 export const authProvider: AuthProvider = {
     login: async (params) => {
@@ -556,66 +599,47 @@ export const authProvider: AuthProvider = {
             shouldRememberDevice ? 'true' : 'false',
         )
 
-        const response = await safeFetch(
-            buildUrl(humanApiRoutes.createHumanSession()),
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify(payload),
-            },
-            '网络连接失败，无法登录',
-        )
-        const body: unknown = await response.json().catch(() => ({}))
-        if (!response.ok || (isRecord(body) && body.code === 1)) {
-            const rawMessage = isRecord(body)
-                ? [body.msg, body.message].find(
-                    (value) => typeof value === 'string',
-                )
-                : undefined
-            const message =
-                typeof rawMessage === 'string' && containsChineseText(rawMessage)
-                    ? rawMessage
-                    : typeof rawMessage === 'string' && /otp/i.test(rawMessage)
-                      ? '动态验证码无效或已过期，请重新输入'
-                      : typeof rawMessage === 'string' &&
-                          /device/i.test(rawMessage)
-                        ? '受信任设备凭据已失效，请重新验证'
-                        : '登录失败，请检查邮箱、密码和验证码'
-            throw new Error(message)
-        }
-
-        const session = parseHumanLoginSessionResponse(body)
-        if (session === null) {
-            throw new Error('登录响应包含无效的平台角色或会话信息')
-        }
-        storeAuthSession(session, false)
-    },
-
-    logout: async () => {
-        if (remoteSignOutObserved) {
-            clearAuthenticationState({ notifyPeers: false })
-            return
-        }
-        try {
-            const token = readHumanAccessToken()
-            const headers = new Headers()
-            if (token) {
-                headers.set('Authorization', `Bearer ${token}`)
-            }
-            await safeFetch(
-                buildUrl(humanApiRoutes.deleteHumanSession()),
+        await withHumanSessionLifecycleLock(async () => {
+            const response = await safeFetch(
+                buildUrl(humanApiRoutes.createHumanSession()),
                 {
                     method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
                     credentials: 'include',
-                    headers,
+                    body: JSON.stringify(payload),
                 },
-                '退出登录请求失败',
+                '网络连接失败，无法登录',
             )
-        } finally {
-            clearAuthenticationState({ notifyPeers: true })
-        }
+            const body: unknown = await response.json().catch(() => ({}))
+            if (!response.ok || (isRecord(body) && body.code === 1)) {
+                const rawMessage = isRecord(body)
+                    ? [body.msg, body.message].find(
+                        (value) => typeof value === 'string',
+                    )
+                    : undefined
+                const message =
+                    typeof rawMessage === 'string' &&
+                    containsChineseText(rawMessage)
+                        ? rawMessage
+                        : typeof rawMessage === 'string' &&
+                            /otp/i.test(rawMessage)
+                          ? '动态验证码无效或已过期，请重新输入'
+                          : typeof rawMessage === 'string' &&
+                              /device/i.test(rawMessage)
+                            ? '受信任设备凭据已失效，请重新验证'
+                            : '登录失败，请检查邮箱、密码和验证码'
+                throw new Error(message)
+            }
+
+            const session = parseHumanLoginSessionResponse(body)
+            if (session === null) {
+                throw new Error('登录响应包含无效的平台角色或会话信息')
+            }
+            storeAuthSession(session, false)
+        })
     },
+
+    logout: logoutCurrentSession,
 
     checkAuth: async () => {
         let committedToken = readCommittedHumanTabSessionToken()

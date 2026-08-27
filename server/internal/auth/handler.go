@@ -29,6 +29,7 @@ const (
 	trustedDeviceCookiePath = "/api/auth/login"
 	refreshTokenCookieName  = "chronodesk_refresh_token"
 	refreshTokenCookiePath  = "/api/auth"
+	humanSessionIDHeader    = "X-Chronodesk-Session-ID"
 	// statusClientClosedRequest follows the established reverse-proxy convention
 	// for a request whose client has already canceled its context. net/http does
 	// not define this non-standard status, so keep it local to the HTTP adapter.
@@ -482,6 +483,51 @@ func writeMissingRefreshCookie(c HTTPContext) {
 	})
 }
 
+func (h *AuthHandler) requireRefreshCookieSession(
+	c HTTPContext,
+	refreshToken, expectedSessionID string,
+) bool {
+	expectedSessionID = strings.TrimSpace(expectedSessionID)
+	if expectedSessionID == "" || len(expectedSessionID) > 128 {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "session_precondition_required",
+			Message: "缺少有效的浏览器会话前置条件",
+			Code:    "session_precondition_required",
+		})
+		return false
+	}
+	if h.authService == nil || h.authService.jwtManager == nil {
+		h.logger.Error(
+			"Authentication session verifier is unavailable",
+			"request_id", authLogRequestID(c),
+		)
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "authentication_unavailable",
+			Message: "认证服务暂时不可用",
+			Code:    "authentication_unavailable",
+		})
+		return false
+	}
+	claims, err := h.authService.jwtManager.VerifyRefreshToken(refreshToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Error:   "invalid_token",
+			Message: "登录会话 Cookie 无效或已过期",
+			Code:    "invalid_token",
+		})
+		return false
+	}
+	if claims.SessionID != expectedSessionID {
+		c.JSON(http.StatusConflict, ErrorResponse{
+			Error:   "session_replaced",
+			Message: "浏览器登录会话已被更新，请刷新后重试",
+			Code:    "session_replaced",
+		})
+		return false
+	}
+	return true
+}
+
 // Register 用户注册
 func (h *AuthHandler) Register(c HTTPContext) {
 	var req RegisterRequest
@@ -820,6 +866,24 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 		writeMissingRefreshCookie(c)
 		return
 	}
+	request := c.Request()
+	if request == nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "session_precondition_required",
+			Message: "缺少有效的浏览器会话前置条件",
+			Code:    "session_precondition_required",
+		})
+		return
+	}
+	sessionIDs := request.Header.Values(humanSessionIDHeader)
+	if len(sessionIDs) != 1 ||
+		!h.requireRefreshCookieSession(
+			c,
+			refreshToken,
+			sessionIDs[0],
+		) {
+		return
+	}
 
 	ctx, cancel, ok := h.boundedRequestContext(c)
 	if !ok {
@@ -868,6 +932,19 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 			Message: "用户 ID 无效",
 		})
 		return
+	}
+	if refreshToken, hasRefreshCookie := refreshTokenFromCookie(c); hasRefreshCookie {
+		sessionID, exists := c.Get("session_id")
+		expectedSessionID, validSessionID := sessionID.(string)
+		if !exists ||
+			!validSessionID ||
+			!h.requireRefreshCookieSession(
+				c,
+				refreshToken,
+				expectedSessionID,
+			) {
+			return
+		}
 	}
 
 	ctx, cancel, ok := h.boundedRequestContext(c)

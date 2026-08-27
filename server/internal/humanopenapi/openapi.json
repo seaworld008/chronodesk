@@ -431,9 +431,22 @@
       "post": {
         "operationId": "deleteHumanSession",
         "summary": "End one human browser session",
-        "description": "Idempotently revokes the session identified only by the HttpOnly browser refresh Cookie, then clears that Cookie on success. Query parameters, JSON bodies and X-Refresh-Token are not accepted. The explicit trusted-device credential remains until it expires, is individually revoked, or the human ends all sessions.",
+        "description": "Idempotently revokes the session identified by the HttpOnly browser refresh Cookie only when X-Chronodesk-Session-ID matches that Cookie's signed session, then clears the Cookie on success. Query parameters, JSON bodies and X-Refresh-Token are not accepted. The explicit trusted-device credential remains until it expires, is individually revoked, or the human ends all sessions.",
         "tags": [
           "Human sessions"
+        ],
+        "parameters": [
+          {
+            "name": "X-Chronodesk-Session-ID",
+            "in": "header",
+            "required": true,
+            "description": "Stable sid from the calling tab's in-memory human access token. Prevents a stale tab from clearing a newer shared refresh Cookie.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
         ],
         "security": [
           {
@@ -460,6 +473,9 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
@@ -476,7 +492,7 @@
       "post": {
         "operationId": "deleteAllHumanSessions",
         "summary": "End all sessions for the current human",
-        "description": "Revokes every persisted session and every persisted trusted-device credential for the authenticated human, then clears this browser's refresh and trusted-device Cookies after the transaction succeeds.",
+        "description": "Revokes every persisted session and every persisted trusted-device credential for the authenticated human, then clears this browser's refresh and trusted-device Cookies after the transaction succeeds. When a refresh Cookie is present, its signed session must match the authenticated access-token session so a stale tab cannot clear a newer login.",
         "tags": [
           "Human sessions"
         ],
@@ -504,6 +520,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"

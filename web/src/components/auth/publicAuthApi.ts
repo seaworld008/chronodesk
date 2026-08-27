@@ -14,6 +14,7 @@ export const registerHumanAccount = (
 ): Promise<HumanRegistrationResult> =>
     apiFetch<HumanRegistrationResult>(humanApiRoutes.registerHuman(), {
         method: 'POST',
+        credentials: 'include',
         body: JSON.stringify(request),
     })
 

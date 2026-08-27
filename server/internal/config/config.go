@@ -339,6 +339,7 @@ func Load() (*Config, error) {
 				"Content-Type",
 				"Accept",
 				"Authorization",
+				"X-Chronodesk-Session-ID",
 				"X-Requested-With",
 				"Idempotency-Key",
 				"If-Match",

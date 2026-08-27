@@ -263,6 +263,10 @@ func TestLogoutKeepsTrustedDeviceCredentialForTheNextLogin(t *testing.T) {
 		nil,
 	)
 	request.Header.Set("Origin", testBrowserOrigin)
+	request.Header.Set(
+		humanSessionIDHeader,
+		"session-with-trusted-device",
+	)
 	request.AddCookie(&http.Cookie{
 		Name:  refreshTokenCookieName,
 		Value: refreshToken,

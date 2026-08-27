@@ -229,6 +229,7 @@ func TestLogoutHandlersPublishClosedSuccessEnvelopesAndPreserveTrustSemantics(
 	})
 	router.POST("/logout-all", func(c *gin.Context) {
 		c.Set("user_id", uint(42))
+		c.Set("session_id", "logout-envelope-session")
 		handler.LogoutAll(NewGinHTTPContext(c))
 	})
 
@@ -257,6 +258,10 @@ func TestLogoutHandlersPublishClosedSuccessEnvelopesAndPreserveTrustSemantics(
 			})
 			if test.path == "/logout" {
 				request.Header.Set("Origin", testBrowserOrigin)
+				request.Header.Set(
+					humanSessionIDHeader,
+					"logout-envelope-session",
+				)
 			}
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)

@@ -425,6 +425,10 @@ func TestLogoutWithRotatedCookieRevokesTheReplacementSession(t *testing.T) {
 		nil,
 	)
 	request.Header.Set("Origin", testBrowserOrigin)
+	request.Header.Set(
+		humanSessionIDHeader,
+		"refresh-logout-race-session",
+	)
 	request.AddCookie(&http.Cookie{
 		Name:  refreshTokenCookieName,
 		Value: refreshToken,
@@ -461,6 +465,147 @@ func TestLogoutWithRotatedCookieRevokesTheReplacementSession(t *testing.T) {
 			status,
 			problem,
 		)
+	}
+}
+
+func TestLogoutRejectsCookieFromAReplacementBrowserSession(t *testing.T) {
+	repository, manager, handler := setupSessionRevocationTest(t)
+	_, _ = issueSessionTokens(
+		t,
+		repository,
+		manager,
+		42,
+		PlatformRolePlatformAdmin,
+		"stale-logout-session-a",
+	)
+	_, replacementRefresh := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		84,
+		PlatformRoleMember,
+		"replacement-login-session-b",
+	)
+
+	router := gin.New()
+	router.POST("/api/auth/logout", func(c *gin.Context) {
+		handler.Logout(NewGinHTTPContext(c))
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/logout",
+		nil,
+	)
+	request.Header.Set("Origin", testBrowserOrigin)
+	request.Header.Set(
+		humanSessionIDHeader,
+		"stale-logout-session-a",
+	)
+	request.AddCookie(&http.Cookie{
+		Name:  refreshTokenCookieName,
+		Value: replacementRefresh,
+		Path:  refreshTokenCookiePath,
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf(
+			"stale logout status = %d, want 409; body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if len(response.Header().Values("Set-Cookie")) != 0 {
+		t.Fatal("stale logout cleared the replacement Cookie")
+	}
+	for _, session := range []struct {
+		userID    uint
+		sessionID string
+	}{
+		{userID: 42, sessionID: "stale-logout-session-a"},
+		{userID: 84, sessionID: "replacement-login-session-b"},
+	} {
+		active, err := repository.IsSessionActive(
+			context.Background(),
+			session.userID,
+			session.sessionID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !active {
+			t.Fatalf("stale logout revoked session %q", session.sessionID)
+		}
+	}
+}
+
+func TestLogoutAllRejectsCookieFromAReplacementBrowserSession(t *testing.T) {
+	repository, manager, handler := setupSessionRevocationTest(t)
+	_, _ = issueSessionTokens(
+		t,
+		repository,
+		manager,
+		42,
+		PlatformRolePlatformAdmin,
+		"stale-logout-all-session-a",
+	)
+	_, replacementRefresh := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		84,
+		PlatformRoleMember,
+		"replacement-logout-all-session-b",
+	)
+
+	router := gin.New()
+	router.POST("/api/auth/logout-all", func(c *gin.Context) {
+		c.Set("user_id", uint(42))
+		c.Set("session_id", "stale-logout-all-session-a")
+		handler.LogoutAll(NewGinHTTPContext(c))
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/logout-all",
+		nil,
+	)
+	request.AddCookie(&http.Cookie{
+		Name:  refreshTokenCookieName,
+		Value: replacementRefresh,
+		Path:  refreshTokenCookiePath,
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf(
+			"stale logout-all status = %d, want 409; body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if len(response.Header().Values("Set-Cookie")) != 0 {
+		t.Fatal("stale logout-all cleared the replacement Cookie")
+	}
+	for _, session := range []struct {
+		userID    uint
+		sessionID string
+	}{
+		{userID: 42, sessionID: "stale-logout-all-session-a"},
+		{userID: 84, sessionID: "replacement-logout-all-session-b"},
+	} {
+		active, err := repository.IsSessionActive(
+			context.Background(),
+			session.userID,
+			session.sessionID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !active {
+			t.Fatalf("stale logout-all revoked session %q", session.sessionID)
+		}
 	}
 }
 

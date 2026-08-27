@@ -11,6 +11,7 @@ import { Link as RouterLink, useNavigate } from 'react-router-dom'
 import { localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { consumeRegistrationResult } from '@/lib/authProvider'
 import { markHumanAuthQueryAuthenticated } from '@/lib/authQueryState'
+import { withHumanSessionLifecycleLock } from '@/lib/humanSessionLifecycle'
 import PublicAuthShell from './PublicAuthShell'
 import { registerHumanAccount } from './publicAuthApi'
 
@@ -57,19 +58,22 @@ const RegisterPage = () => {
         setSubmitting(true)
         setError(null)
         try {
-            const result = await registerHumanAccount({
-                username: form.username.trim(),
-                email: form.email.trim(),
-                password: form.password,
-                confirm_password: form.confirmation,
-                ...(form.firstName.trim()
-                    ? { first_name: form.firstName.trim() }
-                    : {}),
-                ...(form.lastName.trim()
-                    ? { last_name: form.lastName.trim() }
-                    : {}),
+            const outcome = await withHumanSessionLifecycleLock(async () => {
+                const result = await registerHumanAccount({
+                    username: form.username.trim(),
+                    email: form.email.trim(),
+                    password: form.password,
+                    confirm_password: form.confirmation,
+                    ...(form.firstName.trim()
+                        ? { first_name: form.firstName.trim() }
+                        : {}),
+                    ...(form.lastName.trim()
+                        ? { last_name: form.lastName.trim() }
+                        : {}),
+                })
+                return consumeRegistrationResult(result)
             })
-            if (consumeRegistrationResult(result) === 'authenticated') {
+            if (outcome === 'authenticated') {
                 markHumanAuthQueryAuthenticated(queryClient)
                 void queryClient.invalidateQueries({
                     queryKey: ['auth', 'getPermissions'],

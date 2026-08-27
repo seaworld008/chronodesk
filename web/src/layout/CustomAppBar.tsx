@@ -1,7 +1,6 @@
 import * as React from 'react'
 import {
   AppBar,
-  Logout,
   TitlePortal,
   UserMenu,
   useNotify,
@@ -34,7 +33,11 @@ import {
   projectInventoryChangedEvent,
   projectScopeChangedEvent,
 } from '@/lib/projectScopeEvents'
-import { logoutAllSessions } from '@/lib/authProvider'
+import {
+  logoutAllSessions,
+  logoutCurrentSession,
+} from '@/lib/authProvider'
+import { localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { visibleNavigationItems } from '@/navigation/navigationRegistry'
 import { NavigationIconGlyph } from '@/navigation/navigationIcons'
 import { resolveRoutePageScope } from './routePageScope'
@@ -48,9 +51,14 @@ const LogoutAllMenuItem: React.FC = () => {
     try {
       await logoutAllSessions()
       window.location.replace(publicLoginHashTarget)
-    } catch {
-      notify('已清理本地登录状态，请重新登录', { type: 'warning' })
-      window.location.replace(publicLoginHashTarget)
+    } catch (error) {
+      notify(
+        localizedUnknownErrorMessage(
+          error,
+          '从所有设备退出失败，当前登录状态已保留',
+        ),
+        { type: 'error' },
+      )
     }
   }
   return (
@@ -59,6 +67,34 @@ const LogoutAllMenuItem: React.FC = () => {
       onClick={() => void handleLogoutAll()}
     >
       从所有设备退出
+    </MenuItem>
+  )
+}
+
+const LogoutCurrentSessionMenuItem: React.FC = () => {
+  const notify = useNotify()
+  const onClose = useUserMenu()?.onClose
+  const handleLogout = async () => {
+    onClose?.()
+    try {
+      await logoutCurrentSession()
+      window.location.replace(publicLoginHashTarget)
+    } catch (error) {
+      notify(
+        localizedUnknownErrorMessage(
+          error,
+          '退出登录失败，当前登录状态已保留',
+        ),
+        { type: 'error' },
+      )
+    }
+  }
+  return (
+    <MenuItem
+      data-testid="logout-current-session"
+      onClick={() => void handleLogout()}
+    >
+      退出登录
     </MenuItem>
   )
 }
@@ -102,7 +138,7 @@ const CustomUserMenu: React.FC = () => (
     <UserMenu label="账号" className="ChronoDeskUserMenu">
       <AccountNavigationItems />
       <LogoutAllMenuItem />
-      <Logout data-testid="logout-current-session" />
+      <LogoutCurrentSessionMenuItem />
     </UserMenu>
   </Box>
 )

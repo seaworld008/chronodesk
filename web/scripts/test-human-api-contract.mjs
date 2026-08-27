@@ -1665,6 +1665,23 @@ assert.deepEqual(
     [{ humanRefreshCookie: [] }],
 )
 assert.deepEqual(
+    contract.paths['/auth/logout'].post.parameters,
+    [
+        {
+            name: 'X-Chronodesk-Session-ID',
+            in: 'header',
+            required: true,
+            description:
+                "Stable sid from the calling tab's in-memory human access token. Prevents a stale tab from clearing a newer shared refresh Cookie.",
+            schema: {
+                type: 'string',
+                minLength: 1,
+                maxLength: 128,
+            },
+        },
+    ],
+)
+assert.deepEqual(
     contract.components.securitySchemes.humanRefreshCookie,
     {
         type: 'apiKey',
@@ -1696,8 +1713,11 @@ for (const [operationPath, expectedStatuses] of [
         '/auth/refresh',
         ['200', '400', '401', '403', '408', '413', '429', '503'],
     ],
-    ['/auth/logout', ['200', '400', '401', '403', '413', '429', '503']],
-    ['/auth/logout-all', ['200', '401', '429', '500', '503']],
+    [
+        '/auth/logout',
+        ['200', '400', '401', '403', '409', '413', '429', '503'],
+    ],
+    ['/auth/logout-all', ['200', '401', '409', '429', '500', '503']],
 ]) {
     assert.deepEqual(
         Object.keys(contract.paths[operationPath].post.responses),
