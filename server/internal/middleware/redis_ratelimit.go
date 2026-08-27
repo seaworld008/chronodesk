@@ -306,6 +306,8 @@ func InfrastructureRouteRateLimitSkip(c HTTPContext) bool {
 
 const anonymousCredentialBodyLimit = 64 << 10
 
+const humanRefreshCookieName = "chronodesk_refresh_token"
+
 // AnonymousIPRouteKeyFunc is the coarse anti-abuse layer for unauthenticated
 // credential endpoints. It limits the trusted client IP and matched route,
 // regardless of which account or credential an attacker targets.
@@ -329,12 +331,31 @@ func AnonymousCredentialKeyFunc(c HTTPContext) string {
 
 func anonymousCredentialSubject(c HTTPContext) string {
 	ginContext, ok := c.(*GinHTTPContext)
-	if !ok ||
-		ginContext.Context.Request == nil ||
-		ginContext.Context.Request.Body == nil {
+	if !ok || ginContext.Context.Request == nil {
 		return ""
 	}
 	request := ginContext.Context.Request
+	switch getRoutePattern(c) {
+	case "/api/auth/refresh", "/api/auth/logout":
+		var credential string
+		count := 0
+		for _, cookie := range request.Cookies() {
+			if cookie.Name != humanRefreshCookieName {
+				continue
+			}
+			count++
+			credential = cookie.Value
+		}
+		if count == 1 &&
+			credential != "" &&
+			strings.TrimSpace(credential) == credential {
+			return "refresh_cookie:" + credential
+		}
+		return ""
+	}
+	if request.Body == nil {
+		return ""
+	}
 	if request.ContentLength > anonymousCredentialBodyLimit {
 		return ""
 	}

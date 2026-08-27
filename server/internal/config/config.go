@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/seaworld008/chronodesk/server/internal/version"
+	"golang.org/x/net/publicsuffix"
 )
 
 // Config 应用配置结构
@@ -566,6 +568,14 @@ func (c *Config) Validate() error {
 		c.JWT.Audience,
 	); err != nil {
 		return err
+	}
+	if c.App.WebURL != "" {
+		if err := validateBrowserSessionSiteContract(
+			c.App.URL,
+			c.App.WebURL,
+		); err != nil {
+			return err
+		}
 	}
 	if err := validateAgentEndpointContract(
 		c.App.URL,
@@ -1215,6 +1225,55 @@ func validateCanonicalAppURL(appURL string) error {
 		return fmt.Errorf("APP URL must use HTTPS except for loopback development")
 	}
 	return nil
+}
+
+func validateBrowserSessionSiteContract(appURL, webURL string) error {
+	appSite, err := schemefulSite("APP_URL", appURL)
+	if err != nil {
+		return err
+	}
+	webSite, err := schemefulSite("WEB_URL", webURL)
+	if err != nil {
+		return err
+	}
+	if appSite != webSite {
+		return fmt.Errorf(
+			"APP_URL and WEB_URL must use the same schemeful site for SameSite=Strict browser sessions",
+		)
+	}
+	return nil
+}
+
+func schemefulSite(name, raw string) (string, error) {
+	if raw != strings.TrimSpace(raw) {
+		return "", fmt.Errorf("%s must not contain surrounding whitespace", name)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil ||
+		!parsed.IsAbs() ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return "", fmt.Errorf(
+			"%s must be an absolute HTTP(S) URL without credentials, query, or fragment",
+			name,
+		)
+	}
+	hostname := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if hostname == "" {
+		return "", fmt.Errorf("%s must include a hostname", name)
+	}
+	siteHost := hostname
+	if address := net.ParseIP(hostname); address == nil &&
+		hostname != "localhost" {
+		registrable, err := publicsuffix.EffectiveTLDPlusOne(hostname)
+		if err == nil {
+			siteHost = strings.ToLower(registrable)
+		}
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + siteHost, nil
 }
 
 func isLoopbackHostname(hostname string) bool {

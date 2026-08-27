@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -217,6 +218,96 @@ func TestAnonymousCredentialKeySeparatesIdentityAndPreservesRequestBody(t *testi
 	}
 	if len(emails) != 3 || emails[0] != " Employee@Example.COM " {
 		t.Fatalf("preserved emails = %#v", emails)
+	}
+}
+
+func TestAnonymousCredentialKeySeparatesRefreshCookiesBehindOneIP(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	if err := engine.SetTrustedProxies(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var keys []string
+	engine.POST("/api/auth/refresh", func(c *gin.Context) {
+		keys = append(
+			keys,
+			AnonymousCredentialKeyFunc(NewGinHTTPContext(c)),
+		)
+		c.Status(http.StatusNoContent)
+	})
+
+	for _, credential := range []string{
+		"opaque-session-alpha",
+		"opaque-session-alpha",
+		"opaque-session-bravo",
+	} {
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/api/auth/refresh",
+			nil,
+		)
+		request.RemoteAddr = "192.0.2.10:4321"
+		request.AddCookie(&http.Cookie{
+			Name:  humanRefreshCookieName,
+			Value: credential,
+			Path:  "/api/auth",
+		})
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("refresh key probe status = %d", response.Code)
+		}
+	}
+
+	if len(keys) != 3 ||
+		keys[0] != keys[1] ||
+		keys[0] == keys[2] {
+		t.Fatalf("refresh identity keys = %#v", keys)
+	}
+	for _, key := range keys {
+		if strings.Contains(key, "opaque-session") ||
+			strings.Contains(key, "192.0.2.10") {
+			t.Fatalf("refresh limiter key exposed credential or IP: %q", key)
+		}
+	}
+}
+
+func TestAnonymousCredentialKeyRejectsAmbiguousRefreshCookies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	var key string
+	engine.POST("/api/auth/refresh", func(c *gin.Context) {
+		key = AnonymousCredentialKeyFunc(NewGinHTTPContext(c))
+		c.Status(http.StatusNoContent)
+	})
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/refresh",
+		nil,
+	)
+	request.RemoteAddr = "192.0.2.10:4321"
+	for _, value := range []string{
+		"opaque-session-alpha",
+		"opaque-session-bravo",
+	} {
+		request.AddCookie(&http.Cookie{
+			Name:  humanRefreshCookieName,
+			Value: value,
+			Path:  "/api/auth",
+		})
+	}
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("refresh key probe status = %d", response.Code)
+	}
+	if !strings.HasSuffix(key, "|unidentified") {
+		t.Fatalf("ambiguous refresh cookies key = %q", key)
 	}
 }
 

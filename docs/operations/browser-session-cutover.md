@@ -10,6 +10,9 @@ ChronoDesk 浏览器会话采用协调式硬切换。后端与 Web 必须在同�
 - Cookie 固定使用 `HttpOnly`、`SameSite=Strict` 和 `Path=/api/auth`；
   生产环境或 TLS 直连时同时使用 `Secure`。Cookie 不设置 `Domain`，保持为
   host-only。
+- `APP_URL` 与 `WEB_URL` 必须属于同一 schemeful site（协议和可注册域都相同）；
+  可使用不同子域或端口。启动配置会拒绝跨站部署，避免
+  `SameSite=Strict` Cookie 在登录成功后无法用于刷新。
 - 登录、注册和刷新响应只返回内存使用的短期 `access_token`，JSON 中不得出现
   `refresh_token`。
 - `POST /api/auth/refresh` 和 `POST /api/auth/logout` 必须携带 Cookie 和与
@@ -21,6 +24,9 @@ ChronoDesk 浏览器会话采用协调式硬切换。后端与 Web 必须在同�
   同时清 refresh Cookie 和可信设备 Cookie。失败响应不清 Cookie。
 - refresh 的并发请求复用既有的确定性短时重放机制：同一旧 Cookie 在恢复窗口内
   得到同一替代 Cookie，不会分叉出多个有效会话。
+- Web 端的登录、注册、刷新、当前退出和全设备退出使用同一个跨标签页浏览器锁；
+  前一个响应提交 Cookie 和本地状态后，下一个生命周期请求才允许发出。浏览器
+  不支持该安全协调能力时会拒绝操作，不降级为可能回滚 Cookie 的并发请求。
 
 `WEB_URL` 是 refresh/logout Origin 门禁的唯一信任来源。不要从 `Host`、
 `X-Forwarded-Host` 或 `X-Forwarded-Proto` 推导允许来源。部署时还必须将相同
@@ -31,7 +37,7 @@ Origin 显式列入 `CORS_ALLOWED_ORIGINS`；凭据型 CORS 不接受 `*`。
 1. 确认 Web 已使用 `credentials: "include"`，刷新和 logout 发送空 body，且不再
    读取、存储或广播 refresh bearer。
 2. 确认 `WEB_URL` 是无凭据、无 query/fragment 的绝对 HTTP(S) URL；生产必须为
-   HTTPS。
+   HTTPS，且与 `APP_URL` 属于同一 schemeful site。
 3. 确认 `CORS_ALLOWED_ORIGINS` 包含 Web 的精确 Origin，且不包含 `*`。
 4. 运行认证包、Human OpenAPI、race 和浏览器多标签页用例。
 5. 发布后检查浏览器存储中没有 bearer，refresh Cookie 对 JavaScript 不可见。

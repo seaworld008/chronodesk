@@ -155,6 +155,101 @@ func TestCORSConfigFromEnv(t *testing.T) {
 	}
 }
 
+func TestBrowserSessionSiteContractAcceptsSameSchemefulSite(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		appURL string
+		webURL string
+	}{
+		{
+			name:   "loopback ports",
+			appURL: "http://localhost:8081",
+			webURL: "http://localhost:3000",
+		},
+		{
+			name:   "sibling subdomains",
+			appURL: "https://api.example.com",
+			webURL: "https://desk.example.com",
+		},
+		{
+			name:   "public suffix boundary",
+			appURL: "https://api.service.co.uk",
+			webURL: "https://desk.service.co.uk/app",
+		},
+		{
+			name:   "same IPv6 host",
+			appURL: "http://[::1]:8081",
+			webURL: "http://[::1]:3000",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateBrowserSessionSiteContract(
+				test.appURL,
+				test.webURL,
+			); err != nil {
+				t.Fatalf("same-site browser session rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestBrowserSessionSiteContractRejectsCrossSiteDeployment(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		appURL string
+		webURL string
+	}{
+		{
+			name:   "different registrable domains",
+			appURL: "https://api.example.com",
+			webURL: "https://desk.example.net",
+		},
+		{
+			name:   "different scheme",
+			appURL: "https://localhost:8081",
+			webURL: "http://localhost:3000",
+		},
+		{
+			name:   "different private hosts",
+			appURL: "https://chronodesk-api",
+			webURL: "https://chronodesk-web",
+		},
+		{
+			name:   "different co.uk registrable domains",
+			appURL: "https://api.service.co.uk",
+			webURL: "https://desk.other.co.uk",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateBrowserSessionSiteContract(
+				test.appURL,
+				test.webURL,
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), "same schemeful site") {
+				t.Fatalf(
+					"cross-site browser session error = %v",
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsCrossSiteBrowserSessionDeployment(t *testing.T) {
+	t.Setenv("APP_URL", "https://api.example.com")
+	t.Setenv("WEB_URL", "https://desk.example.net")
+	t.Setenv("AGENT_ISSUER", "https://api.example.com")
+	t.Setenv("AGENT_MCP_RESOURCE_URL", "https://api.example.com/mcp")
+	t.Setenv("AGENT_API_RESOURCE_URL", "https://api.example.com/api/v2")
+	t.Setenv("AGENT_A2A_RESOURCE_URL", "https://api.example.com/a2a/v1")
+
+	if _, err := Load(); err == nil ||
+		!strings.Contains(err.Error(), "same schemeful site") {
+		t.Fatalf("Load() cross-site browser session error = %v", err)
+	}
+}
+
 func TestBackupCodeRegenerationRateLimitDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("OTP_BACKUP_CODE_RATE_LIMIT_REQUESTS", "")
 	t.Setenv("OTP_BACKUP_CODE_RATE_LIMIT_WINDOW", "")
@@ -694,6 +789,7 @@ func TestLoadObservabilityDeploymentControls(t *testing.T) {
 func TestProductionMetricsRequireStrongBearerToken(t *testing.T) {
 	t.Setenv("ENVIRONMENT", "production")
 	t.Setenv("APP_URL", "https://desk.internal.example")
+	t.Setenv("WEB_URL", "https://web.internal.example")
 	t.Setenv("JWT_SECRET", "human-access-0123456789-abcdef-XYZ")
 	t.Setenv("JWT_REFRESH_SECRET", "human-refresh-0123456789-abcdef-XYZ")
 	t.Setenv("AGENT_JWT_SECRET", "agent-access-0123456789-abcdef-XYZ")
@@ -818,6 +914,7 @@ func TestLoadIntegrationHMACKeysRejectsUnknownOrWeakValues(t *testing.T) {
 func TestLoadConfig_AcceptsConfigurablePublicOrigin(t *testing.T) {
 	t.Setenv("PORT", "8081")
 	t.Setenv("APP_URL", "https://desk.internal.example")
+	t.Setenv("WEB_URL", "https://web.internal.example")
 	t.Setenv("AGENT_ISSUER", "https://desk.internal.example")
 
 	cfg, err := Load()
