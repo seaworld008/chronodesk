@@ -443,6 +443,7 @@ type AgentNativeService struct {
 	outboxLockTTL              time.Duration
 	outboxDeliveryTimeout      time.Duration
 	outboxDeliverySlots        chan struct{}
+	outboxDeliveryLaneSlots    map[OutboxDeliveryLane]chan struct{}
 	outboxProjectCursor        atomic.Uint64
 	outboxProjectCursorMu      sync.Mutex
 	outboxClaimCursorMu        sync.Mutex
@@ -573,8 +574,12 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 		options.OutboxDeliveryTimeout = options.OutboxLockTTL / 2
 	}
 	if options.OutboxDeliveryConcurrency <= 0 {
-		options.OutboxDeliveryConcurrency = 8
+		options.OutboxDeliveryConcurrency =
+			maxOutboxDeliveryConcurrency
 	}
+	options.OutboxDeliveryConcurrency = normalizeOutboxDeliveryConcurrency(
+		options.OutboxDeliveryConcurrency,
+	)
 	if options.LoopThreshold <= 0 {
 		options.LoopThreshold = 20
 	}
@@ -592,7 +597,7 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 	}
 	slaProjectionEnabled := db != nil && db.Migrator().HasTable(&models.SLAConfig{})
 
-	return &AgentNativeService{
+	service := &AgentNativeService{
 		db:                         db,
 		sla:                        newSLAServiceWithClock(db, options.Now),
 		slaProjectionEnabled:       slaProjectionEnabled,
@@ -617,7 +622,6 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 		),
 		outboxLockTTL:           options.OutboxLockTTL,
 		outboxDeliveryTimeout:   options.OutboxDeliveryTimeout,
-		outboxDeliverySlots:     make(chan struct{}, options.OutboxDeliveryConcurrency),
 		loopThreshold:           options.LoopThreshold,
 		loopWindow:              options.LoopWindow,
 		executionGuard:          options.ExecutionGuard,
@@ -626,6 +630,10 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 		requireDistributedGuard: options.RequireDistributedExecutionGuard,
 		now:                     options.Now,
 	}
+	service.configureOutboxDeliveryBulkheads(
+		options.OutboxDeliveryConcurrency,
+	)
+	return service
 }
 
 func (s *AgentNativeService) SetGlobalEmergencyStop(enabled bool) {
@@ -3095,7 +3103,7 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 	limit int,
 	lockTTL time.Duration,
 ) ([]*models.OutboxDelivery, error) {
-	claimed, _, _, err := s.claimPendingOutbox(
+	claimResult, err := s.claimPendingOutbox(
 		ctx,
 		workerID,
 		limit,
@@ -3103,7 +3111,16 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 		outboxBatchPersistenceCutoff(s.db),
 		archivedProjectOutboxDestinations(),
 		archivedProjectOutboxEventTypes(),
+		nil,
 	)
+	claimed := make(
+		[]*models.OutboxDelivery,
+		0,
+		len(claimResult.deliveries),
+	)
+	for _, delivery := range claimResult.deliveries {
+		claimed = append(claimed, delivery.delivery)
+	}
 	return claimed, err
 }
 
@@ -3135,9 +3152,12 @@ func (s *AgentNativeService) claimPendingOutbox(
 	batchCreatedBefore time.Time,
 	archivedAllowedDestinations []string,
 	archivedAllowedEventTypes []string,
-) ([]*models.OutboxDelivery, int, int, error) {
+	reservePermit func(
+		OutboxDeliveryLane,
+	) (*outboxDeliveryPermit, outboxPermitBlock),
+) (outboxClaimResult, error) {
 	if strings.TrimSpace(workerID) == "" {
-		return nil, 0, 0, fmt.Errorf("worker id is required")
+		return outboxClaimResult{}, fmt.Errorf("worker id is required")
 	}
 	if limit <= 0 {
 		limit = 50
@@ -3149,18 +3169,24 @@ func (s *AgentNativeService) claimPendingOutbox(
 		lockTTL = 2 * time.Minute
 	}
 	if batchCreatedBefore.IsZero() {
-		return nil, 0, 0, errors.New(
+		return outboxClaimResult{}, errors.New(
 			"outbox batch creation cutoff is required",
 		)
 	}
 	batchCreatedBefore = batchCreatedBefore.UTC()
-	var claimed []*models.OutboxDelivery
-	backstoppedDead := 0
-	scannedCandidates := 0
+	type claimCandidateCursor struct {
+		class    string
+		expected outboxClaimScanCursor
+		before   outboxClaimScanCursor
+	}
+	claimResult := outboxClaimResult{}
 	var scanCursorMutations []outboxClaimScanCursorMutation
+	capacitySkippedClaimClasses := make(
+		map[string]claimCandidateCursor,
+	)
 	operation, err := requireOutboxWorkerOperation(ctx)
 	if err != nil {
-		return nil, 0, 0, err
+		return outboxClaimResult{}, err
 	}
 	applyAllowlist := func(query *gorm.DB) *gorm.DB {
 		if len(archivedAllowedDestinations) == 0 &&
@@ -3244,7 +3270,11 @@ func (s *AgentNativeService) claimPendingOutbox(
 					}
 					claimClasses := make(
 						[][]models.OutboxDelivery,
-						5,
+						outboxClaimClassCount,
+					)
+					candidateClaimCursors := make(
+						map[string]claimCandidateCursor,
+						limit,
 					)
 					classStart := s.nextOutboxClaimClassStart(
 						operation.Scope,
@@ -3291,13 +3321,20 @@ func (s *AgentNativeService) claimPendingOutbox(
 							}
 						}
 						next := outboxClaimScanCursor{}
-						if len(raw) > 0 {
-							last := raw[len(raw)-1]
+						before := cursor
+						for index := range raw {
+							candidateClaimCursors[raw[index].ID] =
+								claimCandidateCursor{
+									class:    class,
+									expected: expected,
+									before:   before,
+								}
 							next = outboxClaimScanCursor{
-								sortAt:    sortAt(last),
-								createdAt: last.CreatedAt,
-								stableID:  last.ID,
+								sortAt:    sortAt(raw[index]),
+								createdAt: raw[index].CreatedAt,
+								stableID:  raw[index].ID,
 							}
+							before = next
 						}
 						if expected != next {
 							scanCursorMutations = append(
@@ -3436,76 +3473,97 @@ func (s *AgentNativeService) claimPendingOutbox(
 							},
 						)
 					}
-					classLoaders[3] = func(
-						pageLimit int,
-					) (int, error) {
-						return loadClaimClass(
-							3,
-							"non-webhook:retry",
-							pageLimit,
-							func(
-								cursor outboxClaimScanCursor,
-								pageLimit int,
-							) *gorm.DB {
-								return buildOutboxNonWebhookRetryClaimCandidateQuery(
-									tx.Model(&models.OutboxDelivery{}),
-									operation.Scope,
-									selectionNow,
-									batchCreatedBefore,
-									cursor,
-									pageLimit,
-								)
-							},
-							func(delivery models.OutboxDelivery) time.Time {
-								return delivery.NextAttemptAt
-							},
-							func(ids []string, _ int) *gorm.DB {
-								return buildOutboxNonWebhookRetryEligiblePageQuery(
-									tx.Model(&models.OutboxDelivery{}),
-									operation.Scope,
-									selectionNow,
-									batchCreatedBefore,
-									ids,
-								)
-							},
-						)
-					}
-					classLoaders[4] = func(
-						pageLimit int,
-					) (int, error) {
-						return loadClaimClass(
-							4,
-							"non-webhook:stale",
-							pageLimit,
-							func(
-								cursor outboxClaimScanCursor,
-								pageLimit int,
-							) *gorm.DB {
-								return buildOutboxNonWebhookStaleClaimCandidateQuery(
-									tx.Model(&models.OutboxDelivery{}),
-									operation.Scope,
-									selectionLockCutoff,
-									batchCreatedBefore,
-									cursor,
-									pageLimit,
-								)
-							},
-							func(delivery models.OutboxDelivery) time.Time {
-								if delivery.LockedAt == nil {
-									return time.Time{}
-								}
-								return delivery.LockedAt.UTC()
-							},
-							func(ids []string, _ int) *gorm.DB {
-								return buildOutboxNonWebhookStaleEligiblePageQuery(
-									tx.Model(&models.OutboxDelivery{}),
-									operation.Scope,
-									selectionLockCutoff,
-									batchCreatedBefore,
-									ids,
-								)
-							},
-						)
+					for laneIndex := range outboxNonWebhookDeliveryLaneOrder {
+						lane := outboxNonWebhookDeliveryLaneOrder[laneIndex]
+						retryClassIndex := 3 + laneIndex*2
+						staleClassIndex := retryClassIndex + 1
+						classLoaders[retryClassIndex] = func(
+							pageLimit int,
+						) (int, error) {
+							return loadClaimClass(
+								retryClassIndex,
+								"non-webhook:"+string(lane)+":retry",
+								pageLimit,
+								func(
+									cursor outboxClaimScanCursor,
+									pageLimit int,
+								) *gorm.DB {
+									return applyOutboxClaimLane(
+										buildOutboxNonWebhookRetryClaimCandidateQuery(
+											tx.Model(&models.OutboxDelivery{}),
+											operation.Scope,
+											selectionNow,
+											batchCreatedBefore,
+											cursor,
+											pageLimit,
+										),
+										lane,
+									)
+								},
+								func(
+									delivery models.OutboxDelivery,
+								) time.Time {
+									return delivery.NextAttemptAt
+								},
+								func(ids []string, _ int) *gorm.DB {
+									return applyOutboxClaimLane(
+										buildOutboxNonWebhookRetryEligiblePageQuery(
+											tx.Model(&models.OutboxDelivery{}),
+											operation.Scope,
+											selectionNow,
+											batchCreatedBefore,
+											ids,
+										),
+										lane,
+									)
+								},
+							)
+						}
+						classLoaders[staleClassIndex] = func(
+							pageLimit int,
+						) (int, error) {
+							return loadClaimClass(
+								staleClassIndex,
+								"non-webhook:"+string(lane)+":stale",
+								pageLimit,
+								func(
+									cursor outboxClaimScanCursor,
+									pageLimit int,
+								) *gorm.DB {
+									return applyOutboxClaimLane(
+										buildOutboxNonWebhookStaleClaimCandidateQuery(
+											tx.Model(&models.OutboxDelivery{}),
+											operation.Scope,
+											selectionLockCutoff,
+											batchCreatedBefore,
+											cursor,
+											pageLimit,
+										),
+										lane,
+									)
+								},
+								func(
+									delivery models.OutboxDelivery,
+								) time.Time {
+									if delivery.LockedAt == nil {
+										return time.Time{}
+									}
+									return delivery.LockedAt.UTC()
+								},
+								func(ids []string, _ int) *gorm.DB {
+									return applyOutboxClaimLane(
+										buildOutboxNonWebhookStaleEligiblePageQuery(
+											tx.Model(&models.OutboxDelivery{}),
+											operation.Scope,
+											selectionLockCutoff,
+											batchCreatedBefore,
+											ids,
+										),
+										lane,
+									)
+								},
+							)
+						}
 					}
 					remainingScan := limit
 					for offset := 0; offset < len(classLoaders) &&
@@ -3519,7 +3577,7 @@ func (s *AgentNativeService) claimPendingOutbox(
 						}
 						remainingScan -= scanned
 					}
-					scannedCandidates += limit - remainingScan
+					claimResult.scanned += limit - remainingScan
 					candidates := mergeOutboxClaimCandidateClasses(
 						claimClasses,
 						classStart,
@@ -3566,12 +3624,46 @@ func (s *AgentNativeService) claimPendingOutbox(
 								); transitionErr != nil {
 								return transitionErr
 							} else if transitioned {
-								backstoppedDead++
+								claimResult.backstoppedDead++
 							}
 							continue
 						}
+						var permit *outboxDeliveryPermit
+						if reservePermit != nil {
+							lane :=
+								outboxDeliveryLaneForDestination(
+									candidate.DestinationType,
+								)
+							var blocked outboxPermitBlock
+							permit, blocked = reservePermit(lane)
+							if permit == nil {
+								claimResult.noteBlockedPermit(
+									lane,
+									blocked,
+								)
+								if position, ok :=
+									candidateClaimCursors[candidate.ID]; ok {
+									if _, recorded :=
+										capacitySkippedClaimClasses[position.class]; !recorded {
+										capacitySkippedClaimClasses[position.class] =
+											position
+									}
+								}
+								// Capacity-skipped rows remain eligible and
+								// unclaimed. Do not consume the caller's
+								// logical batch budget so a cooperative lane
+								// can continue in a later wave after permits
+								// are released. Each physical wave is still
+								// capped by the process-wide slot count.
+								if claimResult.scanned > 0 {
+									claimResult.scanned--
+								}
+								continue
+							}
+						}
 						lockToken, tokenErr := newOutboxLockToken()
 						if tokenErr != nil {
+							permit.release()
 							return tokenErr
 						}
 						updateQuery := tx.Model(
@@ -3612,9 +3704,11 @@ func (s *AgentNativeService) claimPendingOutbox(
 								"updated_at":          claimNow,
 							})
 						if result.Error != nil {
+							permit.release()
 							return result.Error
 						}
 						if result.RowsAffected == 0 {
+							permit.release()
 							continue
 						}
 						var delivery models.OutboxDelivery
@@ -3624,6 +3718,7 @@ func (s *AgentNativeService) claimPendingOutbox(
 							operation.Scope.OrganizationID,
 							operation.Scope.ProjectID,
 						).First(&delivery).Error; err != nil {
+							permit.release()
 							return err
 						}
 						if delivery.Event == nil ||
@@ -3631,6 +3726,7 @@ func (s *AgentNativeService) claimPendingOutbox(
 								operation.Scope.OrganizationID ||
 							delivery.Event.ProjectID !=
 								operation.Scope.ProjectID {
+							permit.release()
 							return errors.New(
 								"outbox delivery event project scope mismatch",
 							)
@@ -3640,15 +3736,23 @@ func (s *AgentNativeService) claimPendingOutbox(
 								tx,
 								&delivery,
 							); err != nil {
+								permit.release()
 								return err
 							}
 						}
 						if _, err := OutboxClaimRefFromDelivery(
 							&delivery,
 						); err != nil {
+							permit.release()
 							return err
 						}
-						claimed = append(claimed, &delivery)
+						claimResult.deliveries = append(
+							claimResult.deliveries,
+							claimedOutboxDelivery{
+								delivery: &delivery,
+								permit:   permit,
+							},
+						)
 					}
 					return nil
 				},
@@ -3656,9 +3760,19 @@ func (s *AgentNativeService) claimPendingOutbox(
 		},
 	)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("claim outbox deliveries: %w", err)
+		for _, claimed := range claimResult.deliveries {
+			claimed.permit.release()
+		}
+		return outboxClaimResult{}, fmt.Errorf(
+			"claim outbox deliveries: %w",
+			err,
+		)
 	}
 	for _, mutation := range scanCursorMutations {
+		if _, skipped :=
+			capacitySkippedClaimClasses[mutation.class]; skipped {
+			continue
+		}
 		s.compareAndSetOutboxClaimScanCursor(
 			operation.Scope,
 			mutation.class,
@@ -3666,7 +3780,19 @@ func (s *AgentNativeService) claimPendingOutbox(
 			mutation.next,
 		)
 	}
-	return claimed, backstoppedDead, scannedCandidates, nil
+	for _, skipped := range capacitySkippedClaimClasses {
+		// Rewind to immediately before the earliest capacity-skipped
+		// candidate, including after a cursor wrap. Successfully claimed
+		// rows disappear from the next eligible page, while the skipped row
+		// is revisited before continuously arriving successors.
+		s.compareAndSetOutboxClaimScanCursor(
+			operation.Scope,
+			skipped.class,
+			skipped.expected,
+			skipped.before,
+		)
+	}
+	return claimResult, nil
 }
 
 func (s *AgentNativeService) nextOutboxClaimClassStart(
@@ -4175,12 +4301,15 @@ func (f OutboxDeliverFunc) Deliver(ctx context.Context, delivery *models.OutboxD
 }
 
 type OutboxBatchResult struct {
-	Claimed   int
-	Delivered int
-	Failed    int
-	Dead      int
-	Expired   int
-	consumed  int
+	Claimed         int
+	Delivered       int
+	Failed          int
+	Dead            int
+	Expired         int
+	Status          OutboxBatchStatus
+	GlobalSaturated bool
+	SaturatedLanes  []OutboxDeliveryLane
+	consumed        int
 }
 
 type outboxWorkerProject struct {
@@ -4291,6 +4420,7 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 	}
 	var batchErrors []error
 	consumed := 0
+	emptySaturationProbes := 0
 	for consumed < limit {
 		wave, err := s.processOutboxWave(
 			ctx,
@@ -4306,15 +4436,29 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 		result.Dead += wave.Dead
 		result.Expired += wave.Expired
 		result.consumed += wave.consumed
+		result.mergeOutboxCapacity(wave)
 		consumed += wave.consumed
 		if err != nil {
 			batchErrors = append(batchErrors, err)
 			break
 		}
 		if wave.consumed == 0 {
+			// A saturated lane may occupy the raw page selected by the
+			// current claim class. Rotate through the fixed class set so a
+			// healthy lane in the same project can still make progress.
+			// The fixed bound prevents a permanently saturated queue from
+			// turning one worker iteration into an unbounded scan.
+			if !wave.GlobalSaturated &&
+				len(wave.SaturatedLanes) > 0 &&
+				emptySaturationProbes < outboxClaimClassCount-1 {
+				emptySaturationProbes++
+				continue
+			}
 			break
 		}
+		emptySaturationProbes = 0
 	}
+	result.finalizeOutboxBatchStatus()
 	return result, errors.Join(batchErrors...)
 }
 
@@ -4339,58 +4483,83 @@ func (s *AgentNativeService) processOutboxWave(
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	reserved := 0
-	for reserved < limit {
-		select {
-		case s.outboxDeliverySlots <- struct{}{}:
-			reserved++
-		default:
-			limit = reserved
-		}
-		if reserved == limit {
-			break
-		}
-	}
-	if reserved == 0 {
+	actor := models.SystemActor(outboxSystemActorID)
+	var batchErrors []error
+	preexistingGlobalPermits := len(s.outboxDeliverySlots)
+	if preexistingGlobalPermits == cap(s.outboxDeliverySlots) {
+		// Full global capacity is itself a typed saturation signal. Do not
+		// scan project queues when no candidate can possibly acquire a
+		// permit: a bounded project catalog can still contain thousands of
+		// projects and each project has multiple claim classes.
+		result.GlobalSaturated = true
 		return result, nil
+	}
+	claimLimit := cap(s.outboxDeliverySlots) -
+		preexistingGlobalPermits
+	if claimLimit > limit {
+		claimLimit = limit
+	}
+	preexistingLanePermits := make(
+		map[OutboxDeliveryLane]int,
+		len(outboxDeliveryLaneOrder),
+	)
+	for _, lane := range outboxDeliveryLaneOrder {
+		preexistingLanePermits[lane] =
+			len(s.outboxDeliveryLaneSlots[lane])
+	}
+	reservePermit := func(
+		lane OutboxDeliveryLane,
+	) (*outboxDeliveryPermit, outboxPermitBlock) {
+		permit, blocked := s.tryAcquireOutboxDeliveryPermit(lane)
+		if permit != nil {
+			return permit, blocked
+		}
+		switch blocked {
+		case outboxPermitLaneSaturated:
+			if preexistingLanePermits[lane] == 0 {
+				blocked = outboxPermitAvailable
+			}
+		case outboxPermitGlobalSaturated:
+			if preexistingGlobalPermits == 0 {
+				blocked = outboxPermitAvailable
+			}
+		}
+		return nil, blocked
+	}
+	claimResult, claimErr := s.claimOutboxWaveProjects(
+		ctx,
+		actor,
+		workerID,
+		claimLimit,
+		projects,
+		batchCreatedBefore,
+		reservePermit,
+	)
+	if claimErr != nil {
+		batchErrors = append(batchErrors, claimErr)
+	}
+	deliveries := claimResult.deliveries
+	result.Dead = claimResult.backstoppedDead
+	result.Failed = claimResult.backstoppedDead
+	result.consumed = claimResult.scanned
+	result.GlobalSaturated = claimResult.globalSaturated
+	for _, lane := range claimResult.saturatedLanes {
+		result.noteOutboxSaturation(lane, false)
+	}
+	result.Claimed = len(deliveries)
+	if len(deliveries) == 0 {
+		return result, errors.Join(batchErrors...)
 	}
 	reservationsHandedOff := false
 	defer func() {
 		if reservationsHandedOff {
 			return
 		}
-		for reserved > 0 {
-			<-s.outboxDeliverySlots
-			reserved--
+		for _, claimed := range deliveries {
+			claimed.permit.release()
 		}
 	}()
-	actor := models.SystemActor(outboxSystemActorID)
-	deliveries, backstoppedDead, scannedCandidates, err :=
-		s.claimOutboxWaveProjects(
-			ctx,
-			actor,
-			workerID,
-			limit,
-			projects,
-			batchCreatedBefore,
-		)
-	claimErr := err
-	result.Dead = backstoppedDead
-	result.Failed = backstoppedDead
-	result.consumed = scannedCandidates
-	result.Claimed = len(deliveries)
-	if len(deliveries) == 0 {
-		return result, claimErr
-	}
-	for reserved > len(deliveries) {
-		<-s.outboxDeliverySlots
-		reserved--
-	}
 
-	var batchErrors []error
-	if claimErr != nil {
-		batchErrors = append(batchErrors, claimErr)
-	}
 	type deliveryAttempt struct {
 		delivery         *models.OutboxDelivery
 		finalizeDelivery *models.OutboxDelivery
@@ -4404,6 +4573,7 @@ func (s *AgentNativeService) processOutboxWave(
 		scope            models.ProjectScope
 		claim            OutboxClaimRef
 		deadline         time.Time
+		permit           *outboxDeliveryPermit
 	}
 
 	workerCount := cap(s.outboxDeliverySlots)
@@ -4415,7 +4585,8 @@ func (s *AgentNativeService) processOutboxWave(
 	}
 	jobs := make(chan deliveryJob, len(deliveries))
 	attempts := make(chan deliveryAttempt, len(deliveries))
-	for _, delivery := range deliveries {
+	for _, claimed := range deliveries {
+		delivery := claimed.delivery
 		requestWindow := s.outboxDeliveryTimeout
 		if parentDeadline, ok := ctx.Deadline(); ok {
 			if parentWindow := time.Until(parentDeadline); parentWindow <
@@ -4456,6 +4627,7 @@ func (s *AgentNativeService) processOutboxWave(
 			finalizeDelivery: &finalizeDelivery,
 			scope:            scope,
 			claim:            claim,
+			permit:           claimed.permit,
 			// Every claimed delivery receives the same full bounded window.
 			// A non-cooperative black-hole attempt therefore cannot make queued
 			// work extend the batch by another timeout per item.
@@ -4471,7 +4643,7 @@ func (s *AgentNativeService) processOutboxWave(
 				deliveryCtx, contextErr :=
 					outboxDeliveryOperationContext(ctx, job.delivery)
 				if contextErr != nil {
-					<-s.outboxDeliverySlots
+					job.permit.release()
 					attempts <- deliveryAttempt{
 						delivery:         job.delivery,
 						finalizeDelivery: job.finalizeDelivery,
@@ -4495,6 +4667,7 @@ func (s *AgentNativeService) processOutboxWave(
 						job.deadline,
 						deliverer,
 						job.delivery,
+						job.permit,
 					),
 				}
 			}
@@ -4553,9 +4726,12 @@ func (s *AgentNativeService) claimOutboxWaveProjects(
 	limit int,
 	projects []outboxWorkerProject,
 	batchCreatedBefore time.Time,
-) ([]*models.OutboxDelivery, int, int, error) {
+	reservePermit func(
+		OutboxDeliveryLane,
+	) (*outboxDeliveryPermit, outboxPermitBlock),
+) (outboxClaimResult, error) {
 	if len(projects) == 0 || limit <= 0 {
-		return nil, 0, 0, nil
+		return outboxClaimResult{}, nil
 	}
 	projectBudget := minInt(len(projects), limit)
 	s.outboxProjectCursorMu.Lock()
@@ -4568,12 +4744,12 @@ func (s *AgentNativeService) claimOutboxWaveProjects(
 		}
 		s.outboxProjectCursor.Add(uint64(visited))
 	}()
-	deliveries := make([]*models.OutboxDelivery, 0, limit)
-	backstoppedDead := 0
-	scannedCandidates := 0
+	result := outboxClaimResult{
+		deliveries: make([]claimedOutboxDelivery, 0, limit),
+	}
 	var projectErrors []error
 	for offset := 0; offset < projectBudget &&
-		scannedCandidates < limit; offset++ {
+		result.scanned < limit; offset++ {
 		project := projects[(start+offset)%len(projects)]
 		visited++
 		traceID := fmt.Sprintf(
@@ -4597,15 +4773,16 @@ func (s *AgentNativeService) claimOutboxWaveProjects(
 			}
 			continue
 		}
-		claimed, projectDead, projectScanned, err :=
+		projectResult, err :=
 			s.claimPendingOutbox(
 				projectCtx,
 				workerID,
-				limit-scannedCandidates,
+				limit-result.scanned,
 				s.outboxLockTTL,
 				batchCreatedBefore,
 				archivedProjectOutboxDestinations(),
 				archivedProjectOutboxEventTypes(),
+				reservePermit,
 			)
 		if err != nil {
 			projectErrors = append(projectErrors, fmt.Errorf(
@@ -4619,12 +4796,9 @@ func (s *AgentNativeService) claimOutboxWaveProjects(
 			}
 			continue
 		}
-		backstoppedDead += projectDead
-		scannedCandidates += projectScanned
-		deliveries = append(deliveries, claimed...)
+		result.merge(projectResult)
 	}
-	return deliveries, backstoppedDead, scannedCandidates,
-		errors.Join(projectErrors...)
+	return result, errors.Join(projectErrors...)
 }
 
 func requireOutboxWorkerOperation(
@@ -4723,11 +4897,12 @@ func (s *AgentNativeService) performOutboxDeliveryAttempt(
 	deadline time.Time,
 	deliverer OutboxDeliverer,
 	delivery *models.OutboxDelivery,
+	permit *outboxDeliveryPermit,
 ) OutboxAttemptResult {
 	releaseReservation := true
 	defer func() {
 		if releaseReservation {
-			<-s.outboxDeliverySlots
+			permit.release()
 		}
 	}()
 	if delivery == nil {
@@ -4748,16 +4923,11 @@ func (s *AgentNativeService) performOutboxDeliveryAttempt(
 
 	outcome := make(chan OutboxAttemptResult, 1)
 	go func() {
-		reservationReleased := false
-		release := func() {
-			if reservationReleased {
-				return
-			}
-			<-s.outboxDeliverySlots
-			reservationReleased = true
-		}
+		// The permit belongs to the adapter goroutine, not the caller's
+		// timeout. A non-cooperative adapter keeps consuming its lane/global
+		// capacity until it actually returns.
+		defer permit.release()
 		send := func(result OutboxAttemptResult) {
-			release()
 			outcome <- result
 		}
 		defer func() {
@@ -4769,7 +4939,6 @@ func (s *AgentNativeService) performOutboxDeliveryAttempt(
 				))
 				return
 			}
-			release()
 		}()
 		event := CloudEventFromModel(delivery.Event)
 		if delivery.DestinationType == "webhook" &&

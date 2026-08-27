@@ -440,7 +440,7 @@ func TestWebhookOutboxBatchPersistsEveryAuditBeyondWriterConcurrency(
 			"complete-audit-"+strconv.Itoa(index),
 		)
 	}
-	fixture.service.outboxDeliverySlots = make(chan struct{}, 4)
+	fixture.service.configureOutboxDeliveryBulkheads(4)
 	result, err := fixture.service.ProcessOutboxBatch(
 		context.Background(),
 		"complete-audit-worker",

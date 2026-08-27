@@ -246,6 +246,92 @@ func TestWebhookOutboxLifecycleProductionQueryBuildersPreserveFullContract(
 	)
 }
 
+func TestOutboxClaimLaneFiltersUseFixedDisjointDestinationSets(
+	t *testing.T,
+) {
+	fixture := newWebhookOutboxLifecycleFixture(
+		t,
+		time.Date(2026, time.August, 26, 9, 0, 0, 0, time.UTC),
+	)
+	dryRun := fixture.db.Session(&gorm.Session{DryRun: true})
+	tests := []struct {
+		name         string
+		lane         OutboxDeliveryLane
+		sqlFragment  string
+		destinations []string
+	}{
+		{
+			name:         "callback",
+			lane:         OutboxDeliveryLaneCallback,
+			sqlFragment:  "destination_type IN (?,?)",
+			destinations: outboxCallbackDestinations,
+		},
+		{
+			name:         "storage",
+			lane:         OutboxDeliveryLaneStorage,
+			sqlFragment:  "destination_type IN (?,?,?,?)",
+			destinations: outboxStorageDestinations,
+		},
+		{
+			name:         "internal",
+			lane:         OutboxDeliveryLaneInternal,
+			sqlFragment:  "destination_type IN (?,?,?,?,?)",
+			destinations: outboxInternalDestinations,
+		},
+		{
+			name: "other",
+			lane: OutboxDeliveryLaneOther,
+			sqlFragment: "destination_type NOT IN " +
+				"(?,?,?,?,?,?,?,?,?,?,?,?)",
+			destinations: outboxKnownDestinations,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var rows []models.OutboxDelivery
+			query := applyOutboxClaimLane(
+				dryRun.Model(&models.OutboxDelivery{}),
+				test.lane,
+			).Find(&rows)
+			assertLifecycleDryRunSQLContains(
+				t,
+				query.Statement.SQL.String(),
+				test.sqlFragment,
+			)
+			if len(query.Statement.Vars) != len(test.destinations) {
+				t.Fatalf(
+					"%s lane bind count = %d, want %d",
+					test.lane,
+					len(query.Statement.Vars),
+					len(test.destinations),
+				)
+			}
+			for index, destination := range test.destinations {
+				if query.Statement.Vars[index] != destination {
+					t.Fatalf(
+						"%s lane bind %d = %v, want %q",
+						test.lane,
+						index,
+						query.Statement.Vars[index],
+						destination,
+					)
+				}
+			}
+		})
+	}
+
+	var rows []models.OutboxDelivery
+	failClosed := applyOutboxClaimLane(
+		dryRun.Model(&models.OutboxDelivery{}),
+		OutboxDeliveryLaneWebhook,
+	).Find(&rows)
+	assertLifecycleDryRunSQLContains(
+		t,
+		failClosed.Statement.SQL.String(),
+		"1 = 0",
+	)
+}
+
 func assertLifecycleDryRunSQLContains(
 	t *testing.T,
 	sql string,
