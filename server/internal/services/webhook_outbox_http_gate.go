@@ -36,6 +36,13 @@ type webhookOutboxGateState struct {
 	event    models.DomainEvent
 }
 
+func (ns *NotificationService) webhookGateNow() time.Time {
+	if ns == nil || ns.webhookAttemptGateClock == nil {
+		return time.Now().UTC()
+	}
+	return ns.webhookAttemptGateClock().UTC()
+}
+
 func (claim WebhookOutboxAttemptClaim) validate() error {
 	if strings.TrimSpace(claim.DeliveryID) == "" ||
 		strings.TrimSpace(claim.EventID) == "" ||
@@ -100,7 +107,7 @@ func (ns *NotificationService) webhookOutboxAttemptGate(
 		return webhookOutboxGateState{},
 			ErrWebhookOutboxAttemptRejected
 	}
-	now := time.Now().UTC()
+	now := ns.webhookGateNow()
 	if !now.Before(claim.EffectiveDeadline.UTC()) ||
 		!now.Before(claim.CredentialExpiresAt.UTC()) {
 		return webhookOutboxGateState{},
@@ -171,7 +178,7 @@ func (ns *NotificationService) webhookOutboxAttemptGate(
 					if err != nil {
 						return err
 					}
-					now := time.Now().UTC()
+					now := ns.webhookGateNow()
 					if snapshot.CredentialShreddedAt != nil ||
 						!snapshot.CredentialExpiresAt.UTC().Equal(
 							claim.CredentialExpiresAt.UTC(),
@@ -185,7 +192,7 @@ func (ns *NotificationService) webhookOutboxAttemptGate(
 					validated.snapshot = *snapshot
 					if startDispatch {
 						startedAt := webhookDispatchStartedAt(
-							time.Now().UTC(),
+							ns.webhookGateNow(),
 							claim.LockedAt,
 						)
 						if !startedAt.Before(

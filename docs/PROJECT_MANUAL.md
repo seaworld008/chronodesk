@@ -68,7 +68,7 @@ Human REST、Agent REST、MCP、A2A 与 Connector 五类 Adapter 直接复用同
 
 | 层级 | 当前版本/组件 |
 | --- | --- |
-| 后端 | Go 1.26.5、Gin 1.12、GORM 1.31 |
+| 后端 | Go 1.26.7、Gin 1.12、GORM 1.31 |
 | 数据 | PostgreSQL 18（Compose 18.4）、Redis 8（Compose 8.8）、OpenSearch 3.5 |
 | 前端 | React 19.2.8、React Admin 5.15.1、MUI 7.3.11 |
 | 路由与构建 | React Router 7.18.2、TypeScript 6、Vite 8.1.5 |
