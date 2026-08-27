@@ -14,7 +14,12 @@ import {
 } from './projectScope'
 import { humanApiRoutes } from './generated/human-api'
 import { joinApiUrl } from './apiUrl'
-import { readHumanAccessToken } from './humanSessionRuntime'
+import {
+    captureHumanAccessTokenSnapshot,
+    humanAccessTokenSnapshotIsCurrent,
+    readHumanAccessToken,
+    type HumanAccessTokenSnapshot,
+} from './humanSessionRuntime'
 import {
     projectAccessInvalidatedEvent,
     projectScopeChangedEvent,
@@ -97,11 +102,18 @@ const httpClient = async (
         headers.set('Authorization', `Bearer ${token}`)
     }
 
+    let requestSession: HumanAccessTokenSnapshot | null = null
     try {
         requireCommittedHumanBearerHeaders(headers)
+        const authorization = headers.get('Authorization')
+        requestSession = captureHumanAccessTokenSnapshot(
+            authorization?.startsWith('Bearer ')
+                ? authorization.slice('Bearer '.length)
+                : null,
+        )
         return await fetchUtils.fetchJson(url, { ...options, headers })
     } catch (error: unknown) {
-        return handleHttpError(error, url)
+        return handleHttpError(error, url, requestSession)
     }
 }
 
@@ -147,9 +159,16 @@ const getTotalFromHeaders = (headers: Headers, defaultTotal: number = 0): number
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
 
-function handleHttpError(error: unknown, url?: string): never {
+function handleHttpError(
+    error: unknown,
+    url?: string,
+    requestSession?: HumanAccessTokenSnapshot | null,
+): never {
     if (error instanceof HttpError) {
-        if (error.status === 401) {
+        if (
+            error.status === 401 &&
+            humanAccessTokenSnapshotIsCurrent(requestSession ?? null)
+        ) {
             signalSessionInvalidated()
         }
         if (

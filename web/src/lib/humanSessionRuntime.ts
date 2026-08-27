@@ -1,5 +1,22 @@
 let accessToken: string | null = null
 let generation = 0
+let committedAt = 0
+
+export type HumanAccessTokenSnapshot = Readonly<{
+    accessToken: string
+    generation: number
+}>
+
+export const humanSessionClockNow = (): number => {
+    if (
+        typeof performance !== 'undefined' &&
+        Number.isFinite(performance.timeOrigin) &&
+        Number.isFinite(performance.now())
+    ) {
+        return performance.timeOrigin + performance.now()
+    }
+    return Date.now()
+}
 
 const consumeLegacyPersistedBearer = (): string | null => {
     if (typeof window === 'undefined') return null
@@ -12,6 +29,9 @@ const consumeLegacyPersistedBearer = (): string | null => {
 }
 
 accessToken = consumeLegacyPersistedBearer()
+if (accessToken !== null) {
+    committedAt = humanSessionClockNow()
+}
 
 export const readHumanAccessToken = (): string | null => {
     // The cutover is deliberately one-shot. Late writes to legacy keys are
@@ -23,13 +43,34 @@ export const readHumanAccessToken = (): string | null => {
 export const commitHumanAccessToken = (token: string): number => {
     accessToken = token
     generation += 1
+    committedAt = humanSessionClockNow()
     return generation
 }
 
 export const clearHumanAccessToken = (): number => {
     accessToken = null
     generation += 1
+    committedAt = 0
     return generation
 }
 
 export const humanSessionGeneration = (): number => generation
+
+export const humanSessionCommittedAt = (): number => committedAt
+
+export const captureHumanAccessTokenSnapshot = (
+    token: string | null,
+): HumanAccessTokenSnapshot | null =>
+    token === null || token.length === 0
+        ? null
+        : {
+              accessToken: token,
+              generation,
+          }
+
+export const humanAccessTokenSnapshotIsCurrent = (
+    snapshot: HumanAccessTokenSnapshot | null,
+): boolean =>
+    snapshot !== null &&
+    generation === snapshot.generation &&
+    accessToken === snapshot.accessToken

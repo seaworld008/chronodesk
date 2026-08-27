@@ -1,3 +1,5 @@
+import { humanSessionClockNow } from './humanSessionRuntime.ts'
+
 export const humanSessionChannelName = 'chronodesk:human-session:v2'
 
 export type HumanSessionSignOut =
@@ -117,7 +119,7 @@ export const publishAuthenticatedHumanSession = (
     getChannel()?.postMessage({
         type: 'authenticated',
         ...metadata,
-        issued_at: Date.now(),
+        issued_at: humanSessionClockNow(),
     } satisfies HumanSessionMetadata)
 }
 
@@ -127,7 +129,7 @@ export const publishSignedOutHumanSession = (
     getChannel()?.postMessage({
         type: 'signed_out',
         ...signOut,
-        issued_at: Date.now(),
+        issued_at: humanSessionClockNow(),
     } satisfies HumanSessionMetadata)
 }
 
@@ -137,12 +139,14 @@ export const humanSessionSignOutMatchesBinding = (
         subject: string
         session_id: string
     } | null,
+    committedAt: number,
 ): boolean =>
     binding !== null &&
     binding.subject === metadata.subject &&
     (
-        metadata.scope === 'all_devices' ||
-        binding.session_id === metadata.session_id
+        metadata.scope === 'all_devices'
+            ? metadata.issued_at >= committedAt
+            : binding.session_id === metadata.session_id
     )
 
 export const subscribeHumanSessionMetadata = (

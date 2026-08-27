@@ -11,7 +11,11 @@ import { joinApiUrl } from './apiUrl'
 import {
   resolveHumanBearerForRequest,
 } from './humanTabSession'
-import { readHumanAccessToken } from './humanSessionRuntime'
+import {
+  captureHumanAccessTokenSnapshot,
+  humanAccessTokenSnapshotIsCurrent,
+  readHumanAccessToken,
+} from './humanSessionRuntime'
 
 export type ApiOptions = RequestInit & { rawResponse?: boolean }
 
@@ -47,11 +51,19 @@ export const sessionAwareFetch = async (
   if (authorization?.startsWith('Bearer ')) {
     requireCommittedHumanBearerHeaders(requestHeaders)
   }
+  const committedAuthorization =
+    requestHeaders.get('Authorization')
+  const requestSession = captureHumanAccessTokenSnapshot(
+    committedAuthorization?.startsWith('Bearer ')
+      ? committedAuthorization.slice('Bearer '.length)
+      : null,
+  )
   const response = await fetch(input, { ...init, headers: requestHeaders })
   const path = requestPath(input)
   if (
     response.status === 401 &&
-    !isHumanSessionLifecycleRequest(path)
+    !isHumanSessionLifecycleRequest(path) &&
+    humanAccessTokenSnapshotIsCurrent(requestSession)
   ) {
     signalSessionInvalidated()
   } else if (response.status === 403) {

@@ -37,6 +37,7 @@ import {
 import {
     clearHumanAccessToken,
     commitHumanAccessToken,
+    humanSessionCommittedAt,
     readHumanAccessToken,
 } from './humanSessionRuntime'
 import {
@@ -325,6 +326,7 @@ export const applyRemoteHumanSignOut = (
         !humanSessionSignOutMatchesBinding(
             metadata,
             readHumanSessionBinding(),
+            humanSessionCommittedAt(),
         )
     ) {
         return false

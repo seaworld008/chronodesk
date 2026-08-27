@@ -64,8 +64,11 @@ const {
 local.setItem('token', 'legacy-access-token')
 local.setItem('refreshToken', 'legacy-refresh-token')
 const {
+    captureHumanAccessTokenSnapshot,
     clearHumanAccessToken,
     commitHumanAccessToken,
+    humanAccessTokenSnapshotIsCurrent,
+    humanSessionCommittedAt,
     readHumanAccessToken,
 } = await import('./humanSessionRuntime.ts')
 const {
@@ -86,12 +89,19 @@ test('旧 bearer 只迁移到内存并立即清除浏览器持久化', () => {
     assert.equal(local.getItem('refreshToken'), null)
 
     commitHumanAccessToken('rotated-access-token')
+    const rotatedSnapshot =
+        captureHumanAccessTokenSnapshot('rotated-access-token')
     assert.equal(readHumanAccessToken(), 'rotated-access-token')
+    assert.equal(humanAccessTokenSnapshotIsCurrent(rotatedSnapshot), true)
+    assert.ok(humanSessionCommittedAt() > 0)
     assert.equal(local.getItem('token'), null)
     assert.equal(local.getItem('refreshToken'), null)
 
+    commitHumanAccessToken('newer-access-token')
+    assert.equal(humanAccessTokenSnapshotIsCurrent(rotatedSnapshot), false)
     clearHumanAccessToken()
     assert.equal(readHumanAccessToken(), null)
+    assert.equal(humanSessionCommittedAt(), 0)
 
     local.setItem('token', 'late-persisted-token')
     local.setItem('refreshToken', 'late-persisted-refresh')
@@ -194,7 +204,7 @@ test('跨标签消息拒绝残缺元数据，只交付完整稳定绑定', () =>
     ])
 })
 
-test('延迟的当前会话退出只匹配原 sid，全设备退出匹配同一账号', () => {
+test('延迟退出只清原 sid 或全设备操作前已提交的同账号会话', () => {
     const bindingA = {
         subject: '42',
         session_id: 'session-a',
@@ -225,6 +235,7 @@ test('延迟的当前会话退出只匹配原 sid，全设备退出匹配同一�
         humanSessionSignOutMatchesBinding(
             currentSessionSignOut,
             bindingA,
+            2,
         ),
         true,
     )
@@ -232,6 +243,7 @@ test('延迟的当前会话退出只匹配原 sid，全设备退出匹配同一�
         humanSessionSignOutMatchesBinding(
             currentSessionSignOut,
             replacementBinding,
+            2,
         ),
         false,
     )
@@ -239,6 +251,7 @@ test('延迟的当前会话退出只匹配原 sid，全设备退出匹配同一�
         humanSessionSignOutMatchesBinding(
             currentSessionSignOut,
             rotatedBinding,
+            2,
         ),
         false,
     )
@@ -246,13 +259,23 @@ test('延迟的当前会话退出只匹配原 sid，全设备退出匹配同一�
         humanSessionSignOutMatchesBinding(
             allDevicesSignOut,
             rotatedBinding,
+            1,
         ),
         true,
     )
     assert.equal(
         humanSessionSignOutMatchesBinding(
             allDevicesSignOut,
+            rotatedBinding,
+            2,
+        ),
+        false,
+    )
+    assert.equal(
+        humanSessionSignOutMatchesBinding(
+            allDevicesSignOut,
             replacementBinding,
+            1,
         ),
         false,
     )
