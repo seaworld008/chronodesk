@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,6 +23,31 @@ type sessionTestUserRepo struct {
 }
 
 type sessionTestEmailConfig struct{}
+
+type sessionTestProfileRepo struct{}
+
+func (sessionTestProfileRepo) Create(context.Context, *UserProfile) error {
+	return nil
+}
+
+func (sessionTestProfileRepo) GetByUserID(
+	_ context.Context,
+	userID uint,
+) (*UserProfile, error) {
+	return &UserProfile{UserID: userID}, nil
+}
+
+func (sessionTestProfileRepo) Patch(
+	context.Context,
+	uint,
+	ProfilePatch,
+) error {
+	return nil
+}
+
+func (sessionTestProfileRepo) Delete(context.Context, uint) error {
+	return nil
+}
 
 func (sessionTestEmailConfig) IsEmailVerificationEnabled(context.Context) (bool, error) {
 	return false, nil
@@ -49,6 +73,11 @@ func setupSessionRevocationTest(t *testing.T) (*GormTokenRepository, *SimpleJWTM
 	if err != nil {
 		t.Fatalf("open session database: %v", err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("open session SQL database: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.LoginHistory{},
@@ -98,7 +127,9 @@ func setupSessionRevocationTest(t *testing.T) (*GormTokenRepository, *SimpleJWTM
 				},
 			},
 		},
+		profileRepo:        sessionTestProfileRepo{},
 		tokenRepo:          repository,
+		loginHistoryRepo:   NewGormLoginHistoryRepository(db),
 		jwtManager:         manager,
 		emailConfigService: sessionTestEmailConfig{},
 		config: &AuthConfig{
@@ -106,7 +137,11 @@ func setupSessionRevocationTest(t *testing.T) (*GormTokenRepository, *SimpleJWTM
 			RefreshTokenExpire: 24 * time.Hour,
 		},
 	}
-	return repository, manager, NewAuthHandler(service, nil)
+	return repository, manager, NewAuthHandler(
+		service,
+		nil,
+		WithAllowedBrowserOrigin(testBrowserOrigin),
+	)
 }
 
 func issueSessionTokens(
@@ -222,16 +257,21 @@ func TestLogoutKeepsTrustedDeviceCredentialForTheNextLogin(t *testing.T) {
 	router.POST("/api/auth/logout", func(c *gin.Context) {
 		handler.Logout(NewGinHTTPContext(c))
 	})
-	body, err := json.Marshal(LogoutRequest{RefreshToken: refreshToken})
-	if err != nil {
-		t.Fatal(err)
-	}
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/api/auth/logout",
-		bytes.NewReader(body),
+		nil,
 	)
-	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", testBrowserOrigin)
+	request.Header.Set(
+		humanSessionIDHeader,
+		"session-with-trusted-device",
+	)
+	request.AddCookie(&http.Cookie{
+		Name:  refreshTokenCookieName,
+		Value: refreshToken,
+		Path:  refreshTokenCookiePath,
+	})
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 
@@ -246,6 +286,15 @@ func TestLogoutKeepsTrustedDeviceCredentialForTheNextLogin(t *testing.T) {
 				cookie.Expires,
 			)
 		}
+	}
+	refreshCleared := false
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == refreshTokenCookieName && cookie.MaxAge < 0 {
+			refreshCleared = true
+		}
+	}
+	if !refreshCleared {
+		t.Fatal("普通退出未清除 refresh Cookie")
 	}
 }
 
@@ -322,6 +371,102 @@ func TestLogoutAllRevokesEveryUserSessionOnly(t *testing.T) {
 			targetActive,
 			otherActive,
 		)
+	}
+}
+
+func TestRevokeAllSessionsIssuedBeforeUsesOriginalSessionTime(t *testing.T) {
+	repository, manager, handler := setupSessionRevocationTest(t)
+	oldAccess, oldRefresh := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		42,
+		PlatformRolePlatformAdmin,
+		"pre-cutover-session",
+	)
+	newAccess, newRefresh := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		84,
+		PlatformRoleMember,
+		"post-cutover-session",
+	)
+	cutoff := time.Now().UTC().Add(-time.Hour)
+	oldLogin := cutoff.Add(-time.Hour)
+	if err := repository.db.Model(&models.LoginHistory{}).
+		Where(
+			"user_id = ? AND session_id = ?",
+			42,
+			"pre-cutover-session",
+		).
+		Updates(map[string]interface{}{
+			"login_time":       oldLogin,
+			"last_activity_at": oldLogin,
+		}).Error; err != nil {
+		t.Fatalf("backdate pre-cutover session: %v", err)
+	}
+
+	revoked, err := handler.authService.RevokeAllSessionsIssuedBefore(
+		context.Background(),
+		cutoff,
+	)
+	if err != nil {
+		t.Fatalf("revoke pre-cutover sessions: %v", err)
+	}
+	if revoked != 1 {
+		t.Fatalf("revoked sessions = %d, want 1", revoked)
+	}
+	if _, err := repository.GetRefreshToken(
+		context.Background(),
+		oldRefresh,
+	); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("pre-cutover refresh remains active: %v", err)
+	}
+	if _, err := repository.GetRefreshToken(
+		context.Background(),
+		newRefresh,
+	); err != nil {
+		t.Fatalf("post-cutover refresh was revoked: %v", err)
+	}
+	if status, problem := protectedRequest(
+		t,
+		handler,
+		oldAccess,
+	); status != http.StatusUnauthorized ||
+		problem.Error != "session_revoked" {
+		t.Fatalf(
+			"pre-cutover access status = %d, problem=%+v",
+			status,
+			problem,
+		)
+	}
+	if status, problem := protectedRequest(
+		t,
+		handler,
+		newAccess,
+	); status != http.StatusOK {
+		t.Fatalf(
+			"post-cutover access status = %d, problem=%+v",
+			status,
+			problem,
+		)
+	}
+	repeated, err := handler.authService.RevokeAllSessionsIssuedBefore(
+		context.Background(),
+		cutoff,
+	)
+	if err != nil {
+		t.Fatalf("repeat cutover: %v", err)
+	}
+	if repeated != 0 {
+		t.Fatalf("repeat cutover revoked %d sessions, want 0", repeated)
+	}
+	if _, err := handler.authService.RevokeAllSessionsIssuedBefore(
+		context.Background(),
+		time.Time{},
+	); !errors.Is(err, ErrInvalidSessionCutoff) {
+		t.Fatalf("zero cutover error = %v", err)
 	}
 }
 

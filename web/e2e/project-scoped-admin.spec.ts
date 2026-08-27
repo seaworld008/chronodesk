@@ -163,8 +163,7 @@ const installSession = async (
                 return;
             }
             localStorage.clear();
-            localStorage.setItem('refreshToken', 'e2e-refresh');
-            localStorage.setItem(
+            sessionStorage.setItem(
                 'user',
                 JSON.stringify({
                     id: user.id,
@@ -176,12 +175,12 @@ const installSession = async (
                     otp_enabled: false,
                 }),
             );
-            localStorage.setItem(
+            sessionStorage.setItem(
                 'tokenExpiresAt',
                 String(expiresAt),
             );
             if (selectedProject) {
-                localStorage.setItem(
+                sessionStorage.setItem(
                     'chronodesk.activeProject',
                     JSON.stringify({
                         subject: user.subject,
@@ -1353,9 +1352,9 @@ test.describe('项目授权缓存与撤销', () => {
             }
             await fulfillJSON(route, {
                 code: 0,
+                msg: '登录成功',
                 data: {
                     access_token: session.token,
-                    refresh_token: `${session.identity.sessionID}-refresh`,
                     expires_in: 3600,
                     token_type: 'Bearer',
                     user: {
@@ -1366,6 +1365,7 @@ test.describe('项目授权缓存与撤销', () => {
                         status: 'active',
                         email_verified: true,
                         otp_enabled: false,
+                        last_login_at: null,
                     },
                 },
             });
@@ -1397,7 +1397,7 @@ test.describe('项目授权缓存与撤销', () => {
         );
         await expect.poll(() =>
             page.evaluate(() => {
-                const raw = localStorage.getItem(
+                const raw = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 if (!raw) return null;
@@ -1413,7 +1413,7 @@ test.describe('项目授权缓存与撤销', () => {
         await expect(page.getByLabel('邮箱')).toBeVisible();
         await expect.poll(() =>
             page.evaluate(() =>
-                localStorage.getItem('chronodesk.activeProject'),
+                sessionStorage.getItem('chronodesk.activeProject'),
             ),
         ).toBeNull();
 
@@ -1452,7 +1452,7 @@ test.describe('项目授权缓存与撤销', () => {
         );
         await expect.poll(() =>
             page.evaluate(() => {
-                const raw = localStorage.getItem(
+                const raw = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 if (!raw) return null;
@@ -1462,6 +1462,7 @@ test.describe('项目授权缓存与撤销', () => {
             subject: secondIdentity.subject,
             session_id: secondIdentity.sessionID,
             project_key: financeProject.key,
+            epoch: 1,
         });
         expect(
             backend.scopedProjectRequests
@@ -1492,7 +1493,7 @@ test.describe('项目授权缓存与撤销', () => {
 
         await expect.poll(() =>
             page.evaluate(() => {
-                const raw = localStorage.getItem(
+                const raw = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 if (!raw) return null;
@@ -1506,6 +1507,7 @@ test.describe('项目授权缓存与撤销', () => {
             subject: defaultIdentity.subject,
             session_id: defaultIdentity.sessionID,
             project_key: financeProject.key,
+            epoch: 2,
         });
         await expect.poll(() =>
             backend.scopedProjectRequests.some((request) =>
@@ -1603,7 +1605,7 @@ test.describe('项目授权缓存与撤销', () => {
 
         await expect.poll(() =>
             page.evaluate(() => {
-                const raw = localStorage.getItem(
+                const raw = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 if (!raw) return null;
@@ -1658,7 +1660,7 @@ test.describe('项目授权缓存与撤销', () => {
         ).toBeGreaterThan(projectListRequestCount);
         await expect.poll(() =>
             page.evaluate(() => {
-                const raw = localStorage.getItem(
+                const raw = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 if (!raw) return null;

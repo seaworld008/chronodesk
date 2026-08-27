@@ -179,6 +179,7 @@ test-web:
 	cd web && npm run test:human-api
 	cd web && node --test ./scripts/audit-security.test.mjs
 	cd web && npm run test:navigation
+	cd web && npm run test:project-scope
 	cd web && npm run test:ci-runtime
 	cd web && npm run typecheck
 	cd web && npm run lint

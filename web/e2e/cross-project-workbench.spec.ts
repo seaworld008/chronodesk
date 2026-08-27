@@ -149,7 +149,7 @@ test.describe('我的跨项目工作台', () => {
     await expect.poll(
       () => page.evaluate(
         () => {
-          const stored = localStorage.getItem('chronodesk.activeProject')
+          const stored = sessionStorage.getItem('chronodesk.activeProject')
           if (!stored) return null
           try {
             return (JSON.parse(stored) as { project_key?: unknown }).project_key

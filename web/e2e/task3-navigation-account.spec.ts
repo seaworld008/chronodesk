@@ -34,8 +34,7 @@ const installSession = async (
             return
         }
         localStorage.setItem('token', accessToken)
-        localStorage.setItem('refreshToken', 'task3-refresh')
-        localStorage.setItem('tokenExpiresAt', String(exp * 1000))
+        sessionStorage.setItem('tokenExpiresAt', String(exp * 1000))
         const storedUser: Record<string, unknown> = {
             id: 1,
             username: 'task3-admin',
@@ -53,8 +52,8 @@ const installSession = async (
                 avatar: '',
             }
         }
-        localStorage.setItem('user', JSON.stringify(storedUser))
-        localStorage.setItem('chronodesk.activeProject', JSON.stringify({
+        sessionStorage.setItem('user', JSON.stringify(storedUser))
+        sessionStorage.setItem('chronodesk.activeProject', JSON.stringify({
             subject: '1',
             session_id: sid,
             project_key: 'OPS',
@@ -137,6 +136,7 @@ const installLayoutMocks = async (
         status: 'active',
         email_verified: true,
         otp_enabled: false,
+        last_login_at: null,
         profile: {
             id: 1,
             user_id: 1,
@@ -442,6 +442,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             last_login_at: '2026-07-31T00:00:00Z',
             profile,
         })
+        let refreshSessionID = 'task3-session'
 
         await page.route('**/api/**', async (route) => {
             const request = route.request()
@@ -452,6 +453,33 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                 && url.pathname === '/api/projects'
             ) {
                 data = projectAccess
+            } else if (
+                request.method() === 'POST'
+                && url.pathname === '/api/auth/refresh'
+            ) {
+                const expiresAt = Math.floor(Date.now() / 1000) + 3600
+                const accessToken =
+                    `${encode({ alg: 'none', typ: 'JWT' })}.${encode({
+                        sub: '1',
+                        sid: refreshSessionID,
+                        platform_role: 'platform_admin',
+                        exp: expiresAt,
+                    })}.signature`
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({
+                        success: true,
+                        message: '登录令牌刷新成功',
+                        data: {
+                            user: currentUser(),
+                            access_token: accessToken,
+                            expires_in: 3600,
+                            token_type: 'Bearer',
+                        },
+                    }),
+                })
+                return
             } else if (
                 request.method() === 'GET'
                 && url.pathname === '/api/auth/me'
@@ -571,6 +599,34 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                 && url.pathname === '/api/workbench/tickets'
             ) {
                 data = { items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/projects/OPS/tickets/stats'
+            ) {
+                data = {
+                    total: 0,
+                    open: 0,
+                    in_progress: 0,
+                    pending: 0,
+                    resolved: 0,
+                    overdue: 0,
+                    sla_breached: 0,
+                    my_tickets: 0,
+                    unassigned: 0,
+                    high_priority: 0,
+                    escalated: 0,
+                }
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/projects/OPS/tickets'
+            ) {
+                data = {
+                    items: [],
+                    total: 0,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: 0,
+                }
             } else {
                 await rejectUnexpectedApiRequest(
                     route,
@@ -628,27 +684,29 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await expect(page.getByRole('menuitem', { name: /^治理中心/ }))
             .toHaveAttribute('aria-expanded', 'true')
         const otherExpiry = Math.floor(Date.now() / 1000) + 3600
-        const otherToken = `${encode({ alg: 'none', typ: 'JWT' })}.${encode({
-            sub: '1',
-            sid: 'task3-other-session',
-            platform_role: 'platform_admin',
-            exp: otherExpiry,
-        })}.signature`
-        await page.evaluate(({ token, exp }) => {
+        refreshSessionID = 'task3-other-session'
+        await page.evaluate(({ exp }) => {
             sessionStorage.setItem('task3-preserve-session', 'true')
-            localStorage.setItem('token', token)
-            localStorage.setItem('tokenExpiresAt', String(exp * 1000))
-            localStorage.setItem('chronodesk.activeProject', JSON.stringify({
+            localStorage.removeItem('token')
+            sessionStorage.setItem('tokenExpiresAt', String(exp * 1000))
+            sessionStorage.setItem('chronodesk.activeProject', JSON.stringify({
                 subject: '1',
                 session_id: 'task3-other-session',
                 project_key: 'OPS',
             }))
-        }, { token: otherToken, exp: otherExpiry })
+        }, { exp: otherExpiry })
         await page.reload()
         await expect(page.getByRole('menuitem', { name: /^治理中心/ }))
             .toHaveAttribute('aria-expanded', 'false')
         await expect(page.getByRole('menuitem', { name: /^系统设置/ }))
             .toHaveAttribute('aria-expanded', 'true')
+        const refreshedProjectSwitcher =
+            page.getByTestId('active-project-switcher')
+        await expect(refreshedProjectSwitcher)
+            .toContainText('运营项目')
+        await expect(
+            page.getByTestId('active-project-selection-required'),
+        ).toHaveCount(0)
 
         const accountTrigger = page.getByTestId('account-menu').locator('button').first()
         await accountTrigger.click()
@@ -1111,11 +1169,21 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             status: 'active',
             email_verified: true,
             otp_enabled: false,
+            last_login_at: null,
             profile: {
+                id: 1,
+                user_id: 1,
                 first_name: '',
                 last_name: '',
                 display_name: longDisplayName,
                 avatar: '',
+                phone: '',
+                department: '',
+                position: '',
+                timezone: 'Asia/Shanghai',
+                language: 'zh-CN',
+                created_at: '2026-01-01T00:00:00Z',
+                updated_at: '2026-01-01T00:00:00Z',
             },
         }
 
@@ -1358,14 +1426,21 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             status: 'active',
             email_verified: true,
             otp_enabled: false,
+            last_login_at: null,
             profile: {
+                id: 1,
+                user_id: 1,
                 first_name: 'Chrono',
                 last_name: 'Desk',
                 display_name: 'Chrono Desk',
                 avatar: '',
                 phone: '',
+                department: '',
+                position: '',
                 timezone: 'Asia/Shanghai',
                 language: 'zh-CN',
+                created_at: '2026-01-01T00:00:00Z',
+                updated_at: '2026-01-01T00:00:00Z',
             },
         }
 

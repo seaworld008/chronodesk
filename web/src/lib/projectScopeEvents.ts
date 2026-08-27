@@ -39,7 +39,9 @@ const projectKeyFromProjectScopedApiPath = (path: string): string | null => {
 const storedActiveProjectKey = (): string | null => {
     if (typeof window === 'undefined') return null
     try {
-        const serialized = window.localStorage.getItem(activeProjectStorageKey)
+        const serialized =
+            window.sessionStorage.getItem(activeProjectStorageKey) ??
+            window.localStorage.getItem(activeProjectStorageKey)
         if (!serialized) return null
         const value: unknown = JSON.parse(serialized)
         if (

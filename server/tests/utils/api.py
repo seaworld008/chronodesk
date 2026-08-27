@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
 import os
 import re
@@ -25,6 +28,23 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = int(os.getenv("TEST_REQUEST_TIMEOUT", "15"))
 DEFAULT_MAX_RETRIES = int(os.getenv("TEST_REQUEST_MAX_RETRIES", "3"))
 DEFAULT_RETRY_DELAY = float(os.getenv("TEST_REQUEST_RETRY_DELAY", "1.0"))
+DEFAULT_BROWSER_ORIGIN = os.getenv("TEST_WEB_ORIGIN", "http://localhost:3000")
+_BROWSER_SESSION_ESTABLISH_PATHS = frozenset(
+    {
+        "/auth/login",
+        "/auth/refresh",
+        "/auth/register",
+    }
+)
+_BROWSER_SESSION_END_PATHS = frozenset(
+    {
+        "/auth/logout",
+        "/auth/logout-all",
+    }
+)
+_BROWSER_SESSION_POST_PATHS = (
+    _BROWSER_SESSION_ESTABLISH_PATHS | _BROWSER_SESSION_END_PATHS
+)
 PROJECT_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
 PROJECT_PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 
@@ -50,6 +70,7 @@ class APIClient:
     max_retries: int = DEFAULT_MAX_RETRIES
     retry_delay: float = DEFAULT_RETRY_DELAY
     project_key: str | None = None
+    browser_origin: str = DEFAULT_BROWSER_ORIGIN
 
     def __post_init__(self) -> None:
         # remove trailing slash for consistency
@@ -58,6 +79,7 @@ class APIClient:
             self.bind_project(self.project_key)
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        self._human_session_id: str | None = None
 
     # ------------------------------------------------------------------
     # Core request helper
@@ -79,8 +101,9 @@ class APIClient:
         attempt = 0
         max_attempts = self.max_retries if retry else 1
         last_exc: Exception | None = None
+        request_headers = self._browser_session_headers(method, path, headers)
         register_headers(self.session.headers)
-        register_headers(headers)
+        register_headers(request_headers)
         register_sensitive_values(json)
         register_sensitive_values(data)
         register_sensitive_values(params)
@@ -90,7 +113,7 @@ class APIClient:
                 response = self.session.request(
                     method=method,
                     url=url,
-                    headers=headers,
+                    headers=request_headers,
                     json=json,
                     params=params,
                     data=data,
@@ -98,6 +121,11 @@ class APIClient:
                     timeout=self.timeout,
                 )
                 register_response_secrets(response)
+                self._update_human_session_from_response(
+                    method,
+                    path,
+                    response,
+                )
 
                 if (
                     expected_status is not None
@@ -292,15 +320,24 @@ class APIClient:
 
     def with_auth(self, token: str) -> APIClient:
         register_secret(token)
+        clone = self.clone()
+        clone.session.headers["Authorization"] = f"Bearer {token}"
+        clone._human_session_id = self._access_token_session_id(token)
+        return clone
+
+    def clone(self, *, include_cookies: bool = True) -> APIClient:
         clone = APIClient(
             base_url=self.base_url,
             timeout=self.timeout,
             max_retries=self.max_retries,
             retry_delay=self.retry_delay,
             project_key=self.project_key,
+            browser_origin=self.browser_origin,
         )
         clone.session.headers.update(self.session.headers)
-        clone.session.headers["Authorization"] = f"Bearer {token}"
+        if include_cookies:
+            clone.session.cookies.update(self.session.cookies)
+        clone._human_session_id = self._human_session_id
         return clone
 
     def close(self) -> None:
@@ -323,13 +360,21 @@ class APIClient:
         data = response.json()
         if data.get("code") != 0 or "data" not in data:
             raise APIError("Unexpected login response payload", response=response)
-        return data["data"]
+        result = data["data"]
+        self._remember_human_session(result)
+        return result
 
-    def refresh(self, refresh_token: str) -> dict[str, Any]:
-        response = self.post_json("/auth/refresh", {"refresh_token": refresh_token})
+    def refresh(self) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/auth/refresh",
+            headers={"Origin": self.browser_origin},
+        )
         if response.status_code != 200:
             raise APIError("Refresh token failed", response=response)
-        return response.json().get("data", {})
+        result = response.json().get("data", {})
+        self._remember_human_session(result)
+        return result
 
     def register_user(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self.post_json("/auth/register", payload)
@@ -339,25 +384,110 @@ class APIClient:
         data = response.json()
         if data.get("code") != 0 or "data" not in data:
             raise APIError("Unexpected registration payload", response=response)
-        return data["data"]
+        result = data["data"]
+        self._remember_human_session(result)
+        return result
 
-    def logout(self, refresh_token: str | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if refresh_token:
-            payload["refresh_token"] = refresh_token
-
-        response = self.post_json("/auth/logout", payload)
+    def logout(self) -> dict[str, Any]:
+        if self._human_session_id is None:
+            raise APIError("Logout requires a committed human session")
+        response = self.request(
+            "POST",
+            "/auth/logout",
+            headers={
+                "Origin": self.browser_origin,
+                "X-Chronodesk-Session-ID": self._human_session_id,
+            },
+        )
         if response.status_code != 200:
             raise APIError("Logout failed", response=response)
 
         body = response.json()
         if not body.get("success"):
             raise APIError("Unexpected logout response", response=response)
+        self._human_session_id = None
         return body
+
+    def _remember_human_session(self, data: Any) -> None:
+        if not isinstance(data, Mapping):
+            return
+        access_token = data.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            return
+        self._human_session_id = self._access_token_session_id(access_token)
+
+    @staticmethod
+    def _access_token_session_id(token: str) -> str:
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise APIError("Human access token does not contain a stable session")
+        try:
+            encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(
+                base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+            )
+        except (
+            ValueError,
+            UnicodeError,
+            json.JSONDecodeError,
+            binascii.Error,
+        ) as exc:
+            raise APIError(
+                "Human access token does not contain a stable session"
+            ) from exc
+        session_id = payload.get("sid") if isinstance(payload, dict) else None
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+            raise APIError("Human access token does not contain a stable session")
+        return session_id
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _update_human_session_from_response(
+        self,
+        method: str,
+        path: str,
+        response: requests.Response,
+    ) -> None:
+        if (
+            method.upper() != "POST"
+            or path not in _BROWSER_SESSION_POST_PATHS
+            or not 200 <= response.status_code < 300
+        ):
+            return
+        try:
+            payload = response.json()
+        except ValueError:
+            return
+        if not isinstance(payload, Mapping):
+            return
+        if path in _BROWSER_SESSION_END_PATHS:
+            if payload.get("success") is True:
+                self._human_session_id = None
+            return
+        if path not in _BROWSER_SESSION_ESTABLISH_PATHS:
+            return
+        if path == "/auth/refresh":
+            if payload.get("success") is not True:
+                return
+        elif payload.get("code") != 0:
+            return
+        self._remember_human_session(payload.get("data"))
+
+    def _browser_session_headers(
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str | None] | None,
+    ) -> Mapping[str, str | None] | None:
+        if method.upper() != "POST" or path not in _BROWSER_SESSION_POST_PATHS:
+            return headers
+        if headers is not None and any(key.casefold() == "origin" for key in headers):
+            return headers
+        request_headers = dict(headers or {})
+        request_headers["Origin"] = self.browser_origin
+        return request_headers
+
     def _build_url(self, path: str) -> str:
         if not path.startswith("/"):
             path = f"/{path}"

@@ -410,7 +410,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         );
         await expect.poll(() =>
             page.evaluate(
-                () => localStorage.getItem('chronodesk.activeProject'),
+                () => sessionStorage.getItem('chronodesk.activeProject'),
             ),
         ).toBeNull();
 
@@ -430,7 +430,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         ).toHaveCount(0);
         await expect.poll(() =>
             page.evaluate(() => {
-                const raw = localStorage.getItem(
+                const raw = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 return raw ? JSON.parse(raw).project_key : null;
@@ -542,7 +542,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         ).toBeGreaterThan(authorizedReadsBeforeGovernance);
         await expect.poll(() =>
             page.evaluate(
-                () => localStorage.getItem('chronodesk.activeProject'),
+                () => sessionStorage.getItem('chronodesk.activeProject'),
             ),
         ).toBeNull();
     });
@@ -609,7 +609,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         ).toBeGreaterThan(authorizedReadsBeforeArchive);
         await expect.poll(() =>
             page.evaluate(() => {
-                const raw = localStorage.getItem(
+                const raw = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 if (!raw) return null;

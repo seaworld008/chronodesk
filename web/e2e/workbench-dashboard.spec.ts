@@ -57,9 +57,8 @@ const installSession = async (
   })}.signature`
   await page.addInitScript(({ accessToken, exp }) => {
     localStorage.setItem('token', accessToken)
-    localStorage.setItem('refreshToken', 'workbench-dashboard-refresh')
-    localStorage.setItem('tokenExpiresAt', String(exp * 1000))
-    localStorage.setItem('user', JSON.stringify({
+    sessionStorage.setItem('tokenExpiresAt', String(exp * 1000))
+    sessionStorage.setItem('user', JSON.stringify({
       id: 7,
       username: 'dashboard-user',
       email: 'dashboard@example.invalid',
@@ -68,7 +67,7 @@ const installSession = async (
       email_verified: true,
       otp_enabled: false,
     }))
-    localStorage.setItem('chronodesk.activeProject', JSON.stringify({
+    sessionStorage.setItem('chronodesk.activeProject', JSON.stringify({
       subject: '7',
       session_id: 'workbench-dashboard-session',
       project_key: 'OPS',

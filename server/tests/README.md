@@ -36,9 +36,14 @@ docker compose exec server chronodesk-migrate -seed
 ```bash
 export TEST_API_BASE_URL="http://localhost:8081/api"
 export TEST_HEALTHCHECK_URL="http://localhost:8081/healthz"
+export TEST_WEB_ORIGIN="http://localhost:3000"
 export TEST_ADMIN_EMAIL="admin@example.com"
 export TEST_ADMIN_PASSWORD="development-password"
 ```
+
+`TEST_WEB_ORIGIN` 必须与服务端 `WEB_URL` 的 Origin 完全一致。认证黑盒客户端只在
+该 Origin 下通过 HttpOnly Cookie 执行 refresh/logout，不会从 JSON 响应读取或
+在请求 body/Header 复制 refresh bearer。
 
 非回环目标默认硬拒绝。只有明确确认目标是独立测试环境时，才可同时提供远端
 放行标志与本轮唯一所有权前缀：

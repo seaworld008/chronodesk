@@ -479,7 +479,11 @@ func TestLogoutAllMakesAnOldTrustedDeviceCookieRequireOTP(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	handler := NewAuthHandler(service, nil)
+	handler := NewAuthHandler(
+		service,
+		nil,
+		WithAllowedBrowserOrigin(testBrowserOrigin),
+	)
 	router.POST("/api/auth/login", func(c *gin.Context) {
 		handler.Login(NewGinHTTPContext(c))
 	})
@@ -493,6 +497,7 @@ func TestLogoutAllMakesAnOldTrustedDeviceCookieRequireOTP(t *testing.T) {
 		bytes.NewReader(body),
 	)
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", testBrowserOrigin)
 	request.AddCookie(&http.Cookie{
 		Name:  trustedDeviceCookieName,
 		Value: oldDeviceToken,

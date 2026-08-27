@@ -595,7 +595,7 @@ test.describe('企业集成中心', () => {
       && url.searchParams.get('page') === '2')).toBe(true)
 
     await page.evaluate(({ projectKey, subject, sessionID }) => {
-      localStorage.setItem(
+      sessionStorage.setItem(
         'chronodesk.activeProject',
         JSON.stringify({
           subject,

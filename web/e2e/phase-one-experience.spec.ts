@@ -722,14 +722,14 @@ const switchProjectBySessionContract = async (
 ) => {
     await page.evaluate((nextProjectKey) => {
         const storageKey = 'chronodesk.activeProject';
-        const raw = localStorage.getItem(storageKey);
+        const raw = sessionStorage.getItem(storageKey);
         if (!raw) throw new Error('缺少当前项目会话绑定');
         const binding = JSON.parse(raw) as {
             subject: string;
             session_id: string;
             project_key: string;
         };
-        localStorage.setItem(
+        sessionStorage.setItem(
             storageKey,
             JSON.stringify({
                 ...binding,

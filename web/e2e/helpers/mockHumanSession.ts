@@ -126,8 +126,7 @@ export const installMockSession = async (
             }
             sessionStorage.setItem(initializationKey, 'installed');
             localStorage.clear();
-            localStorage.setItem('refreshToken', `${user.sessionID}-refresh`);
-            localStorage.setItem(
+            sessionStorage.setItem(
                 'user',
                 JSON.stringify({
                     id: user.id,
@@ -137,21 +136,23 @@ export const installMockSession = async (
                     status: 'active',
                     email_verified: true,
                     otp_enabled: false,
+                    last_login_at: null,
                 }),
             );
-            localStorage.setItem(
+            sessionStorage.setItem(
                 'tokenExpiresAt',
                 String(tokenExpiresAt),
             );
-            // Match authProvider: token is the cross-tab commit marker.
+            // Seed the one-time legacy cutover before the runtime module loads.
             localStorage.setItem('token', authToken);
             if (selectedProject) {
-                localStorage.setItem(
+                sessionStorage.setItem(
                     'chronodesk.activeProject',
                     JSON.stringify({
                         subject: String(user.id),
                         session_id: user.sessionID,
                         project_key: selectedProject.key,
+                        epoch: 1,
                     }),
                 );
             }
@@ -177,4 +178,31 @@ export const fulfillJSON = (
     contentType: 'application/json',
     headers,
     body: JSON.stringify(body),
+});
+
+export const fulfillMockSessionRefresh = (
+    route: Route,
+    identity: MockSessionIdentity,
+    expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600,
+) => fulfillJSON(route, {
+    success: true,
+    message: '登录令牌刷新成功',
+    data: {
+        user: {
+            id: identity.id,
+            username: `e2e-${identity.id}`,
+            email: identity.email,
+            platform_role: identity.platformRole,
+            status: 'active',
+            email_verified: true,
+            otp_enabled: false,
+            last_login_at: null,
+        },
+        access_token: mockSessionToken(identity, expiresAtSeconds),
+        expires_in: Math.max(
+            1,
+            expiresAtSeconds - Math.floor(Date.now() / 1000),
+        ),
+        token_type: 'Bearer',
+    },
 });

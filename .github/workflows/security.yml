@@ -257,6 +257,9 @@ jobs:
       - name: Test navigation contracts
         run: npm run test:navigation
 
+      - name: Test project scope contracts
+        run: npm run test:project-scope
+
       - name: Test CI runtime contracts
         run: npm run test:ci-runtime
 

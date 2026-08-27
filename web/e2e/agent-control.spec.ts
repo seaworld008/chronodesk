@@ -83,10 +83,9 @@ const installAgentControlMockSession = async (
     ];
     await page.addInitScript(({ accessToken, exp, sessionUser }) => {
         localStorage.setItem('token', accessToken);
-        localStorage.setItem('refreshToken', 'agent-control-mock-refresh');
-        localStorage.setItem('tokenExpiresAt', String(exp * 1000));
-        localStorage.setItem('user', JSON.stringify(sessionUser));
-        localStorage.setItem(
+        sessionStorage.setItem('tokenExpiresAt', String(exp * 1000));
+        sessionStorage.setItem('user', JSON.stringify(sessionUser));
+        sessionStorage.setItem(
             'chronodesk.activeProject',
             JSON.stringify({
                 subject: '7',
@@ -873,7 +872,7 @@ test.describe('AI 智能体控制中心', () => {
         await page.goto('/#/agent-control');
         await expect.poll(() => firstProjectKey).not.toBe('');
         await page.evaluate(() => {
-            localStorage.removeItem('chronodesk.activeProject');
+            sessionStorage.removeItem('chronodesk.activeProject');
             window.dispatchEvent(new CustomEvent(
                 'chronodesk:project-scope-changed',
                 { detail: { project_key: null } },
@@ -886,7 +885,7 @@ test.describe('AI 智能体控制中心', () => {
         await selection.getByTestId('select-project-SWITCHED').click();
         await expect(page.getByTestId('project-home')).toBeVisible();
         const selectedProjectKey = () => page.evaluate(() => {
-            const serialized = localStorage.getItem(
+            const serialized = sessionStorage.getItem(
                 'chronodesk.activeProject',
             );
             if (!serialized) return null;
@@ -1113,7 +1112,7 @@ test.describe('AI 智能体控制中心', () => {
             .click();
         await expect.poll(() =>
             page.evaluate(() => {
-                const serialized = localStorage.getItem(
+                const serialized = sessionStorage.getItem(
                     'chronodesk.activeProject',
                 );
                 if (!serialized) return null;

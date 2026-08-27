@@ -38,12 +38,14 @@ import {
 import { useQueryClient } from '@tanstack/react-query'
 
 import { dataProvider } from './lib/dataProvider'
-import { authProvider } from './lib/authProvider'
-import { humanSessionStorageCommitKey } from './lib/authQueryState'
 import {
-    adoptHumanTabSessionRotation,
-    readCommittedHumanTabSessionToken,
-} from './lib/humanTabSession'
+    applyRemoteHumanSignOut,
+    authProvider,
+    clearAuthenticationState,
+    synchronizeHumanSessionAfterRemoteAuthentication,
+} from './lib/authProvider'
+import { readHumanAccessToken } from './lib/humanSessionRuntime'
+import { subscribeHumanSessionMetadata } from './lib/humanSessionChannel'
 import {
     getPlatformRoleLabel,
     hasPlatformCapability,
@@ -1306,7 +1308,7 @@ const AppRuntimeCoordinator = () => {
     const queryClient = useQueryClient()
     const navigate = useNavigate()
     const handlingSessionInvalidation = React.useRef(false)
-    const storageRevalidationTimer = React.useRef<number | null>(null)
+    const synchronizingRemoteSession = React.useRef(false)
 
     React.useEffect(() => {
         const clearRuntimeCaches = () => {
@@ -1325,7 +1327,7 @@ const AppRuntimeCoordinator = () => {
         const handleProjectAccessInvalidated = () => {
             if (
                 handlingSessionInvalidation.current ||
-                !localStorage.getItem('token')
+                !readHumanAccessToken()
             ) {
                 return
             }
@@ -1336,13 +1338,27 @@ const AppRuntimeCoordinator = () => {
         const handleSessionInvalidated = () => {
             if (handlingSessionInvalidation.current) return
             handlingSessionInvalidation.current = true
+            clearAuthenticationState({ notifyPeers: false })
             clearRuntimeCaches()
-            void Promise.resolve(authProvider.logout({}))
-                .catch(() => undefined)
-                .finally(() => {
+            navigate('/login', { replace: true })
+            handlingSessionInvalidation.current = false
+        }
+        const handleRemoteSessionAuthentication = (
+            metadata: Extract<
+                Parameters<typeof synchronizeHumanSessionAfterRemoteAuthentication>[0],
+                { type: 'authenticated' }
+            >,
+        ) => {
+            if (synchronizingRemoteSession.current) return
+            synchronizingRemoteSession.current = true
+            void synchronizeHumanSessionAfterRemoteAuthentication(metadata)
+                .catch(() => {
+                    if (readHumanAccessToken()) return
                     clearRuntimeCaches()
                     navigate('/login', { replace: true })
-                    handlingSessionInvalidation.current = false
+                })
+                .finally(() => {
+                    synchronizingRemoteSession.current = false
                 })
         }
         const handleSessionReplaced = () => {
@@ -1350,30 +1366,40 @@ const AppRuntimeCoordinator = () => {
             handlingSessionInvalidation.current = true
             clearActiveProjectSelection()
             clearRuntimeCaches()
-            if (localStorage.getItem('token')) {
+            if (readHumanAccessToken()) {
                 window.location.reload()
                 return
             }
             navigate('/login', { replace: true })
             handlingSessionInvalidation.current = false
         }
-        const handleAuthenticationStorage = (event: StorageEvent) => {
-            if (event.key !== humanSessionStorageCommitKey) return
-            if (storageRevalidationTimer.current !== null) {
-                window.clearTimeout(storageRevalidationTimer.current)
-            }
-            storageRevalidationTimer.current = window.setTimeout(() => {
-                storageRevalidationTimer.current = null
-                const committedAccessToken =
-                    readCommittedHumanTabSessionToken()
+        const unsubscribeHumanSessionMetadata =
+            subscribeHumanSessionMetadata((metadata) => {
+                if (metadata.type === 'signed_out') {
+                    if (handlingSessionInvalidation.current) return
+                    if (!applyRemoteHumanSignOut(metadata)) return
+                    handlingSessionInvalidation.current = true
+                    clearActiveProjectSelection()
+                    clearRuntimeCaches()
+                    navigate('/login', { replace: true })
+                    handlingSessionInvalidation.current = false
+                    return
+                }
+                const binding = readHumanSessionBinding()
                 if (
-                    committedAccessToken === null ||
-                    !adoptHumanTabSessionRotation(committedAccessToken)
+                    binding !== null &&
+                    (
+                        binding.subject !== metadata.subject ||
+                        binding.session_id !== metadata.session_id
+                    )
                 ) {
                     signalSessionReplaced()
+                    return
                 }
-            }, 25)
-        }
+                if (binding !== null) {
+                    handleRemoteSessionAuthentication(metadata)
+                }
+            })
 
         window.addEventListener(
             projectInventoryChangedEvent,
@@ -1395,12 +1421,8 @@ const AppRuntimeCoordinator = () => {
             sessionReplacedEvent,
             handleSessionReplaced,
         )
-        window.addEventListener('storage', handleAuthenticationStorage)
         return () => {
-            if (storageRevalidationTimer.current !== null) {
-                window.clearTimeout(storageRevalidationTimer.current)
-                storageRevalidationTimer.current = null
-            }
+            unsubscribeHumanSessionMetadata()
             window.removeEventListener(
                 projectInventoryChangedEvent,
                 handleProjectInventoryChanged,
@@ -1420,10 +1442,6 @@ const AppRuntimeCoordinator = () => {
             window.removeEventListener(
                 sessionReplacedEvent,
                 handleSessionReplaced,
-            )
-            window.removeEventListener(
-                'storage',
-                handleAuthenticationStorage,
             )
         }
     }, [navigate, queryClient])

@@ -197,21 +197,15 @@
       "post": {
         "operationId": "refreshHumanSession",
         "summary": "Refresh a human browser session",
-        "description": "Rotates a human session after revalidating the persisted platform role and account state.",
+        "description": "Rotates the HttpOnly browser refresh Cookie after revalidating the persisted platform role and account state. Query parameters, JSON bodies and X-Refresh-Token are not accepted.",
         "tags": [
           "Human sessions"
         ],
-        "security": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RefreshTokenRequest"
-              }
-            }
+        "security": [
+          {
+            "humanRefreshCookie": []
           }
-        },
+        ],
         "responses": {
           "200": {
             "description": "Refreshed browser session",
@@ -228,6 +222,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           },
           "408": {
             "$ref": "#/components/responses/RequestTimeout"
@@ -434,32 +431,28 @@
       "post": {
         "operationId": "deleteHumanSession",
         "summary": "End one human browser session",
-        "description": "Idempotently revokes the refresh-token session supplied by X-Refresh-Token or the optional JSON body. The explicit trusted-device credential remains on this browser until it expires, is individually revoked, or the human ends all sessions.",
+        "description": "Idempotently revokes the session identified by the HttpOnly browser refresh Cookie only when X-Chronodesk-Session-ID matches that Cookie's signed session, then clears the Cookie on success. Query parameters, JSON bodies and X-Refresh-Token are not accepted. The explicit trusted-device credential remains until it expires, is individually revoked, or the human ends all sessions.",
         "tags": [
           "Human sessions"
         ],
-        "security": [],
         "parameters": [
           {
-            "name": "X-Refresh-Token",
+            "name": "X-Chronodesk-Session-ID",
             "in": "header",
-            "required": false,
+            "required": true,
+            "description": "Stable sid from the calling tab's in-memory human access token. Prevents a stale tab from clearing a newer shared refresh Cookie.",
             "schema": {
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "maxLength": 128
             }
           }
         ],
-        "requestBody": {
-          "required": false,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LogoutRequest"
-              }
-            }
+        "security": [
+          {
+            "humanRefreshCookie": []
           }
-        },
+        ],
         "responses": {
           "200": {
             "description": "Browser session ended or already absent",
@@ -473,6 +466,15 @@
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           },
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
@@ -490,7 +492,7 @@
       "post": {
         "operationId": "deleteAllHumanSessions",
         "summary": "End all sessions for the current human",
-        "description": "Revokes every persisted session and every persisted trusted-device credential for the authenticated human, then clears this browser's trusted-device cookie.",
+        "description": "Revokes every persisted session and every persisted trusted-device credential for the authenticated human, then clears this browser's refresh and trusted-device Cookies after the transaction succeeds. When a refresh Cookie is present, its signed session must match the authenticated access-token session so a stale tab cannot clear a newer login.",
         "tags": [
           "Human sessions"
         ],
@@ -518,6 +520,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -13296,6 +13301,12 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT"
+      },
+      "humanRefreshCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "chronodesk_refresh_token",
+        "description": "Rotating HttpOnly, SameSite=Strict browser credential scoped to /api/auth. Production deployments also require Secure."
       }
     },
     "responses": {
@@ -14440,19 +14451,6 @@
           }
         }
       },
-      "RefreshTokenRequest": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "refresh_token"
-        ],
-        "properties": {
-          "refresh_token": {
-            "type": "string",
-            "minLength": 1
-          }
-        }
-      },
       "ForgotPasswordRequest": {
         "type": "object",
         "additionalProperties": false,
@@ -14509,16 +14507,6 @@
             "type": "string",
             "format": "email",
             "maxLength": 100
-          }
-        }
-      },
-      "LogoutRequest": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "refresh_token": {
-            "type": "string",
-            "minLength": 1
           }
         }
       },
@@ -14922,7 +14910,6 @@
         "required": [
           "user",
           "access_token",
-          "refresh_token",
           "expires_in",
           "token_type"
         ],
@@ -14931,10 +14918,6 @@
             "$ref": "#/components/schemas/HumanSessionUser"
           },
           "access_token": {
-            "type": "string",
-            "minLength": 1
-          },
-          "refresh_token": {
             "type": "string",
             "minLength": 1
           },
@@ -14955,7 +14938,6 @@
         "required": [
           "user",
           "access_token",
-          "refresh_token",
           "expires_in",
           "token_type"
         ],
@@ -14964,9 +14946,6 @@
             "$ref": "#/components/schemas/HumanSessionUser"
           },
           "access_token": {
-            "type": "string"
-          },
-          "refresh_token": {
             "type": "string"
           },
           "expires_in": {

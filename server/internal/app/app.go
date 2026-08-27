@@ -42,6 +42,59 @@ func ginAdapter(handler func(auth.HTTPContext)) gin.HandlerFunc {
 	}
 }
 
+type browserSessionAuthMiddleware struct {
+	originGate                 gin.HandlerFunc
+	anonymousIPRateLimit       gin.HandlerFunc
+	refreshIdentityProjection  gin.HandlerFunc
+	anonymousIdentityRateLimit gin.HandlerFunc
+	requireAuth                gin.HandlerFunc
+	authenticatedRateLimit     gin.HandlerFunc
+}
+
+type browserSessionAuthHandlers struct {
+	register  gin.HandlerFunc
+	login     gin.HandlerFunc
+	logout    gin.HandlerFunc
+	refresh   gin.HandlerFunc
+	logoutAll gin.HandlerFunc
+}
+
+// registerBrowserSessionAuthRoutes keeps the deployment-owned browser Origin
+// gate ahead of every limiter that protects a Cookie-issuing or
+// Cookie-revoking Human authentication write. Refresh/logout additionally
+// project the signed user/session pair only after the coarse IP limiter and
+// before the stable identity limiter.
+func registerBrowserSessionAuthRoutes(
+	routes *gin.RouterGroup,
+	middlewares browserSessionAuthMiddleware,
+	handlers browserSessionAuthHandlers,
+) {
+	emailCredentialWrites := routes.Group("")
+	emailCredentialWrites.Use(middlewares.originGate)
+	emailCredentialWrites.Use(
+		middlewares.anonymousIPRateLimit,
+		middlewares.anonymousIdentityRateLimit,
+	)
+	emailCredentialWrites.POST("/register", handlers.register)
+	emailCredentialWrites.POST("/login", handlers.login)
+
+	refreshCredentialWrites := routes.Group("")
+	refreshCredentialWrites.Use(middlewares.originGate)
+	refreshCredentialWrites.Use(
+		middlewares.anonymousIPRateLimit,
+		middlewares.refreshIdentityProjection,
+		middlewares.anonymousIdentityRateLimit,
+	)
+	refreshCredentialWrites.POST("/logout", handlers.logout)
+	refreshCredentialWrites.POST("/refresh", handlers.refresh)
+
+	authenticatedWrites := routes.Group("")
+	authenticatedWrites.Use(middlewares.originGate)
+	authenticatedWrites.Use(middlewares.requireAuth)
+	authenticatedWrites.Use(middlewares.authenticatedRateLimit)
+	authenticatedWrites.POST("/logout-all", handlers.logoutAll)
+}
+
 const backupCodeRegenerationRateLimitNamespace = "backup-code-regeneration"
 
 func backupCodeRegenerationRateLimitKey(rawKey string) string {
@@ -962,12 +1015,48 @@ func Run() error {
 		// 认证路由
 		authGroup := api.Group("/auth")
 		{
+			registerBrowserSessionAuthRoutes(
+				authGroup,
+				browserSessionAuthMiddleware{
+					originGate: ginAdapter(
+						authModule.Handler.RequireAllowedBrowserOrigin,
+					),
+					anonymousIPRateLimit: anonymousIPRateLimit,
+					refreshIdentityProjection: func(
+						context *gin.Context,
+					) {
+						identity, ok := authModule.Handler.
+							ProjectRefreshRateLimitIdentity(
+								auth.NewGinHTTPContext(context),
+							)
+						if ok {
+							middleware.BindAnonymousRefreshSessionIdentity(
+								middleware.NewGinHTTPContext(context),
+								identity.UserID,
+								identity.SessionID,
+							)
+						}
+						context.Next()
+					},
+					anonymousIdentityRateLimit: anonymousIdentityRateLimit,
+					requireAuth: ginAdapter(
+						authModule.Handler.RequireAuth,
+					),
+					authenticatedRateLimit: authenticatedRateLimit,
+				},
+				browserSessionAuthHandlers{
+					register: ginAdapter(authModule.Handler.Register),
+					login:    ginAdapter(authModule.Handler.Login),
+					logout:   ginAdapter(authModule.Handler.Logout),
+					refresh:  ginAdapter(authModule.Handler.RefreshToken),
+					logoutAll: ginAdapter(
+						authModule.Handler.LogoutAll,
+					),
+				},
+			)
+
 			publicWrites := authGroup.Group("/")
 			publicWrites.Use(anonymousIPRateLimit, anonymousIdentityRateLimit)
-			publicWrites.POST("/register", ginAdapter(authModule.Handler.Register))
-			publicWrites.POST("/login", ginAdapter(authModule.Handler.Login))
-			publicWrites.POST("/logout", ginAdapter(authModule.Handler.Logout))
-			publicWrites.POST("/refresh", ginAdapter(authModule.Handler.RefreshToken))
 			publicWrites.POST("/forgot-password", ginAdapter(authModule.Handler.ForgotPassword))
 			publicWrites.POST("/reset-password", ginAdapter(authModule.Handler.ResetPassword))
 			publicWrites.POST("/verify-email", ginAdapter(authModule.Handler.VerifyEmail))
@@ -981,7 +1070,6 @@ func Run() error {
 				authenticated.GET("/me", ginAdapter(authModule.Handler.GetProfile))
 				authenticated.PUT("/profile", ginAdapter(authModule.Handler.UpdateProfile))
 				authenticated.POST("/change-password", ginAdapter(authModule.Handler.ChangePassword))
-				authenticated.POST("/logout-all", ginAdapter(authModule.Handler.LogoutAll))
 				authenticated.POST("/enable-otp", ginAdapter(authModule.Handler.EnableOTP))
 				authenticated.POST("/disable-otp", ginAdapter(authModule.Handler.DisableOTP))
 				authenticated.POST("/verify-otp", ginAdapter(authModule.Handler.VerifyOTP))
@@ -1529,7 +1617,7 @@ func getTicketStatsCacheTTL() time.Duration {
 
 func buildCORSConfig(cfg *config.Config) *middleware.CORSConfig {
 	corsConfig := &middleware.CORSConfig{
-		AllowOrigins: cfg.CORS.AllowedOrigins,
+		AllowOrigins: trustedProtocolOrigins(cfg.CORS.AllowedOrigins),
 		AllowMethods: cfg.CORS.AllowedMethods,
 		AllowHeaders: cfg.CORS.AllowedHeaders,
 		ExposeHeaders: []string{
@@ -1546,19 +1634,7 @@ func buildCORSConfig(cfg *config.Config) *middleware.CORSConfig {
 		AllowCredentials: true,
 		MaxAge:           86400,
 	}
-	if cfg.Server.Environment != "production" || containsOrigin(cfg.CORS.AllowedOrigins, "*") {
-		corsConfig.AllowAllOrigins = true
-	}
 	return corsConfig
-}
-
-func containsOrigin(origins []string, target string) bool {
-	for _, origin := range origins {
-		if strings.TrimSpace(origin) == target {
-			return true
-		}
-	}
-	return false
 }
 
 func trustedProtocolOrigins(origins []string) []string {

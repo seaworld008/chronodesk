@@ -38,6 +38,7 @@ import {
 import { joinApiUrl } from '@/lib/apiUrl'
 import type { AccessPermissions } from '@/lib/accessControl'
 import { humanApiRoutes } from '@/lib/generated/human-api'
+import { readHumanAccessToken } from '@/lib/humanSessionRuntime'
 import {
   parseProjectRole,
   projectResourcePath,
@@ -227,7 +228,7 @@ const TicketDashboard: React.FC = () => {
       setError(null)
       try {
         const headers: HeadersInit = {
-          Authorization: `Bearer ${localStorage.getItem('token') || ''}`,
+          Authorization: `Bearer ${readHumanAccessToken() || ''}`,
         }
         const ticketsPath = await projectResourcePath('tickets')
         const ticketsURL = joinApiUrl(API_BASE, ticketsPath)

@@ -5,8 +5,6 @@ import {
     type AuthSession,
     type HumanSessionUser,
     type LoginRequest,
-    type LogoutRequest,
-    type RefreshTokenRequest,
     type ResetHumanPasswordRequest,
 } from '@/lib/generated/human-api'
 import {
@@ -21,25 +19,63 @@ import {
     type AccessPermissions,
 } from './accessControl'
 import {
+    captureStoredProjectSelectionBinding,
     clearProjectScopeCache,
     hasProjectCapability,
     parseProjectRole,
     readHumanSessionBinding,
     resolveActiveProjectAccess,
+    storedProjectSelectionBindingMatchesHumanSession,
 } from './projectScope'
 import {
     authenticationStorageKeys,
+    readHumanSessionMetadata,
+    writeHumanSessionMetadata,
 } from './humanSessionStorage'
 import {
     bindHumanTabSession,
     readCommittedHumanTabSessionToken,
+    type HumanSessionBinding,
 } from './humanTabSession'
+import {
+    clearHumanAccessToken,
+    captureHumanAccessTokenSnapshot,
+    commitHumanAccessToken,
+    humanAccessTokenSnapshotIsCurrent,
+    humanSessionCommittedAt,
+    isStaleHumanSessionResponse,
+    readHumanAccessToken,
+} from './humanSessionRuntime'
+import {
+    humanSessionSignOutMatchesBinding,
+    publishAuthenticatedHumanSession,
+    publishSignedOutHumanSession,
+    type HumanSessionMetadata,
+} from './humanSessionChannel'
+import { withHumanSessionLifecycleLock } from './humanSessionLifecycle'
 import { joinApiUrl } from './apiUrl'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 const buildUrl = (path: string) => joinApiUrl(apiBase, path)
+const publicHumanAuthPaths = new Set([
+    '/login',
+    '/register',
+    '/forgot-password',
+    '/reset-password',
+    '/verify-email',
+    '/resend-verification',
+])
+
+const isPublicHumanAuthRoute = (): boolean => {
+    if (typeof window === 'undefined') return false
+    const hashPath = window.location.hash
+        .replace(/^#/, '')
+        .split(/[?&]/u, 1)[0]
+    return publicHumanAuthPaths.has(hashPath)
+}
 
 const rememberDevicePreferenceKey = 'rememberDevicePreference'
+let remoteSignOutObserved = false
 type LoginParams = {
     username: string
     password: string
@@ -60,6 +96,55 @@ const positiveInteger = (value: unknown): value is number =>
 const nonEmptyString = (value: unknown): value is string =>
     typeof value === 'string' && value.length > 0
 
+const hasOnlyKeys = (
+    value: Record<string, unknown>,
+    allowedKeys: ReadonlySet<string>,
+): boolean => Object.keys(value).every((key) => allowedKeys.has(key))
+
+const dateTimeString = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u
+        .test(value) &&
+    !Number.isNaN(Date.parse(value))
+
+const humanUserProfileKeys = new Set([
+    'id',
+    'user_id',
+    'first_name',
+    'last_name',
+    'display_name',
+    'avatar',
+    'phone',
+    'department',
+    'position',
+    'timezone',
+    'language',
+    'created_at',
+    'updated_at',
+])
+
+const humanSessionUserKeys = new Set([
+    'id',
+    'username',
+    'email',
+    'platform_role',
+    'status',
+    'email_verified',
+    'otp_enabled',
+    'last_login_at',
+    'profile',
+])
+
+const authSessionKeys = new Set([
+    'user',
+    'access_token',
+    'expires_in',
+    'token_type',
+])
+
+const loginSessionEnvelopeKeys = new Set(['code', 'msg', 'data'])
+const refreshSessionEnvelopeKeys = new Set(['success', 'message', 'data'])
+
 const safeFetch = async (
     input: RequestInfo | URL,
     init: RequestInit | undefined,
@@ -77,7 +162,30 @@ const responseData = (value: unknown): unknown => {
     return value
 }
 
-const parseHumanSessionUser = (value: unknown): HumanSessionUser | null => {
+const validHumanUserProfile = (value: unknown): boolean => {
+    if (!isRecord(value) || !hasOnlyKeys(value, humanUserProfileKeys)) {
+        return false
+    }
+    return (
+        positiveInteger(value.id) &&
+        positiveInteger(value.user_id) &&
+        typeof value.first_name === 'string' &&
+        typeof value.last_name === 'string' &&
+        typeof value.display_name === 'string' &&
+        typeof value.avatar === 'string' &&
+        typeof value.phone === 'string' &&
+        typeof value.department === 'string' &&
+        typeof value.position === 'string' &&
+        typeof value.timezone === 'string' &&
+        typeof value.language === 'string' &&
+        dateTimeString(value.created_at) &&
+        dateTimeString(value.updated_at)
+    )
+}
+
+const parseStoredHumanSessionUser = (
+    value: unknown,
+): HumanSessionUser | null => {
     if (!isRecord(value)) return null
     const platformRole = parsePlatformRole(value.platform_role)
     if (
@@ -96,13 +204,35 @@ const parseHumanSessionUser = (value: unknown): HumanSessionUser | null => {
     return value as HumanSessionUser
 }
 
+const parseHumanSessionUser = (value: unknown): HumanSessionUser | null => {
+    if (!isRecord(value) || !hasOnlyKeys(value, humanSessionUserKeys)) {
+        return null
+    }
+    const user = parseStoredHumanSessionUser(value)
+    if (
+        user === null ||
+        (
+            value.last_login_at !== null &&
+            !dateTimeString(value.last_login_at)
+        ) ||
+        (
+            value.profile !== undefined &&
+            !validHumanUserProfile(value.profile)
+        )
+    ) {
+        return null
+    }
+    return user
+}
+
 const parseAuthSession = (value: unknown): AuthSession | null => {
-    if (!isRecord(value)) return null
+    if (!isRecord(value) || !hasOnlyKeys(value, authSessionKeys)) {
+        return null
+    }
     const user = parseHumanSessionUser(value.user)
     if (
         user === null ||
         !nonEmptyString(value.access_token) ||
-        !nonEmptyString(value.refresh_token) ||
         !positiveInteger(value.expires_in) ||
         value.token_type !== 'Bearer'
     ) {
@@ -119,12 +249,41 @@ const parseAuthSession = (value: unknown): AuthSession | null => {
     return value as AuthSession
 }
 
-const readStoredUser = (): HumanSessionUser | null => {
-    const serialized = localStorage.getItem('user')
-    const binding = readHumanSessionBinding()
+export const parseHumanLoginSessionResponse = (
+    value: unknown,
+): AuthSession | null => {
+    if (
+        !isRecord(value) ||
+        !hasOnlyKeys(value, loginSessionEnvelopeKeys) ||
+        value.code !== 0 ||
+        typeof value.msg !== 'string'
+    ) {
+        return null
+    }
+    return parseAuthSession(value.data)
+}
+
+export const parseHumanRefreshSessionResponse = (
+    value: unknown,
+): AuthSession | null => {
+    if (
+        !isRecord(value) ||
+        !hasOnlyKeys(value, refreshSessionEnvelopeKeys) ||
+        value.success !== true ||
+        value.message !== '登录令牌刷新成功'
+    ) {
+        return null
+    }
+    return parseAuthSession(value.data)
+}
+
+const readStoredUserForBinding = (
+    binding: HumanSessionBinding | null,
+): HumanSessionUser | null => {
+    const serialized = readHumanSessionMetadata('user')
     if (!serialized || !binding) return null
     try {
-        const user = parseHumanSessionUser(JSON.parse(serialized))
+        const user = parseStoredHumanSessionUser(JSON.parse(serialized))
         if (
             user === null ||
             binding.subject !== String(user.id) ||
@@ -138,22 +297,62 @@ const readStoredUser = (): HumanSessionUser | null => {
     }
 }
 
-export const hasCompleteAuthenticationState = (): boolean =>
-    readCommittedHumanTabSessionToken() !== null &&
-    readStoredUser() !== null
+const readStoredUser = (): HumanSessionUser | null =>
+    readStoredUserForBinding(readHumanSessionBinding())
 
-export const clearAuthenticationState = (): void => {
+export const clearAuthenticationState = (
+    options: {
+        notifyPeers?: false | 'current_session' | 'all_devices'
+    } = {},
+): void => {
+    const binding =
+        options.notifyPeers === false || options.notifyPeers === undefined
+            ? null
+            : readHumanSessionBinding()
     for (const key of authenticationStorageKeys) {
         localStorage.removeItem(key)
+        sessionStorage.removeItem(key)
     }
+    clearHumanAccessToken()
     bindHumanTabSession(null)
     clearProjectScopeCache()
+    if (binding !== null && options.notifyPeers === 'current_session') {
+        publishSignedOutHumanSession({
+            scope: 'current_session',
+            subject: binding.subject,
+            session_id: binding.session_id,
+        })
+    } else if (binding !== null && options.notifyPeers === 'all_devices') {
+        publishSignedOutHumanSession({
+            scope: 'all_devices',
+            subject: binding.subject,
+        })
+    }
+}
+
+export const applyRemoteHumanSignOut = (
+    metadata: Extract<HumanSessionMetadata, { type: 'signed_out' }>,
+): boolean => {
+    if (
+        !humanSessionSignOutMatchesBinding(
+            metadata,
+            readHumanSessionBinding(),
+            humanSessionCommittedAt(),
+        )
+    ) {
+        return false
+    }
+    remoteSignOutObserved = true
+    clearAuthenticationState({ notifyPeers: false })
+    return true
 }
 
 const storeAuthSession = (
     session: AuthSession,
     preserveProjectScope: boolean,
+    publishToPeers = true,
 ): void => {
+    remoteSignOutObserved = false
     const binding = readHumanSessionBinding(session.access_token)
     if (!binding) {
         throw new Error('登录响应中的会话标识无效')
@@ -163,14 +362,22 @@ const storeAuthSession = (
     }
     for (const key of authenticationStorageKeys) {
         localStorage.removeItem(key)
+        sessionStorage.removeItem(key)
     }
-    localStorage.setItem('refreshToken', session.refresh_token)
-    localStorage.setItem('user', JSON.stringify(session.user))
-    localStorage.setItem('tokenExpiresAt', String(binding.expires_at))
-    // Cross-tab listeners treat token as the session commit marker. Keep it
-    // last so they never observe a partially written authentication state.
-    localStorage.setItem('token', session.access_token)
+    writeHumanSessionMetadata('user', JSON.stringify(session.user))
+    writeHumanSessionMetadata(
+        'tokenExpiresAt',
+        String(binding.expires_at),
+    )
+    commitHumanAccessToken(session.access_token)
     bindHumanTabSession(session.access_token)
+    if (publishToPeers) {
+        publishAuthenticatedHumanSession({
+            subject: binding.subject,
+            session_id: binding.session_id,
+            expires_at: binding.expires_at,
+        })
+    }
 }
 
 export type RegistrationSessionOutcome =
@@ -191,7 +398,10 @@ export const consumeRegistrationResult = (
     if (!user.email_verified) {
         if (
             value.access_token === '' &&
-            value.refresh_token === '' &&
+            (
+                value.refresh_token === undefined ||
+                value.refresh_token === ''
+            ) &&
             value.token_type === '' &&
             value.expires_in === 0
         ) {
@@ -208,39 +418,41 @@ export const consumeRegistrationResult = (
     return 'authenticated'
 }
 
-const refreshStoredSession = async (): Promise<void> => {
-    const refreshToken = localStorage.getItem('refreshToken')
-    const previousBinding = readHumanSessionBinding()
-    if (!refreshToken || !previousBinding) {
-        clearAuthenticationState()
-        throw new Error('登录状态已过期，请重新登录')
-    }
+let refreshSessionRequest: Promise<void> | null = null
 
-    try {
-        const payload: RefreshTokenRequest = {
-            refresh_token: refreshToken,
-        }
+type SessionRefreshOptions = {
+    previousBinding?: HumanSessionBinding | null
+    publishToPeers?: boolean
+}
+
+const performSessionRefresh = (
+    options: SessionRefreshOptions = {},
+): Promise<void> => {
+    // Capture the tab-local project binding before waiting for the cross-tab
+    // lifecycle lock. Auth-gated UI may render while the refresh is queued,
+    // but only the validated refresh response may decide whether it is safe
+    // to retain this selection.
+    const previousProjectBinding =
+        captureStoredProjectSelectionBinding()
+    const previousBinding =
+        options.previousBinding === undefined
+            ? readHumanSessionBinding()
+            : options.previousBinding
+    return withHumanSessionLifecycleLock(async () => {
         const response = await safeFetch(
             buildUrl(humanApiRoutes.refreshHumanSession()),
             {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
+                credentials: 'include',
             },
             '登录状态刷新失败',
         )
         const body: unknown = await response.json().catch(() => ({}))
-        const session = parseAuthSession(responseData(body))
-        const nextBinding = session
-            ? readHumanSessionBinding(session.access_token)
-            : null
-        if (
-            !response.ok ||
-            session === null ||
-            nextBinding === null ||
-            nextBinding.subject !== previousBinding.subject ||
-            nextBinding.session_id !== previousBinding.session_id
-        ) {
+        if (!response.ok) {
+            if (response.status === 401) {
+                remoteSignOutObserved = true
+                clearAuthenticationState({ notifyPeers: false })
+            }
             throw new Error(
                 localizedApiErrorMessage(
                     body,
@@ -249,9 +461,95 @@ const refreshStoredSession = async (): Promise<void> => {
                 ),
             )
         }
-        storeAuthSession(session, true)
+        const session = parseHumanRefreshSessionResponse(body)
+        const nextBinding = session
+            ? readHumanSessionBinding(session.access_token)
+            : null
+        if (
+            session === null ||
+            nextBinding === null ||
+            (
+                previousBinding !== null &&
+                (
+                    nextBinding.subject !== previousBinding.subject ||
+                    nextBinding.session_id !== previousBinding.session_id
+                )
+            )
+        ) {
+            remoteSignOutObserved = true
+            clearAuthenticationState({ notifyPeers: false })
+            throw new Error('登录状态刷新响应无效，请重新登录')
+        }
+        storeAuthSession(
+            session,
+            previousBinding !== null ||
+                storedProjectSelectionBindingMatchesHumanSession(
+                    previousProjectBinding,
+                    nextBinding,
+                ),
+            options.publishToPeers !== false,
+        )
+    })
+}
+
+const refreshStoredSession = async (
+    options: SessionRefreshOptions = {},
+): Promise<void> => {
+    if (refreshSessionRequest) return refreshSessionRequest
+    const request = performSessionRefresh(options)
+    refreshSessionRequest = request
+    try {
+        await request
+    } finally {
+        if (refreshSessionRequest === request) {
+            refreshSessionRequest = null
+        }
+    }
+}
+
+export const bootstrapHumanSession = async (): Promise<void> => {
+    await refreshStoredSession()
+}
+
+export const synchronizeHumanSessionAfterRemoteAuthentication = async (
+    metadata: Extract<HumanSessionMetadata, { type: 'authenticated' }>,
+): Promise<boolean> => {
+    const previousToken = readHumanAccessToken()
+    const previousBinding = readHumanSessionBinding(previousToken)
+    if (
+        previousToken === null ||
+        previousBinding === null ||
+        previousBinding.subject !== metadata.subject ||
+        previousBinding.session_id !== metadata.session_id ||
+        metadata.issued_at <= humanSessionCommittedAt()
+    ) {
+        return false
+    }
+
+    // Retire the old bearer synchronously so any response already in flight
+    // becomes stale before it can trigger a shared-cookie logout. The
+    // synchronization refresh deliberately stays local: rebroadcasting it
+    // would make same-session tabs rotate the shared cookie in a loop.
+    clearHumanAccessToken()
+    bindHumanTabSession(null)
+    try {
+        await refreshStoredSession({
+            previousBinding,
+            publishToPeers: false,
+        })
+        return true
     } catch (error) {
-        clearAuthenticationState()
+        // A transient refresh failure must not destroy an otherwise usable
+        // tab. Recommit the previous bearer with a new generation so already
+        // in-flight responses remain stale. Deterministic refresh failures
+        // clear the stored user and therefore cannot enter this branch.
+        if (
+            readHumanAccessToken() === null &&
+            readStoredUserForBinding(previousBinding) !== null
+        ) {
+            commitHumanAccessToken(previousToken)
+            bindHumanTabSession(previousToken)
+        }
         throw error
     }
 }
@@ -284,12 +582,13 @@ const userIdentity = (user: HumanSessionUser): UserIdentity => {
 }
 
 const fetchCurrentUser = async (): Promise<HumanSessionUser> => {
-    const token = localStorage.getItem('token')
+    const token = readHumanAccessToken()
     const binding = readHumanSessionBinding(token)
     if (!token || !binding) {
         clearAuthenticationState()
         throw new Error('未找到有效登录令牌，请重新登录')
     }
+    const requestSession = captureHumanAccessTokenSnapshot(token)
     const response = await safeFetch(
         buildUrl(humanApiRoutes.getHumanSessionUser()),
         {
@@ -299,6 +598,13 @@ const fetchCurrentUser = async (): Promise<HumanSessionUser> => {
         '获取当前用户身份失败',
     )
     const body: unknown = await response.json().catch(() => ({}))
+    if (!humanAccessTokenSnapshotIsCurrent(requestSession)) {
+        const committedUser = readStoredUser()
+        if (committedUser !== null) {
+            return committedUser
+        }
+        throw new Error('登录状态已更新，请重试')
+    }
     const user = parseHumanSessionUser(responseData(body))
     if (
         !response.ok ||
@@ -313,38 +619,79 @@ const fetchCurrentUser = async (): Promise<HumanSessionUser> => {
             localizedApiErrorMessage(body, response.status, '获取当前用户身份失败'),
         )
     }
-    localStorage.setItem('user', JSON.stringify(user))
+    writeHumanSessionMetadata('user', JSON.stringify(user))
     return user
 }
 
-export const logoutAllSessions = async (): Promise<void> => {
-    const token = localStorage.getItem('token')
-    try {
-        if (token) {
-            const response = await safeFetch(
-                buildUrl(humanApiRoutes.deleteAllHumanSessions()),
-                {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: { Authorization: `Bearer ${token}` },
-                },
-                '从所有设备退出失败',
-            )
-            if (!response.ok) {
-                const body: unknown = await response.json().catch(() => ({}))
-                throw new Error(
-                    localizedApiErrorMessage(
-                        body,
-                        response.status,
-                        '从所有设备退出失败',
-                    ),
-                )
+export const logoutAllSessions = (): Promise<void> =>
+    withHumanSessionLifecycleLock(async () => {
+        const token = readHumanAccessToken()
+        const binding = readHumanSessionBinding(token)
+        if (!token || binding === null) {
+            if (remoteSignOutObserved) {
+                clearAuthenticationState({ notifyPeers: false })
+                return
             }
+            throw new Error('未找到有效登录会话，无法从所有设备退出')
         }
-    } finally {
-        clearAuthenticationState()
-    }
-}
+        const response = await safeFetch(
+            buildUrl(humanApiRoutes.deleteAllHumanSessions()),
+            {
+                method: 'POST',
+                credentials: 'include',
+                headers: { Authorization: `Bearer ${token}` },
+            },
+            '从所有设备退出失败',
+        )
+        if (!response.ok) {
+            const body: unknown = await response.json().catch(() => ({}))
+            throw new Error(
+                localizedApiErrorMessage(
+                    body,
+                    response.status,
+                    '从所有设备退出失败',
+                ),
+            )
+        }
+        clearAuthenticationState({ notifyPeers: 'all_devices' })
+    })
+
+export const logoutCurrentSession = (): Promise<void> =>
+    withHumanSessionLifecycleLock(async () => {
+        if (remoteSignOutObserved) {
+            clearAuthenticationState({ notifyPeers: false })
+            return
+        }
+        const token = readHumanAccessToken()
+        const binding = readHumanSessionBinding(token)
+        if (!token || binding === null) {
+            throw new Error('未找到有效登录会话，无法安全退出')
+        }
+        const headers = new Headers({
+            Authorization: `Bearer ${token}`,
+            'X-Chronodesk-Session-ID': binding.session_id,
+        })
+        const response = await safeFetch(
+            buildUrl(humanApiRoutes.deleteHumanSession()),
+            {
+                method: 'POST',
+                credentials: 'include',
+                headers,
+            },
+            '退出登录请求失败',
+        )
+        if (!response.ok) {
+            const body: unknown = await response.json().catch(() => ({}))
+            throw new Error(
+                localizedApiErrorMessage(
+                    body,
+                    response.status,
+                    '退出登录请求失败',
+                ),
+            )
+        }
+        clearAuthenticationState({ notifyPeers: 'current_session' })
+    })
 
 export const authProvider: AuthProvider = {
     login: async (params) => {
@@ -375,75 +722,62 @@ export const authProvider: AuthProvider = {
             shouldRememberDevice ? 'true' : 'false',
         )
 
-        const response = await safeFetch(
-            buildUrl(humanApiRoutes.createHumanSession()),
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify(payload),
-            },
-            '网络连接失败，无法登录',
-        )
-        const body: unknown = await response.json().catch(() => ({}))
-        if (!response.ok || (isRecord(body) && body.code === 1)) {
-            const rawMessage = isRecord(body)
-                ? [body.msg, body.message].find(
-                    (value) => typeof value === 'string',
-                )
-                : undefined
-            const message =
-                typeof rawMessage === 'string' && containsChineseText(rawMessage)
-                    ? rawMessage
-                    : typeof rawMessage === 'string' && /otp/i.test(rawMessage)
-                      ? '动态验证码无效或已过期，请重新输入'
-                      : typeof rawMessage === 'string' &&
-                          /device/i.test(rawMessage)
-                        ? '受信任设备凭据已失效，请重新验证'
-                        : '登录失败，请检查邮箱、密码和验证码'
-            throw new Error(message)
-        }
-
-        const session = parseAuthSession(responseData(body))
-        if (session === null) {
-            throw new Error('登录响应包含无效的平台角色或会话信息')
-        }
-        storeAuthSession(session, false)
-    },
-
-    logout: async () => {
-        try {
-            const token = localStorage.getItem('token')
-            const refreshToken = localStorage.getItem('refreshToken')
-            if (token) {
-                const payload: LogoutRequest | undefined = refreshToken
-                    ? { refresh_token: refreshToken }
+        await withHumanSessionLifecycleLock(async () => {
+            const response = await safeFetch(
+                buildUrl(humanApiRoutes.createHumanSession()),
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify(payload),
+                },
+                '网络连接失败，无法登录',
+            )
+            const body: unknown = await response.json().catch(() => ({}))
+            if (!response.ok || (isRecord(body) && body.code === 1)) {
+                const rawMessage = isRecord(body)
+                    ? [body.msg, body.message].find(
+                        (value) => typeof value === 'string',
+                    )
                     : undefined
-                await safeFetch(
-                    buildUrl(humanApiRoutes.deleteHumanSession()),
-                    {
-                        method: 'POST',
-                        credentials: 'include',
-                        headers: {
-                            Authorization: `Bearer ${token}`,
-                            'Content-Type': 'application/json',
-                        },
-                        body: payload ? JSON.stringify(payload) : undefined,
-                    },
-                    '退出登录请求失败',
-                )
+                const message =
+                    typeof rawMessage === 'string' &&
+                    containsChineseText(rawMessage)
+                        ? rawMessage
+                        : typeof rawMessage === 'string' &&
+                            /otp/i.test(rawMessage)
+                          ? '动态验证码无效或已过期，请重新输入'
+                          : typeof rawMessage === 'string' &&
+                              /device/i.test(rawMessage)
+                            ? '受信任设备凭据已失效，请重新验证'
+                            : '登录失败，请检查邮箱、密码和验证码'
+                throw new Error(message)
             }
-        } finally {
-            clearAuthenticationState()
-        }
+
+            const session = parseHumanLoginSessionResponse(body)
+            if (session === null) {
+                throw new Error('登录响应包含无效的平台角色或会话信息')
+            }
+            storeAuthSession(session, false)
+        })
     },
+
+    logout: logoutCurrentSession,
 
     checkAuth: async () => {
         let committedToken = readCommittedHumanTabSessionToken()
         let binding = readHumanSessionBinding(committedToken)
         if (!committedToken || !binding || readStoredUser() === null) {
+            if (isPublicHumanAuthRoute()) {
+                throw new Error('当前页面无需登录')
+            }
+            await refreshStoredSession()
+            committedToken = readCommittedHumanTabSessionToken()
+            binding = readHumanSessionBinding(committedToken)
+        }
+        if (!committedToken || !binding || readStoredUser() === null) {
             clearAuthenticationState()
-            throw new Error('登录会话无效，请重新登录')
+            throw new Error('登录状态已过期，请重新登录')
         }
         if (Date.now() >= binding.expires_at) {
             await refreshStoredSession()
@@ -459,6 +793,9 @@ export const authProvider: AuthProvider = {
     checkError: async (error) => {
         const status = isRecord(error) ? error.status : undefined
         if (status === 401) {
+            if (isStaleHumanSessionResponse(error)) {
+                return
+            }
             clearAuthenticationState()
             throw new Error('身份认证失败，请重新登录')
         }
@@ -470,9 +807,15 @@ export const authProvider: AuthProvider = {
     },
 
     getPermissions: async (): Promise<AccessPermissions> => {
-        const user = readStoredUser()
+        let user = readStoredUser()
         if (!user) {
-            clearAuthenticationState()
+            if (isPublicHumanAuthRoute()) {
+                throw new Error('当前页面无需登录')
+            }
+            await refreshStoredSession()
+            user = readStoredUser()
+        }
+        if (!user) {
             throw new Error('登录会话无效，请重新登录')
         }
         try {

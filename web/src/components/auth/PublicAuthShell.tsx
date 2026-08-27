@@ -5,11 +5,18 @@ import {
     Typography,
 } from '@mui/material'
 import { useQueryClient } from '@tanstack/react-query'
+import { markHumanAuthQueryAuthenticated } from '@/lib/authQueryState'
 import {
-    humanSessionStorageCommitKey,
-    markHumanAuthQueryAuthenticated,
-} from '@/lib/authQueryState'
-import { hasCompleteAuthenticationState } from '@/lib/authProvider'
+    applyRemoteHumanSignOut,
+    bootstrapHumanSession,
+    synchronizeHumanSessionAfterRemoteAuthentication,
+} from '@/lib/authProvider'
+import { subscribeHumanSessionMetadata } from '@/lib/humanSessionChannel'
+import { clearHumanAccessToken } from '@/lib/humanSessionRuntime'
+import {
+    bindHumanTabSession,
+    readHumanSessionBinding,
+} from '@/lib/humanTabSession'
 import heroAvif from '@/assets/chronodesk-login-orchestration.avif'
 import heroJpeg from '@/assets/chronodesk-login-orchestration.jpg'
 import ChronoDeskMark from '@/components/brand/ChronoDeskMark'
@@ -303,23 +310,45 @@ const PublicAuthShell = ({
     const queryClient = useQueryClient()
 
     useEffect(() => {
-        const handleAuthenticationStorage = (event: StorageEvent) => {
+        return subscribeHumanSessionMetadata((metadata) => {
             if (
-                event.key !== humanSessionStorageCommitKey ||
-                event.newValue === null ||
-                !hasCompleteAuthenticationState()
+                metadata.type === 'signed_out' &&
+                !applyRemoteHumanSignOut(metadata)
             ) {
                 return
             }
-            markHumanAuthQueryAuthenticated(queryClient)
-        }
-        window.addEventListener('storage', handleAuthenticationStorage)
-        return () => {
-            window.removeEventListener(
-                'storage',
-                handleAuthenticationStorage,
-            )
-        }
+            void queryClient.cancelQueries({
+                queryKey: ['auth', 'checkAuth'],
+            })
+            queryClient.removeQueries({
+                queryKey: ['auth', 'checkAuth'],
+            })
+            if (metadata.type === 'signed_out') {
+                return
+            }
+            const binding = readHumanSessionBinding()
+            if (
+                binding !== null &&
+                binding.subject === metadata.subject &&
+                binding.session_id === metadata.session_id
+            ) {
+                void synchronizeHumanSessionAfterRemoteAuthentication(
+                    metadata,
+                )
+                    .then(() => {
+                        markHumanAuthQueryAuthenticated(queryClient)
+                    })
+                    .catch(() => undefined)
+                return
+            }
+            clearHumanAccessToken()
+            bindHumanTabSession(null)
+            void bootstrapHumanSession()
+                .then(() => {
+                    markHumanAuthQueryAuthenticated(queryClient)
+                })
+                .catch(() => undefined)
+        })
     }, [queryClient])
 
     return (

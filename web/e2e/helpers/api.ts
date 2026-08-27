@@ -5,7 +5,7 @@ import type {
     HumanSessionUser as GeneratedHumanSessionUser,
     PlatformRole as GeneratedPlatformRole,
 } from '../../src/lib/generated/human-api';
-import { assertDestructiveE2EAllowed } from './safety';
+import { assertDestructiveE2EAllowed, testBaseURL } from './safety';
 
 export type Credentials = {
     email: string;
@@ -53,6 +53,9 @@ export const loginSession = async (
     credentials: Credentials,
 ): Promise<AuthSession> => {
     const response = await request.post('/api/auth/login', {
+        headers: {
+            Origin: testBaseURL().origin,
+        },
         data: {
             email: credentials.email,
             password: credentials.password,
@@ -77,14 +80,12 @@ export const loginSession = async (
         throw new Error('登录响应缺少合法的 platform_role 用户身份');
     }
     if (
-        typeof data.refresh_token !== 'string' ||
-        data.refresh_token.length === 0 ||
         typeof data.expires_in !== 'number' ||
         !Number.isSafeInteger(data.expires_in) ||
         data.expires_in <= 0 ||
         data.token_type !== 'Bearer'
     ) {
-        throw new Error('登录响应缺少合法的刷新令牌或过期信息');
+        throw new Error('登录响应缺少合法的过期信息');
     }
 
     return data as AuthSession;

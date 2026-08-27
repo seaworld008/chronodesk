@@ -15,6 +15,28 @@ const loadWorkflow = async (name) =>
 
 const workflowEvents = (workflow) => workflow.on ?? workflow.true
 
+test('浏览器登录 helper 只使用测试基址 origin，且不污染通用 API helper', async () => {
+  const helper = await readRepositoryFile('web/e2e/helpers/api.ts')
+  const loginStart = helper.indexOf('export const loginSession')
+  const genericStart = helper.indexOf('export const apiRequest')
+
+  assert.ok(loginStart >= 0)
+  assert.ok(genericStart > loginStart)
+
+  const loginSource = helper.slice(loginStart, genericStart)
+  const genericSource = helper.slice(genericStart)
+
+  assert.match(
+    helper,
+    /import\s*\{\s*assertDestructiveE2EAllowed,\s*testBaseURL\s*\}\s*from\s*'\.\/safety'/u,
+  )
+  assert.match(
+    loginSource,
+    /headers:\s*\{\s*Origin:\s*testBaseURL\(\)\.origin,\s*\}/u,
+  )
+  assert.doesNotMatch(genericSource, /\bOrigin\s*:/u)
+})
+
 test('完整 Smoke 只验证 PR 合并结果并取消同 PR 的旧运行', async () => {
   const workflow = await loadWorkflow('smoke')
   const events = workflowEvents(workflow)
@@ -89,6 +111,11 @@ test('短时安全检查保留 main 状态并取消同 PR 的旧运行', async (
       assert.ok(
         workflow.jobs.web.steps.some(
           (step) => step.run === 'npm run test:ci-runtime',
+        ),
+      )
+      assert.ok(
+        workflow.jobs.web.steps.some(
+          (step) => step.run === 'npm run test:project-scope',
         ),
       )
     }

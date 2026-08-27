@@ -17,6 +17,7 @@ import {
     type HumanSessionUser,
     type UpdateHumanProfileRequest,
 } from '@/lib/generated/human-api'
+import { writeHumanSessionMetadata } from '@/lib/humanSessionStorage'
 import PageShell from '@/components/layout/PageShell'
 import AccountPageHeader from './AccountPageHeader'
 
@@ -35,7 +36,7 @@ const emptyForm: ProfileForm = {
 }
 
 const storeCurrentUser = (user: HumanSessionUser) => {
-    localStorage.setItem('user', JSON.stringify(user))
+    writeHumanSessionMetadata('user', JSON.stringify(user))
 }
 
 const profileDescription =

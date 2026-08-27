@@ -643,8 +643,6 @@ func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 		"ProjectRole",
 		"RegisterHumanRequest",
 		"LoginRequest",
-		"RefreshTokenRequest",
-		"LogoutRequest",
 		"ForgotPasswordRequest",
 		"ResetHumanPasswordRequest",
 		"VerifyHumanEmailRequest",
@@ -826,12 +824,6 @@ func TestHumanSessionRequestsMatchStrictRuntimeDTOs(t *testing.T) {
 			},
 		},
 		{
-			path:       "/auth/refresh",
-			schemaName: "RefreshTokenRequest",
-			required:   []string{"refresh_token"},
-			properties: []string{"refresh_token"},
-		},
-		{
 			path:       "/auth/forgot-password",
 			schemaName: "ForgotPasswordRequest",
 			required:   []string{"email"},
@@ -908,25 +900,70 @@ func TestHumanSessionRequestsMatchStrictRuntimeDTOs(t *testing.T) {
 			)
 		}
 	}
-	logout := objectAt(t, objectAt(t, paths, "/auth/logout"), "post")
-	requestBody := objectAt(t, logout, "requestBody")
-	if requestBody["required"] != false {
-		t.Fatal("logout request body must remain optional")
+	for _, path := range []string{"/auth/refresh", "/auth/logout"} {
+		operation := objectAt(t, objectAt(t, paths, path), "post")
+		if _, hasBody := operation["requestBody"]; hasBody {
+			t.Errorf("%s must not publish a request body", path)
+		}
+		parameters, hasParameters := operation["parameters"].([]any)
+		if path == "/auth/refresh" && hasParameters {
+			t.Errorf("%s must not publish a legacy refresh-token parameter", path)
+		}
+		if path == "/auth/logout" {
+			if !hasParameters || len(parameters) != 1 {
+				t.Fatalf("%s parameters = %v", path, operation["parameters"])
+			}
+			precondition, ok := parameters[0].(map[string]any)
+			if !ok ||
+				precondition["name"] != "X-Chronodesk-Session-ID" ||
+				precondition["in"] != "header" ||
+				precondition["required"] != true {
+				t.Errorf("%s session precondition = %v", path, parameters[0])
+			}
+		}
+		security, ok := operation["security"].([]any)
+		if !ok || len(security) != 1 {
+			t.Fatalf("%s security = %v", path, operation["security"])
+		}
+		requirement, ok := security[0].(map[string]any)
+		if !ok || len(requirement) != 1 {
+			t.Fatalf("%s security requirement = %v", path, security[0])
+		}
+		scopes, ok := requirement["humanRefreshCookie"].([]any)
+		if !ok || len(scopes) != 0 {
+			t.Errorf("%s does not require humanRefreshCookie: %v", path, requirement)
+		}
 	}
-	content := objectAt(t, requestBody, "content")
-	media := objectAt(t, content, "application/json")
-	if got, _ := objectAt(t, media, "schema")["$ref"].(string); got != "#/components/schemas/LogoutRequest" {
-		t.Fatalf("logout request schema = %q", got)
+	for _, removed := range []string{"RefreshTokenRequest", "LogoutRequest"} {
+		if _, exists := schemas[removed]; exists {
+			t.Errorf("components.schemas.%s must be removed", removed)
+		}
 	}
-	logoutSchema := objectAt(t, schemas, "LogoutRequest")
-	if logoutSchema["additionalProperties"] != false {
-		t.Fatal("LogoutRequest must reject unknown fields when a body is supplied")
+	for _, responseSchema := range []string{
+		"AuthSession",
+		"HumanRegistrationResult",
+	} {
+		schema := objectAt(t, schemas, responseSchema)
+		properties := objectAt(t, schema, "properties")
+		if _, exposed := properties["refresh_token"]; exposed {
+			t.Errorf("%s exposes refresh_token", responseSchema)
+		}
+		required, _ := schema["required"].([]any)
+		if slices.Contains(required, any("refresh_token")) {
+			t.Errorf("%s requires refresh_token", responseSchema)
+		}
 	}
-	assertExactObjectKeys(
+	securitySchemes := objectAt(
 		t,
-		objectAt(t, logoutSchema, "properties"),
-		[]string{"refresh_token"},
+		objectAt(t, document, "components"),
+		"securitySchemes",
 	)
+	refreshCookie := objectAt(t, securitySchemes, "humanRefreshCookie")
+	if refreshCookie["type"] != "apiKey" ||
+		refreshCookie["in"] != "cookie" ||
+		refreshCookie["name"] != "chronodesk_refresh_token" {
+		t.Errorf("humanRefreshCookie = %v", refreshCookie)
+	}
 }
 
 func TestAuthorizedProjectPublishesStableScalarProjection(t *testing.T) {
@@ -1707,6 +1744,16 @@ func TestProtectedOperationsDeclareExactRoleAllowlist(t *testing.T) {
 			}
 			platform, hasPlatform := operation["x-chronodesk-platform-roles"]
 			project, hasProject := operation["x-chronodesk-project-roles"]
+			if path == "/auth/refresh" || path == "/auth/logout" {
+				if hasPlatform || hasProject {
+					t.Errorf(
+						"%s %s refresh-cookie authentication must not imply a role allowlist",
+						method,
+						path,
+					)
+				}
+				continue
+			}
 			if path == "/projects" && method == "get" {
 				if hasPlatform || hasProject {
 					t.Error("GET /projects must filter memberships without a role precondition")
@@ -2221,15 +2268,15 @@ func TestAuthOperationsPublishEveryRuntimeStatus(t *testing.T) {
 		},
 		{
 			path: "/auth/refresh",
-			want: []string{"200", "400", "401", "408", "413", "429", "503"},
+			want: []string{"200", "400", "401", "403", "408", "413", "429", "503"},
 		},
 		{
 			path: "/auth/logout",
-			want: []string{"200", "400", "413", "429", "503"},
+			want: []string{"200", "400", "401", "403", "409", "413", "429", "503"},
 		},
 		{
 			path: "/auth/logout-all",
-			want: []string{"200", "401", "429", "500", "503"},
+			want: []string{"200", "401", "409", "429", "500", "503"},
 		},
 		{
 			path: "/auth/profile",

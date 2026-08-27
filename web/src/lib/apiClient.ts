@@ -11,6 +11,11 @@ import { joinApiUrl } from './apiUrl'
 import {
   resolveHumanBearerForRequest,
 } from './humanTabSession'
+import {
+  captureHumanAccessTokenSnapshot,
+  humanAccessTokenSnapshotIsCurrent,
+  readHumanAccessToken,
+} from './humanSessionRuntime'
 
 export type ApiOptions = RequestInit & { rawResponse?: boolean }
 
@@ -22,6 +27,16 @@ const requestPath = (input: RequestInfo | URL): string => {
   if (typeof input === 'string') return input
   if (input instanceof URL) return input.toString()
   return input.url
+}
+
+const isHumanSessionLifecycleRequest = (path: string): boolean => {
+  try {
+    return /\/auth\/(?:login|refresh|logout|logout-all)$/u.test(
+      new URL(path, 'http://chronodesk.local').pathname,
+    )
+  } catch {
+    return false
+  }
 }
 
 export const sessionAwareFetch = async (
@@ -36,9 +51,20 @@ export const sessionAwareFetch = async (
   if (authorization?.startsWith('Bearer ')) {
     requireCommittedHumanBearerHeaders(requestHeaders)
   }
+  const committedAuthorization =
+    requestHeaders.get('Authorization')
+  const requestSession = captureHumanAccessTokenSnapshot(
+    committedAuthorization?.startsWith('Bearer ')
+      ? committedAuthorization.slice('Bearer '.length)
+      : null,
+  )
   const response = await fetch(input, { ...init, headers: requestHeaders })
   const path = requestPath(input)
-  if (response.status === 401) {
+  if (
+    response.status === 401 &&
+    !isHumanSessionLifecycleRequest(path) &&
+    humanAccessTokenSnapshotIsCurrent(requestSession)
+  ) {
     signalSessionInvalidated()
   } else if (response.status === 403) {
     const payload = await response.clone().json().catch(() => null)
@@ -97,6 +123,7 @@ const problemMessages: Record<string, string> = {
   read_only: '当前处于只读模式，写操作已被拒绝',
   not_found: '请求的资源不存在或当前账号无权访问',
   precondition_required: '数据版本信息缺失，请刷新后重试',
+  project_scope_changed: '当前标签页的项目已切换，请确认后重新操作',
   version_conflict: '数据已被其他操作更新，请刷新后重试',
   lease_conflict: '工单租约已失效或由其他智能体持有',
   lease_expired: '工单租约已过期，请重新领取',
@@ -186,7 +213,7 @@ const extractDataFromEnvelope = <T>(payload: JsonRecord): T | undefined => {
 }
 
 export async function apiFetch<T = unknown>(path: string, options: ApiOptions = {}): Promise<T> {
-  const token = localStorage.getItem('token')
+  const token = readHumanAccessToken()
   const headers = new Headers(options.headers ?? {})
   headers.set('Accept', 'application/json')
   if (!(options.body instanceof FormData)) {
