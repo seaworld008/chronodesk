@@ -5,7 +5,7 @@ import type {
     HumanSessionUser as GeneratedHumanSessionUser,
     PlatformRole as GeneratedPlatformRole,
 } from '../../src/lib/generated/human-api';
-import { assertDestructiveE2EAllowed } from './safety';
+import { assertDestructiveE2EAllowed, testBaseURL } from './safety';
 
 export type Credentials = {
     email: string;
@@ -53,6 +53,9 @@ export const loginSession = async (
     credentials: Credentials,
 ): Promise<AuthSession> => {
     const response = await request.post('/api/auth/login', {
+        headers: {
+            Origin: testBaseURL().origin,
+        },
         data: {
             email: credentials.email,
             password: credentials.password,
