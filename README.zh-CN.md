@@ -245,7 +245,7 @@ make docker-down
 
 ## 原生开发
 
-环境要求：Go `1.26.5`、Node.js `24`、Python `3.12+`、PostgreSQL `18`、
+环境要求：Go `1.26.7`、Node.js `24`、Python `3.12+`、PostgreSQL `18`、
 Redis `8`。
 
 ```bash
