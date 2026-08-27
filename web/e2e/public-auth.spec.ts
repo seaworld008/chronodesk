@@ -2507,7 +2507,7 @@ test('旧标签退出响应提交后新标签才允许登录', async ({
     expect(replacementProbeAuthorization).toBe(`Bearer ${tokenB}`)
 })
 
-test('三个标签页 refresh 的网络响应保持全局串行', async ({
+test('三个标签页生命周期锁内 refresh 网络响应保持全局串行', async ({
     context,
     page: firstPage,
 }) => {
@@ -2543,14 +2543,21 @@ test('三个标签页 refresh 的网络响应保持全局串行', async ({
         const request = route.request()
         const pathname = new URL(request.url()).pathname
         if (pathname === '/api/auth/refresh') {
-            refreshRequests += 1
-            const sequence = refreshRequests
-            events.push(`refresh:${sequence}:start`)
-            inFlight += 1
-            maximumInFlight = Math.max(maximumInFlight, inFlight)
-            await new Promise((resolve) => setTimeout(resolve, 100))
-            inFlight -= 1
-            events.push(`refresh:${sequence}:end`)
+            const isLifecycleLockProbe =
+                request.headers()['x-chronodesk-e2e-refresh-lock-probe'] ===
+                '1'
+            const sequence = isLifecycleLockProbe
+                ? refreshRequests + 1
+                : 0
+            if (isLifecycleLockProbe) {
+                refreshRequests = sequence
+                events.push(`refresh:${sequence}:start`)
+                inFlight += 1
+                maximumInFlight = Math.max(maximumInFlight, inFlight)
+                await new Promise((resolve) => setTimeout(resolve, 100))
+                inFlight -= 1
+                events.push(`refresh:${sequence}:end`)
+            }
             const expiresAt =
                 Math.floor(Date.now() / 1000) + 7200 + sequence
             await fulfillJSON(route, {
@@ -2594,13 +2601,35 @@ test('三个标签页 refresh 的网络响应保持全局串行', async ({
     await Promise.all(
         pages.map((page) =>
             page.evaluate(async (modulePath) => {
-                const authModule = await import(
+                const lifecycleModule = await import(
                     /* @vite-ignore */ modulePath
                 ) as {
-                    bootstrapHumanSession: () => Promise<void>
+                    withHumanSessionLifecycleLock: <T>(
+                        operation: () => Promise<T>,
+                    ) => Promise<T>
                 }
-                await authModule.bootstrapHumanSession()
-            }, '/src/lib/authProvider.ts'),
+                await lifecycleModule.withHumanSessionLifecycleLock(
+                    async () => {
+                        const response = await fetch(
+                            '/api/auth/refresh',
+                            {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: {
+                                    'X-ChronoDesk-E2E-Refresh-Lock-Probe':
+                                        '1',
+                                },
+                            },
+                        )
+                        if (!response.ok) {
+                            throw new Error(
+                                'refresh lifecycle lock probe failed',
+                            )
+                        }
+                        await response.json()
+                    },
+                )
+            }, '/src/lib/humanSessionLifecycle.ts'),
         ),
     )
 
