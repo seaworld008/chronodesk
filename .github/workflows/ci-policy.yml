@@ -66,6 +66,7 @@ jobs:
             const protectedPrefixes = [
               '.github/actions/',
               '.github/workflows/',
+              'web/patches/',
               'web/scripts/',
             ];
             const packageControlNames = new Set([

@@ -226,6 +226,7 @@ test('所有声明的 CI 控制面入口都受保护', async (t) => {
     'server/pytest.ini',
     'server/tests/test_python_toolchain.sh',
     'server/tests/validate_case_evidence_manifest.py',
+    'web/patches/ra-ui-materialui+5.15.1.patch',
     'web/scripts/audit-security.mjs',
     'web/scripts/ci-runtime.test.mjs',
     'web/scripts/ci-policy.test.mjs',

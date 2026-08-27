@@ -239,6 +239,7 @@ test('可信 CI policy 分离普通判定与 Dependabot 精确 SHA 批准', asyn
     'package.json',
     'playwright.config.',
     'pytest.ini',
+    'web/patches/',
     'web/scripts/',
   ]) {
     assert.ok(
