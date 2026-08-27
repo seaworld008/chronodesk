@@ -7493,12 +7493,14 @@ func (s *LocalAttachmentStorage) Delete(ctx context.Context, key string) error {
 		return err
 	}
 	if objectExists {
-		if err := storageRoot.Remove(relativePath); err != nil {
+		if err := storageRoot.Remove(relativePath); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("delete attachment: %w", err)
 		}
 	}
 	if partialExists {
-		if err := storageRoot.Remove(tempPath); err != nil {
+		if err := storageRoot.Remove(tempPath); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("delete attachment partial: %w", err)
 		}
 	}
@@ -7606,7 +7608,11 @@ func removeLocalAttachmentRegularFileIfExists(
 	if err != nil || !exists {
 		return err
 	}
-	return storageRoot.Remove(relativePath)
+	err = storageRoot.Remove(relativePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func validAttachmentStagingKey(key string) bool {
