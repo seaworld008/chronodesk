@@ -3,6 +3,7 @@ package observability
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -156,6 +157,91 @@ func TestNewTracingRuntimeAcceptsExplicitExporterConfiguration(t *testing.T) {
 	span.End()
 	if err := runtime.Shutdown(context.Background()); err != nil {
 		t.Fatalf("shutdown: %v", err)
+	}
+}
+
+func TestNewTracingRuntimeExportsToStableTracePath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		endpointPath string
+		wantPath     string
+	}{
+		{
+			name:     "base endpoint",
+			wantPath: defaultOTLPTracePath,
+		},
+		{
+			name:         "base endpoint with trailing slash",
+			endpointPath: "/",
+			wantPath:     defaultOTLPTracePath,
+		},
+		{
+			name:         "explicit custom path",
+			endpointPath: "/collector/custom-traces",
+			wantPath:     "/collector/custom-traces",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			type exportRequest struct {
+				method string
+				path   string
+			}
+			requests := make(chan exportRequest, 1)
+			server := httptest.NewServer(http.HandlerFunc(
+				func(response http.ResponseWriter, request *http.Request) {
+					requests <- exportRequest{
+						method: request.Method,
+						path:   request.URL.Path,
+					}
+					response.Header().Set("Content-Type", "application/x-protobuf")
+					response.WriteHeader(http.StatusOK)
+				},
+			))
+			defer server.Close()
+
+			alwaysSample := 1.0
+			runtime, err := NewTracingRuntime(context.Background(), TracingConfig{
+				ServiceName:        "chronodesk-test",
+				OTLPHTTPEndpoint:   server.URL + test.endpointPath,
+				AllowInsecureHTTP:  true,
+				TraceSamplingRatio: &alwaysSample,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, span := runtime.TracerProvider().Tracer("test").Start(
+				context.Background(),
+				"exported",
+			)
+			span.End()
+
+			shutdownContext, cancel := context.WithTimeout(
+				context.Background(),
+				5*time.Second,
+			)
+			defer cancel()
+			if err := runtime.Shutdown(shutdownContext); err != nil {
+				t.Fatalf("shutdown: %v", err)
+			}
+
+			select {
+			case request := <-requests:
+				if request.method != http.MethodPost {
+					t.Fatalf("export method = %q", request.method)
+				}
+				if request.path != test.wantPath {
+					t.Fatalf("export path = %q, want %q", request.path, test.wantPath)
+				}
+			default:
+				t.Fatal("trace exporter did not send a request")
+			}
+		})
 	}
 }
 
