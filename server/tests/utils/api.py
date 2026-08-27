@@ -29,6 +29,15 @@ DEFAULT_TIMEOUT = int(os.getenv("TEST_REQUEST_TIMEOUT", "15"))
 DEFAULT_MAX_RETRIES = int(os.getenv("TEST_REQUEST_MAX_RETRIES", "3"))
 DEFAULT_RETRY_DELAY = float(os.getenv("TEST_REQUEST_RETRY_DELAY", "1.0"))
 DEFAULT_BROWSER_ORIGIN = os.getenv("TEST_WEB_ORIGIN", "http://localhost:3000")
+_BROWSER_SESSION_POST_PATHS = frozenset(
+    {
+        "/auth/login",
+        "/auth/logout",
+        "/auth/logout-all",
+        "/auth/refresh",
+        "/auth/register",
+    }
+)
 PROJECT_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
 PROJECT_PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 
@@ -85,8 +94,9 @@ class APIClient:
         attempt = 0
         max_attempts = self.max_retries if retry else 1
         last_exc: Exception | None = None
+        request_headers = self._browser_session_headers(method, path, headers)
         register_headers(self.session.headers)
-        register_headers(headers)
+        register_headers(request_headers)
         register_sensitive_values(json)
         register_sensitive_values(data)
         register_sensitive_values(params)
@@ -96,7 +106,7 @@ class APIClient:
                 response = self.session.request(
                     method=method,
                     url=url,
-                    headers=headers,
+                    headers=request_headers,
                     json=json,
                     params=params,
                     data=data,
@@ -421,6 +431,20 @@ class APIClient:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _browser_session_headers(
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str | None] | None,
+    ) -> Mapping[str, str | None] | None:
+        if method.upper() != "POST" or path not in _BROWSER_SESSION_POST_PATHS:
+            return headers
+        if headers is not None and any(key.casefold() == "origin" for key in headers):
+            return headers
+        request_headers = dict(headers or {})
+        request_headers["Origin"] = self.browser_origin
+        return request_headers
+
     def _build_url(self, path: str) -> str:
         if not path.startswith("/"):
             path = f"/{path}"
