@@ -1184,6 +1184,199 @@ test('当前退出和全设备退出失败时保留已提交会话', async ({ pa
     expect(probeAuthorization).toBe(`Bearer ${token}`)
 })
 
+test('refresh 瞬态失败保留会话并允许重试，确定性失效才清理', async ({
+    page,
+}) => {
+    const identity = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-transient-refresh-preserves-session',
+    }
+    const oldToken = await installMockSession(page, identity, projectA)
+    const rotatedToken = mockSessionToken(
+        identity,
+        Math.floor(Date.now() / 1000) + 7200,
+    )
+    const access = authorizedProjectAccess(projectA, 'requester')
+    const user = {
+        id: identity.id,
+        username: `e2e-${identity.id}`,
+        email: identity.email,
+        platform_role: identity.platformRole,
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+    }
+    const probeAuthorizations: string[] = []
+    let refreshRequests = 0
+
+    await page.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        if (pathname === '/api/auth/refresh') {
+            refreshRequests += 1
+            if (refreshRequests === 1) {
+                await route.abort('failed')
+                return
+            }
+            if (refreshRequests === 2) {
+                await fulfillJSON(
+                    route,
+                    {
+                        code: 'rate_limited',
+                        message: '刷新请求过于频繁，请稍后重试',
+                    },
+                    429,
+                )
+                return
+            }
+            if (refreshRequests === 3) {
+                await fulfillJSON(
+                    route,
+                    {
+                        code: 'refresh_failed',
+                        message: '刷新服务暂时不可用',
+                    },
+                    503,
+                )
+                return
+            }
+            if (refreshRequests === 5) {
+                await fulfillJSON(
+                    route,
+                    {
+                        code: 'invalid_token',
+                        message: '登录会话已失效',
+                    },
+                    401,
+                )
+                return
+            }
+            await fulfillJSON(route, {
+                success: true,
+                message: '登录令牌刷新成功',
+                data: {
+                    user,
+                    access_token: rotatedToken,
+                    expires_in: 7200,
+                    token_type: 'Bearer',
+                },
+            })
+            return
+        }
+        if (pathname === '/api/e2e/refresh-preserved-probe') {
+            probeAuthorizations.push(
+                request.headers().authorization ?? '',
+            )
+            await fulfillJSON(route, { code: 0, data: [] })
+            return
+        }
+        if (pathname === '/api/auth/me') {
+            await fulfillJSON(route, { code: 0, data: user })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (pathname === `/api/projects/${projectA.key}/context`) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    await page.goto('/#/')
+    await expect(page.getByTestId('account-menu')).toBeVisible()
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const failure = await page.evaluate(async (modulePath) => {
+            const authModule = await import(
+                /* @vite-ignore */ modulePath
+            ) as {
+                bootstrapHumanSession: () => Promise<void>
+            }
+            try {
+                await authModule.bootstrapHumanSession()
+                return null
+            } catch (error) {
+                return error instanceof Error
+                    ? error.message
+                    : String(error)
+            }
+        }, '/src/lib/authProvider.ts')
+        expect(failure).not.toBeNull()
+        await page.evaluate(async (modulePath) => {
+            const apiModule = await import(
+                /* @vite-ignore */ modulePath
+            ) as {
+                apiFetch: (path: string) => Promise<unknown>
+            }
+            await apiModule.apiFetch('/e2e/refresh-preserved-probe')
+        }, '/src/lib/apiClient.ts')
+        expect(probeAuthorizations).toEqual(
+            Array.from(
+                { length: attempt },
+                () => `Bearer ${oldToken}`,
+            ),
+        )
+    }
+
+    await page.evaluate(async (modulePath) => {
+        const authModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            bootstrapHumanSession: () => Promise<void>
+        }
+        await authModule.bootstrapHumanSession()
+    }, '/src/lib/authProvider.ts')
+    await page.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        await apiModule.apiFetch('/e2e/refresh-preserved-probe')
+    }, '/src/lib/apiClient.ts')
+    expect(probeAuthorizations.at(-1)).toBe(`Bearer ${rotatedToken}`)
+
+    const deterministicFailure = await page.evaluate(
+        async (modulePath) => {
+            const authModule = await import(
+                /* @vite-ignore */ modulePath
+            ) as {
+                bootstrapHumanSession: () => Promise<void>
+            }
+            try {
+                await authModule.bootstrapHumanSession()
+                return null
+            } catch (error) {
+                return error instanceof Error
+                    ? error.message
+                    : String(error)
+            }
+        },
+        '/src/lib/authProvider.ts',
+    )
+    expect(deterministicFailure).toContain('登录会话已失效')
+    await page.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        await apiModule.apiFetch('/e2e/refresh-preserved-probe')
+    }, '/src/lib/apiClient.ts')
+    expect(probeAuthorizations).toEqual([
+        `Bearer ${oldToken}`,
+        `Bearer ${oldToken}`,
+        `Bearer ${oldToken}`,
+        `Bearer ${rotatedToken}`,
+        '',
+    ])
+    expect(refreshRequests).toBe(5)
+})
+
 test('旧标签退出响应提交后新标签才允许登录', async ({
     context,
     page: logoutPage,
@@ -1195,7 +1388,6 @@ test('旧标签退出响应提交后新标签才允许登录', async ({
     }
     const identityB = {
         ...defaultMockIdentity,
-        id: 188,
         sessionID: 'e2e-lifecycle-lock-session-b',
         email: 'lifecycle-lock-b@example.test',
     }
@@ -1206,6 +1398,7 @@ test('旧标签退出响应提交后新标签才允许登录', async ({
     const events: string[] = []
     let logoutSessionID = ''
     let loginRequests = 0
+    let replacementProbeAuthorization = ''
     let markLogoutStarted: (() => void) | undefined
     const logoutStarted = new Promise<void>((resolve) => {
         markLogoutStarted = resolve
@@ -1269,6 +1462,11 @@ test('旧标签退出响应提交后新标签才允许登录', async ({
             })
             return
         }
+        if (pathname === '/api/e2e/delayed-sign-out-probe') {
+            replacementProbeAuthorization = authorization
+            await fulfillJSON(route, { code: 0, data: [] })
+            return
+        }
         if (pathname === '/api/auth/me') {
             await fulfillJSON(route, { code: 0, data: user })
             return
@@ -1323,6 +1521,44 @@ test('旧标签退出响应提交后新标签才允许登录', async ({
         'logout:end',
         'login:start',
     ])
+
+    await logoutPage.evaluate((staleSession) => {
+        const channel = new BroadcastChannel(
+            'chronodesk:human-session:v2',
+        )
+        channel.postMessage({
+            type: 'signed_out',
+            scope: 'current_session',
+            subject: staleSession.subject,
+            session_id: staleSession.sessionID,
+            issued_at: Date.now() - 1_000,
+        })
+        channel.close()
+    }, {
+        subject: String(identityA.id),
+        sessionID: identityA.sessionID,
+    })
+    await loginPage.evaluate(
+        () =>
+            new Promise<void>((resolve) => {
+                requestAnimationFrame(() =>
+                    requestAnimationFrame(() => resolve()),
+                )
+            }),
+    )
+    await expect(loginPage).toHaveURL(/\/#\/$/u)
+    await expect(loginPage.getByTestId('account-menu')).toContainText(
+        `e2e-${identityB.id}`,
+    )
+    await loginPage.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        await apiModule.apiFetch('/e2e/delayed-sign-out-probe')
+    }, '/src/lib/apiClient.ts')
+    expect(replacementProbeAuthorization).toBe(`Bearer ${tokenB}`)
 })
 
 test('三个标签页 refresh 的网络响应保持全局串行', async ({
@@ -1405,6 +1641,10 @@ test('三个标签页 refresh 的网络响应保持全局串行', async ({
         await page.goto('/#/')
         await expect(page.getByTestId('account-menu')).toBeVisible()
     }
+    await expect.poll(() => inFlight).toBe(0)
+    refreshRequests = 0
+    maximumInFlight = 0
+    events.splice(0)
     await Promise.all(
         pages.map((page) =>
             page.evaluate(async (modulePath) => {

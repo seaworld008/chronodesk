@@ -40,8 +40,10 @@ import {
     readHumanAccessToken,
 } from './humanSessionRuntime'
 import {
+    humanSessionSignOutMatchesBinding,
     publishAuthenticatedHumanSession,
     publishSignedOutHumanSession,
+    type HumanSessionMetadata,
 } from './humanSessionChannel'
 import { withHumanSessionLifecycleLock } from './humanSessionLifecycle'
 import { joinApiUrl } from './apiUrl'
@@ -287,8 +289,14 @@ const readStoredUser = (): HumanSessionUser | null => {
 }
 
 export const clearAuthenticationState = (
-    options: { notifyPeers?: boolean } = {},
+    options: {
+        notifyPeers?: false | 'current_session' | 'all_devices'
+    } = {},
 ): void => {
+    const binding =
+        options.notifyPeers === false || options.notifyPeers === undefined
+            ? null
+            : readHumanSessionBinding()
     for (const key of authenticationStorageKeys) {
         localStorage.removeItem(key)
         sessionStorage.removeItem(key)
@@ -296,14 +304,34 @@ export const clearAuthenticationState = (
     clearHumanAccessToken()
     bindHumanTabSession(null)
     clearProjectScopeCache()
-    if (options.notifyPeers === true) {
-        publishSignedOutHumanSession()
+    if (binding !== null && options.notifyPeers === 'current_session') {
+        publishSignedOutHumanSession({
+            scope: 'current_session',
+            subject: binding.subject,
+            session_id: binding.session_id,
+        })
+    } else if (binding !== null && options.notifyPeers === 'all_devices') {
+        publishSignedOutHumanSession({
+            scope: 'all_devices',
+            subject: binding.subject,
+        })
     }
 }
 
-export const applyRemoteHumanSignOut = (): void => {
+export const applyRemoteHumanSignOut = (
+    metadata: Extract<HumanSessionMetadata, { type: 'signed_out' }>,
+): boolean => {
+    if (
+        !humanSessionSignOutMatchesBinding(
+            metadata,
+            readHumanSessionBinding(),
+        )
+    ) {
+        return false
+    }
     remoteSignOutObserved = true
     clearAuthenticationState({ notifyPeers: false })
+    return true
 }
 
 const storeAuthSession = (
@@ -380,46 +408,48 @@ const performSessionRefresh = (): Promise<void> =>
     withHumanSessionLifecycleLock(async () => {
         const previousBinding = readHumanSessionBinding()
 
-        try {
-            const response = await safeFetch(
-                buildUrl(humanApiRoutes.refreshHumanSession()),
-                {
-                    method: 'POST',
-                    credentials: 'include',
-                },
-                '登录状态刷新失败',
-            )
-            const body: unknown = await response.json().catch(() => ({}))
-            const session = parseHumanRefreshSessionResponse(body)
-            const nextBinding = session
-                ? readHumanSessionBinding(session.access_token)
-                : null
-            if (
-                !response.ok ||
-                session === null ||
-                nextBinding === null ||
-                (
-                    previousBinding !== null &&
-                    (
-                        nextBinding.subject !== previousBinding.subject ||
-                        nextBinding.session_id !== previousBinding.session_id
-                    )
-                )
-            ) {
-                throw new Error(
-                    localizedApiErrorMessage(
-                        body,
-                        response.status,
-                        '登录状态刷新失败',
-                    ),
-                )
+        const response = await safeFetch(
+            buildUrl(humanApiRoutes.refreshHumanSession()),
+            {
+                method: 'POST',
+                credentials: 'include',
+            },
+            '登录状态刷新失败',
+        )
+        const body: unknown = await response.json().catch(() => ({}))
+        if (!response.ok) {
+            if (response.status === 401) {
+                remoteSignOutObserved = true
+                clearAuthenticationState({ notifyPeers: false })
             }
-            storeAuthSession(session, previousBinding !== null)
-        } catch (error) {
+            throw new Error(
+                localizedApiErrorMessage(
+                    body,
+                    response.status,
+                    '登录状态刷新失败',
+                ),
+            )
+        }
+        const session = parseHumanRefreshSessionResponse(body)
+        const nextBinding = session
+            ? readHumanSessionBinding(session.access_token)
+            : null
+        if (
+            session === null ||
+            nextBinding === null ||
+            (
+                previousBinding !== null &&
+                (
+                    nextBinding.subject !== previousBinding.subject ||
+                    nextBinding.session_id !== previousBinding.session_id
+                )
+            )
+        ) {
             remoteSignOutObserved = true
             clearAuthenticationState({ notifyPeers: false })
-            throw error
+            throw new Error('登录状态刷新响应无效，请重新登录')
         }
+        storeAuthSession(session, previousBinding !== null)
     })
 
 const refreshStoredSession = async (): Promise<void> => {
@@ -530,7 +560,7 @@ export const logoutAllSessions = (): Promise<void> =>
                 ),
             )
         }
-        clearAuthenticationState({ notifyPeers: true })
+        clearAuthenticationState({ notifyPeers: 'all_devices' })
     })
 
 export const logoutCurrentSession = (): Promise<void> =>
@@ -567,7 +597,7 @@ export const logoutCurrentSession = (): Promise<void> =>
                 ),
             )
         }
-        clearAuthenticationState({ notifyPeers: true })
+        clearAuthenticationState({ notifyPeers: 'current_session' })
     })
 
 export const authProvider: AuthProvider = {

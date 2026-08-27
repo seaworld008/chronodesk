@@ -1,4 +1,15 @@
-export const humanSessionChannelName = 'chronodesk:human-session:v1'
+export const humanSessionChannelName = 'chronodesk:human-session:v2'
+
+export type HumanSessionSignOut =
+    | {
+          scope: 'current_session'
+          subject: string
+          session_id: string
+      }
+    | {
+          scope: 'all_devices'
+          subject: string
+      }
 
 export type HumanSessionMetadata =
     | {
@@ -8,10 +19,10 @@ export type HumanSessionMetadata =
           expires_at: number
           issued_at: number
       }
-    | {
+    | ({
           type: 'signed_out'
           issued_at: number
-      }
+      } & HumanSessionSignOut)
 
 type HumanSessionMetadataListener = (
     metadata: HumanSessionMetadata,
@@ -31,15 +42,38 @@ const parseHumanSessionMetadata = (
     if (typeof value !== 'object' || value === null || !('type' in value)) {
         return null
     }
-    if (
-        value.type === 'signed_out' &&
-        'issued_at' in value &&
-        positiveNumber(value.issued_at)
-    ) {
-        return {
-            type: 'signed_out',
-            issued_at: value.issued_at,
+    if (value.type === 'signed_out') {
+        if (
+            !('issued_at' in value) ||
+            !positiveNumber(value.issued_at) ||
+            !('scope' in value) ||
+            !('subject' in value) ||
+            !nonEmptyString(value.subject)
+        ) {
+            return null
         }
+        if (
+            value.scope === 'current_session' &&
+            'session_id' in value &&
+            nonEmptyString(value.session_id)
+        ) {
+            return {
+                type: 'signed_out',
+                scope: 'current_session',
+                subject: value.subject,
+                session_id: value.session_id,
+                issued_at: value.issued_at,
+            }
+        }
+        if (value.scope === 'all_devices') {
+            return {
+                type: 'signed_out',
+                scope: 'all_devices',
+                subject: value.subject,
+                issued_at: value.issued_at,
+            }
+        }
+        return null
     }
     if (
         value.type === 'authenticated' &&
@@ -87,12 +121,29 @@ export const publishAuthenticatedHumanSession = (
     } satisfies HumanSessionMetadata)
 }
 
-export const publishSignedOutHumanSession = (): void => {
+export const publishSignedOutHumanSession = (
+    signOut: HumanSessionSignOut,
+): void => {
     getChannel()?.postMessage({
         type: 'signed_out',
+        ...signOut,
         issued_at: Date.now(),
     } satisfies HumanSessionMetadata)
 }
+
+export const humanSessionSignOutMatchesBinding = (
+    metadata: Extract<HumanSessionMetadata, { type: 'signed_out' }>,
+    binding: {
+        subject: string
+        session_id: string
+    } | null,
+): boolean =>
+    binding !== null &&
+    binding.subject === metadata.subject &&
+    (
+        metadata.scope === 'all_devices' ||
+        binding.session_id === metadata.session_id
+    )
 
 export const subscribeHumanSessionMetadata = (
     listener: HumanSessionMetadataListener,

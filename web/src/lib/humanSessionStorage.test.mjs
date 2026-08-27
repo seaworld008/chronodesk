@@ -69,6 +69,7 @@ const {
     readHumanAccessToken,
 } = await import('./humanSessionRuntime.ts')
 const {
+    humanSessionSignOutMatchesBinding,
     publishAuthenticatedHumanSession,
     publishSignedOutHumanSession,
     subscribeHumanSessionMetadata,
@@ -105,11 +106,19 @@ test('跨标签消息只广播稳定会话元数据，不包含 bearer', () => {
         session_id: 'session-42',
         expires_at: 4_102_444_800_000,
     })
-    publishSignedOutHumanSession()
+    publishSignedOutHumanSession({
+        scope: 'current_session',
+        subject: '42',
+        session_id: 'session-42',
+    })
+    publishSignedOutHumanSession({
+        scope: 'all_devices',
+        subject: '42',
+    })
 
     const activeChannel = MockBroadcastChannel.instances.at(-1)
-    assert.equal(activeChannel.name, 'chronodesk:human-session:v1')
-    assert.equal(activeChannel.messages.length, 2)
+    assert.equal(activeChannel.name, 'chronodesk:human-session:v2')
+    assert.equal(activeChannel.messages.length, 3)
     assert.deepEqual(
         Object.keys(activeChannel.messages[0]).sort(),
         [
@@ -122,6 +131,20 @@ test('跨标签消息只广播稳定会话元数据，不包含 bearer', () => {
     )
     assert.equal('access_token' in activeChannel.messages[0], false)
     assert.equal('refresh_token' in activeChannel.messages[0], false)
+    assert.deepEqual(
+        Object.keys(activeChannel.messages[1]).sort(),
+        [
+            'issued_at',
+            'scope',
+            'session_id',
+            'subject',
+            'type',
+        ],
+    )
+    assert.deepEqual(
+        Object.keys(activeChannel.messages[2]).sort(),
+        ['issued_at', 'scope', 'subject', 'type'],
+    )
 })
 
 test('跨标签消息拒绝残缺元数据，只交付完整稳定绑定', () => {
@@ -135,6 +158,21 @@ test('跨标签消息拒绝残缺元数据，只交付完整稳定绑定', () =>
         type: 'authenticated',
         subject: '42',
         access_token: 'must-not-be-accepted',
+    })
+    activeChannel.emit({
+        type: 'signed_out',
+        issued_at: 1,
+    })
+    activeChannel.emit({
+        type: 'signed_out',
+        scope: 'current_session',
+        subject: '42',
+        issued_at: 1,
+    })
+    activeChannel.emit({
+        type: 'signed_out',
+        scope: 'all_devices',
+        issued_at: 1,
     })
     activeChannel.emit({
         type: 'authenticated',
@@ -154,6 +192,70 @@ test('跨标签消息拒绝残缺元数据，只交付完整稳定绑定', () =>
             issued_at: 1,
         },
     ])
+})
+
+test('延迟的当前会话退出只匹配原 sid，全设备退出匹配同一账号', () => {
+    const bindingA = {
+        subject: '42',
+        session_id: 'session-a',
+    }
+    const replacementBinding = {
+        subject: '84',
+        session_id: 'session-b',
+    }
+    const rotatedBinding = {
+        subject: '42',
+        session_id: 'session-c',
+    }
+    const currentSessionSignOut = {
+        type: 'signed_out',
+        scope: 'current_session',
+        subject: '42',
+        session_id: 'session-a',
+        issued_at: 1,
+    }
+    const allDevicesSignOut = {
+        type: 'signed_out',
+        scope: 'all_devices',
+        subject: '42',
+        issued_at: 1,
+    }
+
+    assert.equal(
+        humanSessionSignOutMatchesBinding(
+            currentSessionSignOut,
+            bindingA,
+        ),
+        true,
+    )
+    assert.equal(
+        humanSessionSignOutMatchesBinding(
+            currentSessionSignOut,
+            replacementBinding,
+        ),
+        false,
+    )
+    assert.equal(
+        humanSessionSignOutMatchesBinding(
+            currentSessionSignOut,
+            rotatedBinding,
+        ),
+        false,
+    )
+    assert.equal(
+        humanSessionSignOutMatchesBinding(
+            allDevicesSignOut,
+            rotatedBinding,
+        ),
+        true,
+    )
+    assert.equal(
+        humanSessionSignOutMatchesBinding(
+            allDevicesSignOut,
+            replacementBinding,
+        ),
+        false,
+    )
 })
 
 test('非敏感会话元数据从旧 localStorage 迁移到当前标签页', () => {

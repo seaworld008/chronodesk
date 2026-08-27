@@ -310,6 +310,12 @@ const PublicAuthShell = ({
 
     useEffect(() => {
         return subscribeHumanSessionMetadata((metadata) => {
+            if (
+                metadata.type === 'signed_out' &&
+                !applyRemoteHumanSignOut(metadata)
+            ) {
+                return
+            }
             void queryClient.cancelQueries({
                 queryKey: ['auth', 'checkAuth'],
             })
@@ -317,7 +323,6 @@ const PublicAuthShell = ({
                 queryKey: ['auth', 'checkAuth'],
             })
             if (metadata.type === 'signed_out') {
-                applyRemoteHumanSignOut()
                 return
             }
             const binding = readHumanSessionBinding()

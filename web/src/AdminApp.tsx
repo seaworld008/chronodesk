@@ -1360,8 +1360,8 @@ const AppRuntimeCoordinator = () => {
             subscribeHumanSessionMetadata((metadata) => {
                 if (metadata.type === 'signed_out') {
                     if (handlingSessionInvalidation.current) return
+                    if (!applyRemoteHumanSignOut(metadata)) return
                     handlingSessionInvalidation.current = true
-                    applyRemoteHumanSignOut()
                     clearActiveProjectSelection()
                     clearRuntimeCaches()
                     navigate('/login', { replace: true })
