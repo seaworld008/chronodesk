@@ -237,6 +237,7 @@ func TestWebhookOutboxLifecycleProductionQueriesPostgresExplainScale(
 			locked_at,
 			locked_by,
 			lock_token,
+			dispatch_started_at,
 			expires_at,
 			delivered_at
 		)
@@ -287,6 +288,11 @@ func TestWebhookOutboxLifecycleProductionQueriesPostgresExplainScale(
 				WHEN (series / 10) % 10 = 0
 					THEN '50000000-0000-7000-8000-' ||
 						lpad(series::text, 12, '0')
+				ELSE NULL
+			END,
+			CASE
+				WHEN (series / 10) % 10 = 0
+					THEN TIMESTAMPTZ '2025-01-01 00:00:00+00'
 				ELSE NULL
 			END,
 			CASE
@@ -663,7 +669,11 @@ func TestWebhookOutboxLifecycleProductionQueriesPostgresExplainScale(
 	}
 	if err := fixture.adminScoped.Exec(`
 		UPDATE outbox_deliveries
-		SET locked_at = TIMESTAMPTZ '2027-01-01 00:00:00+00'
+		SET attempts = attempts + 1,
+		    locked_at = TIMESTAMPTZ '2027-01-01 00:00:00+00',
+		    locked_by = 'scale-worker-future',
+		    lock_token = '51000000-0000-7000-8000-' || right(id, 12),
+		    dispatch_started_at = TIMESTAMPTZ '2027-01-01 00:00:00+00'
 		WHERE organization_id = ?
 		  AND project_id = ?
 		  AND destination_type = 'webhook'
@@ -698,7 +708,19 @@ func TestWebhookOutboxLifecycleProductionQueriesPostgresExplainScale(
 			'40000000-0000-7000-8000-000000000020'
 		);
 		UPDATE outbox_deliveries
-		SET locked_at = TIMESTAMPTZ '2025-01-01 00:00:00+00'
+		SET status = 'failed',
+		    locked_at = NULL,
+		    locked_by = '',
+		    lock_token = NULL,
+		    dispatch_started_at = NULL
+		WHERE id = '40000000-0000-7000-8000-000000000100';
+		UPDATE outbox_deliveries
+		SET status = 'processing',
+		    attempts = attempts + 1,
+		    locked_at = TIMESTAMPTZ '2025-01-01 00:00:00+00',
+		    locked_by = 'scale-worker-stale',
+		    lock_token = '52000000-0000-7000-8000-' || right(id, 12),
+		    dispatch_started_at = TIMESTAMPTZ '2025-01-01 00:00:00+00'
 		WHERE id = '40000000-0000-7000-8000-000000000100';
 		ANALYZE outbox_deliveries
 	`).Error; err != nil {
@@ -730,11 +752,31 @@ func TestWebhookOutboxLifecycleProductionQueriesPostgresExplainScale(
 	}
 	if err := fixture.adminScoped.Exec(`
 		UPDATE outbox_deliveries
-		SET locked_at = TIMESTAMPTZ '2025-01-01 00:00:00+00'
+		SET status = 'failed',
+		    locked_at = NULL,
+		    locked_by = '',
+		    lock_token = NULL,
+		    dispatch_started_at = NULL
 		WHERE organization_id = ?
 		  AND project_id = ?
 		  AND destination_type = 'webhook'
 		  AND status = 'processing'
+	`, scope.OrganizationID, scope.ProjectID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.adminScoped.Exec(`
+		UPDATE outbox_deliveries
+		SET status = 'processing',
+		    attempts = attempts + 1,
+		    locked_at = TIMESTAMPTZ '2025-01-01 00:00:00+00',
+		    locked_by = 'scale-worker-deep',
+		    lock_token = '53000000-0000-7000-8000-' || right(id, 12),
+		    dispatch_started_at = TIMESTAMPTZ '2025-01-01 00:00:00+00'
+		WHERE organization_id = ?
+		  AND project_id = ?
+		  AND destination_type = 'webhook'
+		  AND status = 'failed'
+		  AND attempts >= 3
 	`, scope.OrganizationID, scope.ProjectID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -844,7 +886,11 @@ func TestWebhookOutboxLifecycleProductionQueriesPostgresExplainScale(
 	}
 	if err := fixture.adminScoped.Exec(`
 		UPDATE outbox_deliveries
-		SET locked_at = TIMESTAMPTZ '2027-01-01 00:00:00+00'
+		SET attempts = attempts + 1,
+		    locked_at = TIMESTAMPTZ '2027-01-01 00:00:00+00',
+		    locked_by = 'scale-worker-expiry',
+		    lock_token = '54000000-0000-7000-8000-' || right(id, 12),
+		    dispatch_started_at = TIMESTAMPTZ '2027-01-01 00:00:00+00'
 		WHERE organization_id = ?
 		  AND project_id = ?
 		  AND destination_type = 'webhook'
@@ -947,6 +993,7 @@ func TestWebhookOutboxLifecycleProductionQueriesPostgresExplainScale(
 		UPDATE outbox_deliveries
 		SET destination_type = 'event_stream',
 		    delivered_at = NULL,
+		    dispatch_started_at = NULL,
 		    status = CASE
 			    WHEN ((right(id, 12))::bigint / 10) % 10
 			         IN (3, 4, 5)

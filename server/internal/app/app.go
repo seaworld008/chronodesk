@@ -1709,6 +1709,10 @@ func runAgentOutboxWorkerLoops(
 	}
 	hostname, _ := os.Hostname()
 	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+	saturationReporter := newAgentOutboxSaturationReporter(
+		30*time.Second,
+		time.Now,
+	)
 	var workers sync.WaitGroup
 	workers.Add(2)
 	go func() {
@@ -1724,6 +1728,9 @@ func runAgentOutboxWorkerLoops(
 			)
 			if err != nil && ctx.Err() == nil {
 				log.Printf("Agent Outbox batch failed: %v", err)
+			}
+			if message, ok := saturationReporter.observe(result); ok {
+				log.Print(message)
 			}
 			if result.Dead > 0 {
 				log.Printf(
@@ -1762,6 +1769,98 @@ func runAgentOutboxWorkerLoops(
 		}
 	}()
 	workers.Wait()
+}
+
+type agentOutboxSaturationReporter struct {
+	interval     time.Duration
+	now          func() time.Time
+	lastReported map[string]time.Time
+}
+
+func newAgentOutboxSaturationReporter(
+	interval time.Duration,
+	now func() time.Time,
+) *agentOutboxSaturationReporter {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return &agentOutboxSaturationReporter{
+		interval:     interval,
+		now:          now,
+		lastReported: make(map[string]time.Time, 1),
+	}
+}
+
+func (reporter *agentOutboxSaturationReporter) observe(
+	result services.OutboxBatchResult,
+) (string, bool) {
+	if reporter == nil {
+		return "", false
+	}
+	if result.Status != services.OutboxBatchStatusSaturated &&
+		result.Status != services.OutboxBatchStatusPartialSaturation {
+		return "", false
+	}
+	laneText := agentOutboxSaturationLaneText(result.SaturatedLanes)
+	signature := fmt.Sprintf(
+		"%s|%t|%s",
+		result.Status,
+		result.GlobalSaturated,
+		laneText,
+	)
+	now := reporter.now().UTC()
+	if lastReported := reporter.lastReported[signature]; !lastReported.IsZero() &&
+		now.Sub(lastReported) < reporter.interval {
+		return "", false
+	}
+	reporter.lastReported[signature] = now
+	return fmt.Sprintf(
+		"Agent Outbox capacity status=%s global_saturated=%t lanes=%s claimed=%d delivered=%d failed=%d",
+		result.Status,
+		result.GlobalSaturated,
+		laneText,
+		result.Claimed,
+		result.Delivered,
+		result.Failed,
+	), true
+}
+
+func agentOutboxSaturationLaneText(
+	lanes []services.OutboxDeliveryLane,
+) string {
+	seen := make(map[services.OutboxDeliveryLane]struct{}, len(lanes))
+	for _, lane := range lanes {
+		switch lane {
+		case services.OutboxDeliveryLaneWebhook,
+			services.OutboxDeliveryLaneCallback,
+			services.OutboxDeliveryLaneStorage,
+			services.OutboxDeliveryLaneInternal,
+			services.OutboxDeliveryLaneOther:
+			seen[lane] = struct{}{}
+		default:
+			seen[services.OutboxDeliveryLaneOther] = struct{}{}
+		}
+	}
+	ordered := []services.OutboxDeliveryLane{
+		services.OutboxDeliveryLaneWebhook,
+		services.OutboxDeliveryLaneCallback,
+		services.OutboxDeliveryLaneStorage,
+		services.OutboxDeliveryLaneInternal,
+		services.OutboxDeliveryLaneOther,
+	}
+	values := make([]string, 0, len(seen))
+	for _, lane := range ordered {
+		if _, ok := seen[lane]; ok {
+			values = append(values, string(lane))
+		}
+	}
+	if len(values) == 0 {
+		return "none"
+	}
+	return strings.Join(values, ",")
 }
 
 func agentOutboxCleanupMetricText(

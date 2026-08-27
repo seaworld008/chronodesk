@@ -124,3 +124,70 @@ func TestAgentOutboxCleanupMetricTextContainsOnlyFixedIntegers(t *testing.T) {
 		t.Fatalf("metric text contains dynamic detail: %q", message)
 	}
 }
+
+func TestAgentOutboxSaturationReporterUsesFixedRateLimitedSignal(
+	t *testing.T,
+) {
+	now := time.Date(2026, time.August, 26, 9, 0, 0, 0, time.UTC)
+	reporter := newAgentOutboxSaturationReporter(
+		time.Minute,
+		func() time.Time { return now },
+	)
+	result := services.OutboxBatchResult{
+		Claimed:   1,
+		Delivered: 1,
+		Status:    services.OutboxBatchStatusPartialSaturation,
+		SaturatedLanes: []services.OutboxDeliveryLane{
+			services.OutboxDeliveryLaneWebhook,
+			services.OutboxDeliveryLane("private-destination-id"),
+		},
+	}
+	message, ok := reporter.observe(result)
+	if !ok {
+		t.Fatal("first saturation signal was suppressed")
+	}
+	for _, value := range []string{
+		"status=partial_saturation",
+		"global_saturated=false",
+		"lanes=webhook,other",
+		"claimed=1",
+		"delivered=1",
+		"failed=0",
+	} {
+		if !strings.Contains(message, value) {
+			t.Fatalf("saturation metric %q is missing %q", message, value)
+		}
+	}
+	if strings.Contains(message, "private-destination-id") {
+		t.Fatalf("saturation metric leaked dynamic label: %q", message)
+	}
+	if _, ok := reporter.observe(result); ok {
+		t.Fatal("stable saturation signal was not rate limited")
+	}
+	now = now.Add(time.Minute)
+	if _, ok := reporter.observe(result); !ok {
+		t.Fatal("saturation signal did not recover after rate limit interval")
+	}
+	alternate := services.OutboxBatchResult{
+		Status:          services.OutboxBatchStatusSaturated,
+		GlobalSaturated: true,
+	}
+	if _, ok := reporter.observe(alternate); !ok {
+		t.Fatal("distinct fixed saturation signature was suppressed")
+	}
+	if _, ok := reporter.observe(services.OutboxBatchResult{
+		Status: services.OutboxBatchStatusIdle,
+	}); ok {
+		t.Fatal("idle Outbox emitted a saturation signal")
+	}
+	if _, ok := reporter.observe(result); ok {
+		t.Fatal("idle transition reset the persistent saturation rate limit")
+	}
+	if _, ok := reporter.observe(alternate); ok {
+		t.Fatal("rate limit was not retained independently by signature")
+	}
+	now = now.Add(time.Minute)
+	if _, ok := reporter.observe(result); !ok {
+		t.Fatal("persistent saturation signal did not recover after interval")
+	}
+}

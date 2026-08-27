@@ -4,15 +4,28 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, reopened, synchronize, ready_for_review, edited]
-  workflow_run:
-    workflows: [Smoke Tests]
-    types: [completed]
   workflow_dispatch:
     inputs:
       pull_request:
-        description: 要重新评估的开放 PR 编号
+        description: 要批准的 Dependabot Go、npm 或 GitHub Actions 开放 PR 编号
         required: true
         type: number
+      expected_head_sha:
+        description: 当前 PR head 的 40 位小写提交 SHA
+        required: true
+        type: string
+      approve_dependabot_update:
+        description: 明确批准这个精确 SHA
+        required: true
+        type: boolean
+      reason:
+        description: 批准原因（8 到 500 个字符）
+        required: true
+        type: string
+
+concurrency:
+  group: ci-policy-pr-${{ github.event.pull_request.number || inputs.pull_request }}-sha-${{ github.event.pull_request.head.sha || inputs.expected_head_sha || github.run_id }}
+  queue: max
 
 permissions:
   contents: read
@@ -22,103 +35,220 @@ permissions:
 jobs:
   policy:
     if: >-
-      github.event_name == 'workflow_run' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.user.login != 'dependabot[bot]'
+      github.event_name == 'pull_request_target' ||
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Verify protected CI files
+      - name: Evaluate protected CI control plane
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         with:
           script: |
-            let pullNumber;
-            if (context.eventName === 'workflow_run') {
-              const run = context.payload.workflow_run;
-              if (run.event !== 'pull_request') {
-                core.notice('忽略非 Pull Request 的 Smoke 运行。');
-                return;
-              }
-              const associated = await github.paginate(
-                github.rest.repos.listPullRequestsAssociatedWithCommit,
-                {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  commit_sha: run.head_sha,
-                  per_page: 100,
-                },
-              );
-              const candidates = associated.filter(
-                (candidate) =>
-                  candidate.state === 'open' &&
-                  candidate.base.ref === 'main' &&
-                  candidate.base.repo.full_name ===
-                    `${context.repo.owner}/${context.repo.repo}` &&
-                  candidate.head.sha === run.head_sha &&
-                  candidate.head.repo?.full_name ===
-                    run.head_repository?.full_name,
-              );
-              if (candidates.length !== 1) {
-                core.notice(
-                  '没有找到与本次 Smoke 精确匹配的唯一开放 PR。',
-                );
-                return;
-              }
-              pullNumber = candidates[0].number;
-            } else if (context.eventName === 'workflow_dispatch') {
-              pullNumber = Number(context.payload.inputs.pull_request);
-              if (!Number.isSafeInteger(pullNumber) || pullNumber < 1) {
-                core.setFailed('必须提供有效的开放 PR 编号。');
-                return;
-              }
-            } else {
-              pullNumber = context.payload.pull_request.number;
-            }
-
-            const response = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pullNumber,
-            });
-            const pull = response.data;
-
-            if (
-              pull.state !== 'open' ||
-              pull.base.ref !== 'main' ||
-              pull.base.repo.full_name !==
-                `${context.repo.owner}/${context.repo.repo}`
-            ) {
-              core.setFailed('CI policy 仅处理目标为本仓库 main 的开放 PR。');
-              return;
-            }
-
-            let permission = 'none';
-            try {
-              const response =
-                await github.rest.repos.getCollaboratorPermissionLevel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  username: pull.user.login,
-                });
-              permission = response.data.permission;
-            } catch (error) {
-              if (error.status !== 404) {
-                throw error;
-              }
-            }
-            const trusted = new Set([
+            const repositoryFullName =
+              `${context.repo.owner}/${context.repo.repo}`;
+            const writerPermissions = new Set([
               'admin',
               'maintain',
               'push',
               'write',
-            ]).has(permission);
-            const protectedPaths = [
+            ]);
+            const shaPattern = /^[0-9a-f]{40}$/u;
+            const protectedExactPaths = new Set([
+              '.github/CODEOWNERS',
+              '.github/dependabot.yml',
               '.github/main-branch-protection.json',
-              '.github/workflows/',
+              'Makefile',
+              'compose.yaml',
+              'compose.yml',
+              'docker-compose.yaml',
+              'docker-compose.yml',
+              'server/tests/test_python_toolchain.sh',
+              'server/tests/validate_case_evidence_manifest.py',
+              'server/tests/utils/safety.py',
+              'web/eslint.config.js',
+              'web/e2e/helpers/safety.ts',
+              'web/vite.config.ts',
+            ]);
+            const protectedRootPaths = [
+              '.cache',
+              '.venv',
             ];
-            let complete = true;
-            let protectedChanges = [];
-            if (!trusted) {
+            const protectedPrefixes = [
+              '.github/actions/',
+              '.github/workflows/',
+              'sdk/go/vendor/',
+              'server/vendor/',
+              'web/patches/',
+              'web/scripts/',
+            ];
+            const protectedBasenames = new Set([
+              '.gitleaks.toml',
+              '.gitleaksignore',
+              '.npmrc',
+              '.ruff.toml',
+              'GNUmakefile',
+              'Makefile',
+              'bun.lock',
+              'bun.lockb',
+              'conftest.py',
+              'go.mod',
+              'go.sum',
+              'go.work',
+              'go.work.sum',
+              'makefile',
+              'npm-shrinkwrap.json',
+              'package-lock.json',
+              'package.json',
+              'pnpm-lock.yaml',
+              'pyproject.toml',
+              'ruff.toml',
+              'yarn.lock',
+            ]);
+            const dependabotEcosystemPolicies = [
+              {
+                headPrefix: 'dependabot/github_actions/',
+                label: 'GitHub Actions',
+                permits: (pathname) =>
+                  pathname.startsWith('.github/workflows/') ||
+                  pathname.startsWith('.github/actions/'),
+              },
+              {
+                headPrefix: 'dependabot/go_modules/',
+                label: 'Go modules',
+                permits: (pathname) =>
+                  pathname === 'server/go.mod' ||
+                  pathname === 'server/go.sum',
+              },
+              {
+                headPrefix: 'dependabot/npm_and_yarn/',
+                label: 'npm',
+                permits: (pathname) =>
+                  pathname === 'web/package.json' ||
+                  pathname === 'web/package-lock.json',
+              },
+            ];
+            const dependabotPolicyFor = (pull) =>
+              dependabotEcosystemPolicies.find(
+                ({ headPrefix }) =>
+                  typeof pull.head?.ref === 'string' &&
+                  pull.head.ref.startsWith(headPrefix),
+              );
+
+            class PolicyFailure extends Error {}
+
+            const requirePolicy = (condition, message) => {
+              if (!condition) {
+                throw new PolicyFailure(message);
+              }
+            };
+            const sameRepository = (candidate) =>
+              typeof candidate === 'string' &&
+              candidate.toLowerCase() ===
+                repositoryFullName.toLowerCase();
+            const isProtectedPath = (pathname) => {
+              if (
+                typeof pathname !== 'string' ||
+                pathname.length === 0
+              ) {
+                throw new PolicyFailure(
+                  'GitHub 返回了无效的 PR 文件路径，失败关闭。',
+                );
+              }
+              if (
+                protectedExactPaths.has(pathname) ||
+                protectedRootPaths.some(
+                  (root) =>
+                    pathname === root ||
+                    pathname.startsWith(`${root}/`),
+                ) ||
+                protectedPrefixes.some((prefix) =>
+                  pathname.startsWith(prefix),
+                ) ||
+                pathname.split('/').includes('node_modules')
+              ) {
+                return true;
+              }
+              const basename = pathname.split('/').at(-1);
+              return (
+                protectedBasenames.has(basename) ||
+                basename === 'CODEOWNERS' ||
+                basename === 'pytest.ini' ||
+                basename === '.spectral.yaml' ||
+                basename?.endsWith('.dockerignore') ||
+                basename?.startsWith('Dockerfile.') ||
+                basename === 'Dockerfile' ||
+                basename?.startsWith('playwright.config.') ||
+                /^\.env(?:\..+)?$/u.test(basename ?? '') ||
+                /^(?:docker-)?compose(?:\.override)?\.ya?ml$/u.test(
+                  basename ?? '',
+                ) ||
+                /^(?:eslint|vite)\.config\.[cm]?[jt]s$/u.test(
+                  basename ?? '',
+                ) ||
+                /^(?:postcss\.config\.[cm]?[jt]s|\.postcssrc(?:\.(?:json|ya?ml|[cm]?[jt]s))?)$/u.test(
+                  basename ?? '',
+                ) ||
+                /^requirements(?:-[A-Za-z0-9_.-]+)?\.txt$/u.test(
+                  basename ?? '',
+                ) ||
+                /^tsconfig(?:\.[A-Za-z0-9_.-]+)?\.json$/u.test(
+                  basename ?? '',
+                )
+              );
+            };
+            const changedPaths = (files) =>
+              files
+                .flatMap(
+                  ({
+                    filename,
+                    previous_filename: previousFilename,
+                  }) =>
+                    typeof previousFilename === 'string'
+                      ? [filename, previousFilename]
+                      : [filename],
+                )
+                .filter(
+                  (pathname, index, all) =>
+                    all.indexOf(pathname) === index,
+                );
+            const validPullNumber = (value) => {
+              const pullNumber = Number(value);
+              requirePolicy(
+                Number.isSafeInteger(pullNumber) && pullNumber > 0,
+                '必须提供有效的开放 PR 编号。',
+              );
+              return pullNumber;
+            };
+            const readPull = async (pullNumber) => {
+              const response = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pullNumber,
+              });
+              requirePolicy(
+                response?.data &&
+                  typeof response.data === 'object',
+                'GitHub 未返回可验证的 PR，失败关闭。',
+              );
+              return response.data;
+            };
+            const requireOpenMainPull = (pull) => {
+              requirePolicy(
+                pull.state === 'open' &&
+                  pull.base?.ref === 'main' &&
+                  sameRepository(pull.base?.repo?.full_name) &&
+                  Number.isSafeInteger(pull.number) &&
+                  shaPattern.test(pull.head?.sha ?? ''),
+                'CI policy 仅处理目标为本仓库 main 的开放 PR。',
+              );
+            };
+            const listCompleteFiles = async (pull) => {
+              requirePolicy(
+                Number.isSafeInteger(pull.changed_files) &&
+                  pull.changed_files >= 0 &&
+                  pull.changed_files <= 3000,
+                'PR 文件数无效或超过 GitHub 3000 文件上限，失败关闭。',
+              );
               const files = await github.paginate(
                 github.rest.pulls.listFiles,
                 {
@@ -128,54 +258,312 @@ jobs:
                   per_page: 100,
                 },
               );
-              complete =
-                Number.isSafeInteger(pull.changed_files) &&
-                files.length === pull.changed_files;
-              protectedChanges = files
-                .flatMap(({ filename, previous_filename: previous }) =>
-                  typeof previous === 'string'
-                    ? [filename, previous]
-                    : [filename],
-                )
-                .filter((filename) =>
-                  protectedPaths.some((path) =>
-                    path.endsWith('/')
-                      ? filename.startsWith(path)
-                      : filename === path,
-                  ),
-                )
-                .filter(
-                  (filename, index, all) =>
-                    all.indexOf(filename) === index,
+              requirePolicy(
+                Array.isArray(files) &&
+                  files.length === pull.changed_files,
+                `GitHub 返回的文件数与 changed_files=${pull.changed_files} 不一致，失败关闭。`,
+              );
+              changedPaths(files).forEach((pathname) => {
+                if (
+                  typeof pathname !== 'string' ||
+                  pathname.length === 0
+                ) {
+                  throw new PolicyFailure(
+                    'GitHub 返回了无效的 PR 文件路径，失败关闭。',
+                  );
+                }
+              });
+              return files;
+            };
+            const permissionFor = async (login) => {
+              requirePolicy(
+                typeof login === 'string' && login.length > 0,
+                '无法验证仓库权限，失败关闭。',
+              );
+              try {
+                const response =
+                  await github.rest.repos.getCollaboratorPermissionLevel(
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      username: login,
+                    },
+                  );
+                requirePolicy(
+                  typeof response?.data?.permission === 'string',
+                  'GitHub 未返回可验证的仓库权限，失败关闭。',
                 );
-            }
-            const accepted =
-              trusted ||
-              (complete && protectedChanges.length === 0);
-            const description = trusted
-              ? '仓库写入者可维护受保护 CI 文件'
-              : !complete
-                ? 'PR 文件清单不完整，CI policy 失败关闭'
-                : accepted
-                  ? '受保护 CI 文件策略通过'
-                  : '外部贡献者不得修改受保护 CI 文件';
-            const targetUrl =
-              `${context.serverUrl}/${context.repo.owner}/` +
-              `${context.repo.repo}/actions/runs/${context.runId}`;
-
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: pull.head.sha,
-              state: accepted ? 'success' : 'failure',
-              context: 'ci-policy',
+                return response.data.permission;
+              } catch (error) {
+                if (error?.status === 404) {
+                  return 'none';
+                }
+                throw error;
+              }
+            };
+            const isWriter = (permission) =>
+              writerPermissions.has(permission);
+            const approvalDescription = (ecosystemPolicy) =>
+              `Dependabot ${ecosystemPolicy.label} 精确 SHA 已由写入者批准`;
+            const hasCurrentDependabotApproval = async (
+              pull,
+              ecosystemPolicy,
+            ) => {
+              const statuses = await github.paginate(
+                github.rest.repos.listCommitStatusesForRef,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: pull.head.sha,
+                  per_page: 100,
+                },
+              );
+              requirePolicy(
+                Array.isArray(statuses),
+                'GitHub 未返回可验证的 commit status，失败关闭。',
+              );
+              const actionsRunPrefix =
+                `${context.serverUrl}/${context.repo.owner}/` +
+                `${context.repo.repo}/actions/runs/`;
+              return statuses.some(
+                (status) =>
+                  status?.context === 'ci-policy' &&
+                  status.state === 'success' &&
+                  status.description ===
+                    approvalDescription(ecosystemPolicy) &&
+                  status.creator?.login ===
+                    'github-actions[bot]' &&
+                  typeof status.target_url === 'string' &&
+                  status.target_url.startsWith(actionsRunPrefix) &&
+                  /^[1-9][0-9]*$/u.test(
+                    status.target_url.slice(
+                      actionsRunPrefix.length,
+                    ),
+                  ),
+              );
+            };
+            const requireStableHead = async (
+              initialPull,
+              { sameHeadRepository = false } = {},
+            ) => {
+              const currentPull = await readPull(initialPull.number);
+              requireOpenMainPull(currentPull);
+              requirePolicy(
+                currentPull.head.sha === initialPull.head.sha,
+                'PR head 在策略评估期间发生变化，拒绝写入状态。',
+              );
+              if (sameHeadRepository) {
+                requirePolicy(
+                  sameRepository(currentPull.head?.repo?.full_name),
+                  'PR head 不属于本仓库，拒绝写入可信状态。',
+                );
+              }
+              return currentPull;
+            };
+            const publishStatus = async (
+              pull,
+              accepted,
               description,
-              target_url: targetUrl,
-            });
+              options = {},
+            ) => {
+              await requireStableHead(pull, options);
+              const targetUrl =
+                `${context.serverUrl}/${context.repo.owner}/` +
+                `${context.repo.repo}/actions/runs/${context.runId}`;
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: pull.head.sha,
+                state: accepted ? 'success' : 'failure',
+                context: 'ci-policy',
+                description,
+                target_url: targetUrl,
+              });
+              if (!accepted) {
+                throw new PolicyFailure(description);
+              }
+            };
+            const evaluatePullRequestTarget = async () => {
+              const eventPull = context.payload.pull_request;
+              const pullNumber = validPullNumber(
+                eventPull?.number,
+              );
+              const pull = await readPull(pullNumber);
+              requireOpenMainPull(pull);
+              requirePolicy(
+                shaPattern.test(eventPull?.head?.sha ?? '') &&
+                  pull.head.sha === eventPull.head.sha &&
+                  typeof eventPull.head?.repo?.full_name === 'string' &&
+                  pull.head?.repo?.full_name?.toLowerCase() ===
+                    eventPull.head.repo.full_name.toLowerCase(),
+                '事件中的 PR head 与当前 PR 不一致，拒绝重放旧判定。',
+              );
 
-            if (!accepted) {
-              const details = !complete
-                ? `GitHub 返回的文件数与 changed_files=${pull.changed_files} 不一致`
-                : protectedChanges.join(', ');
-              core.setFailed(`${description}: ${details}`);
+              const authorLogin = pull.user?.login;
+              const isBot =
+                pull.user?.type === 'Bot' ||
+                (typeof authorLogin === 'string' &&
+                  authorLogin.endsWith('[bot]'));
+              if (isBot) {
+                if (context.payload.action === 'edited') {
+                  core.notice(
+                    '机器人 PR 的元数据编辑不覆盖当前 head 已有判定。',
+                  );
+                  return;
+                }
+                const ecosystemPolicy = dependabotPolicyFor(pull);
+                if (
+                  pull.user?.login === 'dependabot[bot]' &&
+                  pull.user?.type === 'Bot' &&
+                  sameRepository(pull.head?.repo?.full_name) &&
+                  ecosystemPolicy !== undefined &&
+                  await hasCurrentDependabotApproval(
+                    pull,
+                    ecosystemPolicy,
+                  )
+                ) {
+                  await publishStatus(
+                    pull,
+                    true,
+                    approvalDescription(ecosystemPolicy),
+                    { sameHeadRepository: true },
+                  );
+                  return;
+                }
+                await publishStatus(
+                  pull,
+                  false,
+                  '机器人 PR 需要受控人工批准',
+                );
+                return;
+              }
+
+              const files = await listCompleteFiles(pull);
+              const protectedChanges = changedPaths(files).filter(
+                isProtectedPath,
+              );
+              if (protectedChanges.length === 0) {
+                await publishStatus(
+                  pull,
+                  true,
+                  'PR 未修改受保护的 CI 控制面',
+                );
+                return;
+              }
+
+              const senderLogin = context.payload.sender?.login;
+              const [
+                authorPermission,
+                senderPermission,
+              ] = await Promise.all([
+                permissionFor(authorLogin),
+                permissionFor(senderLogin),
+              ]);
+              const accepted =
+                sameRepository(pull.head?.repo?.full_name) &&
+                isWriter(authorPermission) &&
+                isWriter(senderPermission);
+              await publishStatus(
+                pull,
+                accepted,
+                accepted
+                  ? '本仓库写入者可维护受保护的 CI 控制面'
+                  : '受保护的 CI 控制面需要本仓库写入者提交',
+                { sameHeadRepository: accepted },
+              );
+            };
+            const approveDependabotUpdate = async () => {
+              const inputs = context.payload.inputs ?? {};
+              const pullNumber = validPullNumber(inputs.pull_request);
+              const expectedHeadSha = inputs.expected_head_sha;
+              const explicitlyApproved =
+                inputs.approve_dependabot_update === true ||
+                inputs.approve_dependabot_update === 'true';
+              const reason =
+                typeof inputs.reason === 'string'
+                  ? inputs.reason.trim()
+                  : '';
+              requirePolicy(
+                explicitlyApproved,
+                '必须显式勾选批准 Dependabot 更新。',
+              );
+              requirePolicy(
+                shaPattern.test(expectedHeadSha ?? ''),
+                'expected_head_sha 必须是 40 位小写提交 SHA。',
+              );
+              requirePolicy(
+                reason.length >= 8 && reason.length <= 500,
+                '批准原因必须为 8 到 500 个字符。',
+              );
+
+              const actorPermission = await permissionFor(context.actor);
+              requirePolicy(
+                isWriter(actorPermission),
+                '只有当前仓库写入者可以批准 Dependabot 更新。',
+              );
+
+              const pull = await readPull(pullNumber);
+              requireOpenMainPull(pull);
+              const ecosystemPolicy = dependabotPolicyFor(pull);
+              requirePolicy(
+                pull.user?.login === 'dependabot[bot]' &&
+                  pull.user?.type === 'Bot' &&
+                  sameRepository(pull.head?.repo?.full_name) &&
+                  ecosystemPolicy !== undefined,
+                '仅允许批准本仓库已配置的 Dependabot Go、npm 或 GitHub Actions PR。',
+              );
+              requirePolicy(
+                pull.head.sha === expectedHeadSha,
+                'expected_head_sha 与当前 PR head 不一致。',
+              );
+
+              const files = await listCompleteFiles(pull);
+              const paths = changedPaths(files);
+              requirePolicy(
+                paths.length > 0 &&
+                  paths.every((pathname) =>
+                    ecosystemPolicy.permits(pathname),
+                  ),
+                `Dependabot ${ecosystemPolicy.label} PR 包含生态范围外的文件。`,
+              );
+
+              const stablePull = await requireStableHead(pull, {
+                sameHeadRepository: true,
+              });
+              requirePolicy(
+                stablePull.head.sha === expectedHeadSha &&
+                  stablePull.head.ref === pull.head.ref &&
+                  stablePull.user?.login === 'dependabot[bot]',
+                'Dependabot PR 在批准期间发生变化，拒绝写入状态。',
+              );
+              const targetUrl =
+                `${context.serverUrl}/${context.repo.owner}/` +
+                `${context.repo.repo}/actions/runs/${context.runId}`;
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: expectedHeadSha,
+                state: 'success',
+                context: 'ci-policy',
+                description: approvalDescription(ecosystemPolicy),
+                target_url: targetUrl,
+              });
+            };
+
+            try {
+              if (context.eventName === 'pull_request_target') {
+                await evaluatePullRequestTarget();
+              } else if (context.eventName === 'workflow_dispatch') {
+                await approveDependabotUpdate();
+              } else {
+                throw new PolicyFailure(
+                  '不支持的 CI policy 事件，失败关闭。',
+                );
+              }
+            } catch (error) {
+              core.setFailed(
+                error instanceof PolicyFailure
+                  ? error.message
+                  : 'GitHub API 调用失败，CI policy 失败关闭。',
+              );
             }

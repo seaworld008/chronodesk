@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -35,8 +37,75 @@ jobs:
           --redact=100
           --no-banner
           --no-color
+          --ignore-gitleaks-allow
 
-  go:
+  go-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          check-latest: true
+          cache-dependency-path: server/go.sum
+
+      - name: Test server
+        run: go test ./... -count=1
+
+  go-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdk/go
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: sdk/go/go.mod
+          check-latest: true
+          cache-dependency-path: sdk/go/go.sum
+
+      - name: Test Go SDK
+        run: go test ./... -count=1
+
+  go-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          check-latest: true
+          cache-dependency-path: server/go.sum
+
+      - name: Test server with race detector
+        run: go test -race ./... -count=1
+
+  redis-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -58,6 +127,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -66,17 +137,79 @@ jobs:
           check-latest: true
           cache-dependency-path: server/go.sum
 
-      - name: Test
-        run: go test ./... -count=1
-
-      - name: Verify Redis Agent execution guard integration
+      - name: Verify Redis release-gate integrations
         run: >-
           go test ./internal/services
-          -run '^TestRedisAgentExecutionGuardIntegration$'
+          -run '^(TestRedisAgentExecutionGuardIntegration|TestSchedulerRedisLeaseIntegration)$'
           -count=1
 
+  go-vuln:
+    name: go-vuln (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: server
+            working-directory: server
+            go-version-file: server/go.mod
+            cache-dependency-path: server/go.sum
+          - component: sdk
+            working-directory: sdk/go
+            go-version-file: sdk/go/go.mod
+            cache-dependency-path: sdk/go/go.sum
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ matrix.go-version-file }}
+          check-latest: true
+          cache-dependency-path: ${{ matrix.cache-dependency-path }}
+
       - name: Scan reachable Go vulnerabilities
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        working-directory: ${{ matrix.working-directory }}
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+  go:
+    name: go
+    if: ${{ always() }}
+    needs:
+      - go-unit
+      - go-sdk
+      - go-race
+      - redis-integration
+      - go-vuln
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enforce every Go security gate
+        env:
+          GO_UNIT_RESULT: ${{ needs.go-unit.result }}
+          GO_SDK_RESULT: ${{ needs.go-sdk.result }}
+          GO_RACE_RESULT: ${{ needs.go-race.result }}
+          REDIS_INTEGRATION_RESULT: ${{ needs.redis-integration.result }}
+          GO_VULN_RESULT: ${{ needs.go-vuln.result }}
+        run: |
+          failures=0
+          for gate in \
+            "go-unit=${GO_UNIT_RESULT}" \
+            "go-sdk=${GO_SDK_RESULT}" \
+            "go-race=${GO_RACE_RESULT}" \
+            "redis-integration=${REDIS_INTEGRATION_RESULT}" \
+            "go-vuln=${GO_VULN_RESULT}"
+          do
+            if [ "${gate#*=}" != "success" ]; then
+              echo "::error::${gate}"
+              failures=1
+            fi
+          done
+          exit "${failures}"
 
   web:
     runs-on: ubuntu-latest
@@ -87,6 +220,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@v7

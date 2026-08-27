@@ -177,7 +177,7 @@ func TestWebhookOutboxBatchStartsSuccessorWithFullWindowAfterCapacityFrees(
 		t,
 		"capacity-successor",
 	)
-	fixture.service.outboxDeliverySlots = make(chan struct{}, 1)
+	fixture.service.configureOutboxDeliveryBulkheads(1)
 	fixture.service.outboxDeliveryTimeout = 40 * time.Millisecond
 	var calls atomic.Int32
 	batch, err := fixture.service.ProcessOutboxBatch(

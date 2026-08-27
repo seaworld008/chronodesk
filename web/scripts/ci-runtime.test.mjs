@@ -100,12 +100,13 @@ test('短时安全检查保留 main 状态并取消同 PR 的旧运行', async (
   }
 })
 
-test('可信 CI policy 不执行 PR 代码并显式写入唯一状态', async () => {
+test('可信 CI policy 分离普通判定与 Dependabot 精确 SHA 批准', async () => {
   const workflow = await loadWorkflow('ci-policy')
   const events = workflowEvents(workflow)
   const policy = workflow.jobs.policy
   const serialized = JSON.stringify(workflow)
   const script = policy.steps[0].with.script
+  const dispatchInputs = events.workflow_dispatch.inputs
 
   assert.deepEqual(events.pull_request_target.branches, ['main'])
   assert.deepEqual(events.pull_request_target.types, [
@@ -115,17 +116,45 @@ test('可信 CI policy 不执行 PR 代码并显式写入唯一状态', async ()
     'ready_for_review',
     'edited',
   ])
-  assert.deepEqual(events.workflow_run.workflows, ['Smoke Tests'])
-  assert.deepEqual(events.workflow_run.types, ['completed'])
-  assert.equal(
-    events.workflow_dispatch.inputs.pull_request.type,
-    'number',
+  assert.equal(events.workflow_run, undefined)
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(dispatchInputs).map(([name, input]) => [
+        name,
+        input.type,
+      ]),
+    ),
+    {
+      approve_dependabot_update: 'boolean',
+      expected_head_sha: 'string',
+      pull_request: 'number',
+      reason: 'string',
+    },
   )
+  assert.ok(
+    Object.values(dispatchInputs).every(
+      ({ required }) => required === true,
+    ),
+  )
+  assert.equal(
+    workflow.concurrency.group,
+    'ci-policy-pr-${{ github.event.pull_request.number || inputs.pull_request }}-sha-${{ github.event.pull_request.head.sha || inputs.expected_head_sha || github.run_id }}',
+  )
+  assert.equal(workflow.concurrency.queue, 'max')
+  assert.equal(workflow.concurrency['cancel-in-progress'], undefined)
   assert.deepEqual(workflow.permissions, {
     contents: 'read',
     'pull-requests': 'read',
     statuses: 'write',
   })
+  assert.match(
+    policy.if,
+    /github\.event_name == 'pull_request_target'/u,
+  )
+  assert.match(
+    policy.if,
+    /github\.ref == 'refs\/heads\/main'/u,
+  )
   assert.equal(policy.steps.length, 1)
   assert.equal(
     policy.steps[0].uses,
@@ -133,22 +162,24 @@ test('可信 CI policy 不执行 PR 代码并显式写入唯一状态', async ()
   )
   assert.doesNotMatch(serialized, /actions\/checkout/u)
   assert.doesNotMatch(serialized, /download-artifact/u)
+  assert.doesNotMatch(serialized, /workflow_run/u)
   assert.match(
     script,
     /context:\s*'ci-policy'/u,
   )
   assert.match(
     script,
-    /sha:\s*pull\.head\.sha/u,
+    /sha:\s*expectedHeadSha/u,
   )
   assert.match(
     script,
-    /previous_filename:\s*previous/u,
+    /previous_filename:\s*previousFilename/u,
   )
   assert.match(
     script,
     /Number\.isSafeInteger\(pull\.changed_files\)/u,
   )
+  assert.match(script, /pull\.changed_files <= 3000/u)
   assert.match(script, /files\.length === pull\.changed_files/u)
   assert.match(
     script,
@@ -156,19 +187,100 @@ test('可信 CI policy 不执行 PR 代码并显式写入唯一状态', async ()
   )
   assert.match(
     script,
-    /candidate\.head\.sha === run\.head_sha/u,
+    /currentPull\.head\.sha === initialPull\.head\.sha/u,
   )
   assert.match(
     script,
-    /candidate\.base\.ref === 'main'/u,
+    /pull\.head\.sha === eventPull\.head\.sha/u,
   )
   assert.match(
-    policy.if,
-    /pull_request\.user\.login != 'dependabot\[bot\]'/u,
+    script,
+    /pull\.base\?\.ref === 'main'/u,
   )
   assert.match(
-    policy.if,
-    /github\.event_name == 'workflow_dispatch'/u,
+    script,
+    /context\.payload\.sender\?\.login/u,
+  )
+  assert.match(
+    script,
+    /permissionFor\(context\.actor\)/u,
+  )
+  assert.match(
+    script,
+    /pull\.user\?\.login === 'dependabot\[bot\]'/u,
+  )
+  for (const headPrefix of [
+    'dependabot/github_actions/',
+    'dependabot/go_modules/',
+    'dependabot/npm_and_yarn/',
+  ]) {
+    assert.ok(script.includes(headPrefix), headPrefix)
+  }
+  for (const allowedPath of [
+    'server/go.mod',
+    'server/go.sum',
+    'web/package.json',
+    'web/package-lock.json',
+  ]) {
+    assert.ok(script.includes(allowedPath), allowedPath)
+  }
+  assert.match(
+    script,
+    /context\.payload\.action === 'edited'/u,
+  )
+  assert.match(
+    script,
+    /const shaPattern = \/\^\[0-9a-f\]\{40\}\$/u,
+  )
+  assert.match(
+    script,
+    /writerPermissions[\s\S]*?'push'/u,
+  )
+
+  for (const protectedControl of [
+    '.github/CODEOWNERS',
+    '.github/actions/',
+    '.github/dependabot.yml',
+    '.github/main-branch-protection.json',
+    '.github/workflows/',
+    '.gitleaks.toml',
+    '.gitleaksignore',
+    '.cache',
+    '.npmrc',
+    '.ruff.toml',
+    '.venv',
+    'GNUmakefile',
+    'Makefile',
+    'conftest.py',
+    'docker-compose.yml',
+    'Dockerfile',
+    'go.work',
+    'makefile',
+    'node_modules',
+    'package-lock.json',
+    'package.json',
+    'playwright.config.',
+    'pytest.ini',
+    'sdk/go/vendor/',
+    'server/tests/utils/safety.py',
+    'server/vendor/',
+    'web/patches/',
+    'web/e2e/helpers/safety.ts',
+    'web/scripts/',
+  ]) {
+    assert.ok(
+      script.includes(protectedControl),
+      `${protectedControl} should be protected`,
+    )
+  }
+
+  assert.match(
+    script,
+    /pathname\.startsWith\('\.github\/workflows\/'\)/u,
+  )
+  assert.match(
+    script,
+    /pathname\.startsWith\('\.github\/actions\/'\)/u,
   )
 })
 
