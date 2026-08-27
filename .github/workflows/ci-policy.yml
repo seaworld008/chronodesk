@@ -23,6 +23,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: ci-policy-pr-${{ github.event.pull_request.number || inputs.pull_request }}-sha-${{ github.event.pull_request.head.sha || inputs.expected_head_sha || github.run_id }}
+  queue: max
+
 permissions:
   contents: read
   pull-requests: read
@@ -65,6 +69,10 @@ jobs:
               'web/e2e/helpers/safety.ts',
               'web/vite.config.ts',
             ]);
+            const protectedRootPaths = [
+              '.cache',
+              '.venv',
+            ];
             const protectedPrefixes = [
               '.github/actions/',
               '.github/workflows/',
@@ -119,6 +127,12 @@ jobs:
                   pathname === 'web/package-lock.json',
               },
             ];
+            const dependabotPolicyFor = (pull) =>
+              dependabotEcosystemPolicies.find(
+                ({ headPrefix }) =>
+                  typeof pull.head?.ref === 'string' &&
+                  pull.head.ref.startsWith(headPrefix),
+              );
 
             class PolicyFailure extends Error {}
 
@@ -142,9 +156,15 @@ jobs:
               }
               if (
                 protectedExactPaths.has(pathname) ||
+                protectedRootPaths.some(
+                  (root) =>
+                    pathname === root ||
+                    pathname.startsWith(`${root}/`),
+                ) ||
                 protectedPrefixes.some((prefix) =>
                   pathname.startsWith(prefix),
-                )
+                ) ||
+                pathname.split('/').includes('node_modules')
               ) {
                 return true;
               }
@@ -283,6 +303,45 @@ jobs:
             };
             const isWriter = (permission) =>
               writerPermissions.has(permission);
+            const approvalDescription = (ecosystemPolicy) =>
+              `Dependabot ${ecosystemPolicy.label} 精确 SHA 已由写入者批准`;
+            const hasCurrentDependabotApproval = async (
+              pull,
+              ecosystemPolicy,
+            ) => {
+              const statuses = await github.paginate(
+                github.rest.repos.listCommitStatusesForRef,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: pull.head.sha,
+                  per_page: 100,
+                },
+              );
+              requirePolicy(
+                Array.isArray(statuses),
+                'GitHub 未返回可验证的 commit status，失败关闭。',
+              );
+              const actionsRunPrefix =
+                `${context.serverUrl}/${context.repo.owner}/` +
+                `${context.repo.repo}/actions/runs/`;
+              return statuses.some(
+                (status) =>
+                  status?.context === 'ci-policy' &&
+                  status.state === 'success' &&
+                  status.description ===
+                    approvalDescription(ecosystemPolicy) &&
+                  status.creator?.login ===
+                    'github-actions[bot]' &&
+                  typeof status.target_url === 'string' &&
+                  status.target_url.startsWith(actionsRunPrefix) &&
+                  /^[1-9][0-9]*$/u.test(
+                    status.target_url.slice(
+                      actionsRunPrefix.length,
+                    ),
+                  ),
+              );
+            };
             const requireStableHead = async (
               initialPull,
               { sameHeadRepository = false } = {},
@@ -349,6 +408,25 @@ jobs:
                 if (context.payload.action === 'edited') {
                   core.notice(
                     '机器人 PR 的元数据编辑不覆盖当前 head 已有判定。',
+                  );
+                  return;
+                }
+                const ecosystemPolicy = dependabotPolicyFor(pull);
+                if (
+                  pull.user?.login === 'dependabot[bot]' &&
+                  pull.user?.type === 'Bot' &&
+                  sameRepository(pull.head?.repo?.full_name) &&
+                  ecosystemPolicy !== undefined &&
+                  await hasCurrentDependabotApproval(
+                    pull,
+                    ecosystemPolicy,
+                  )
+                ) {
+                  await publishStatus(
+                    pull,
+                    true,
+                    approvalDescription(ecosystemPolicy),
+                    { sameHeadRepository: true },
                   );
                   return;
                 }
@@ -426,12 +504,7 @@ jobs:
 
               const pull = await readPull(pullNumber);
               requireOpenMainPull(pull);
-              const ecosystemPolicy =
-                dependabotEcosystemPolicies.find(
-                  ({ headPrefix }) =>
-                    typeof pull.head?.ref === 'string' &&
-                    pull.head.ref.startsWith(headPrefix),
-                );
+              const ecosystemPolicy = dependabotPolicyFor(pull);
               requirePolicy(
                 pull.user?.login === 'dependabot[bot]' &&
                   pull.user?.type === 'Bot' &&
@@ -472,7 +545,7 @@ jobs:
                 sha: expectedHeadSha,
                 state: 'success',
                 context: 'ci-policy',
-                description: `Dependabot ${ecosystemPolicy.label} 精确 SHA 已由写入者批准`,
+                description: approvalDescription(ecosystemPolicy),
                 target_url: targetUrl,
               });
             };

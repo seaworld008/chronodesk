@@ -123,7 +123,8 @@ gh api "repos/$repo/branches/main/protection"
 5. 错误 SHA 或无权限 actor 的人工批准：运行失败且不产生 success；
 6. 生态与文件路径错配或包含越界文件：运行失败且不产生 success；
 7. 正确 SHA 的人工批准：只给该 SHA success，标题或正文编辑不覆盖；
-8. Dependabot 再次更新 head：新 SHA 默认 failure，旧批准不继承；
-9. 直接推送、force push 与删除 `main` 继续被分支保护拒绝。
+8. 人工批准与延迟的同 SHA 默认判定并发时，最终仍保留可信批准；
+9. Dependabot 再次更新 head：新 SHA 默认 failure，旧批准不继承；
+10. 直接推送、force push 与删除 `main` 继续被分支保护拒绝。
 
 完成 canary 后删除一次性分支；保留运行 URL、SHA 与 API 回读作为验收证据。

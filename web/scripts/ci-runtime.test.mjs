@@ -131,6 +131,12 @@ test('可信 CI policy 分离普通判定与 Dependabot 精确 SHA 批准', asyn
       ({ required }) => required === true,
     ),
   )
+  assert.equal(
+    workflow.concurrency.group,
+    'ci-policy-pr-${{ github.event.pull_request.number || inputs.pull_request }}-sha-${{ github.event.pull_request.head.sha || inputs.expected_head_sha || github.run_id }}',
+  )
+  assert.equal(workflow.concurrency.queue, 'max')
+  assert.equal(workflow.concurrency['cancel-in-progress'], undefined)
   assert.deepEqual(workflow.permissions, {
     contents: 'read',
     'pull-requests': 'read',
@@ -234,8 +240,10 @@ test('可信 CI policy 分离普通判定与 Dependabot 精确 SHA 批准', asyn
     '.github/workflows/',
     '.gitleaks.toml',
     '.gitleaksignore',
+    '.cache',
     '.npmrc',
     '.ruff.toml',
+    '.venv',
     'GNUmakefile',
     'Makefile',
     'conftest.py',
@@ -243,6 +251,7 @@ test('可信 CI policy 分离普通判定与 Dependabot 精确 SHA 批准', asyn
     'Dockerfile',
     'go.work',
     'makefile',
+    'node_modules',
     'package-lock.json',
     'package.json',
     'playwright.config.',

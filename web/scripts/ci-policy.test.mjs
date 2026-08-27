@@ -66,6 +66,7 @@ const runPolicy = async ({
   failApi,
   files = [{ filename: 'docs/README.md' }],
   inputs,
+  commitStatuses = [],
   permissions = {},
   pull = createPull({ changedFiles: files.length }),
   pullSnapshots = [pull, pull],
@@ -76,6 +77,7 @@ const runPolicy = async ({
     permissions: [],
     pullReads: [],
     fileReads: [],
+    statusReads: [],
     notices: [],
     statuses: [],
   }
@@ -118,6 +120,13 @@ const runPolicy = async ({
     calls.statuses.push(structuredClone(status))
     return { data: status }
   }
+  const listCommitStatusesForRef = async (parameters) => {
+    calls.statusReads.push(parameters)
+    if (failApi === 'repos.listCommitStatusesForRef') {
+      throw apiError()
+    }
+    return { data: structuredClone(commitStatuses) }
+  }
 
   const github = {
     paginate: async (endpoint, parameters) => {
@@ -132,6 +141,7 @@ const runPolicy = async ({
       repos: {
         createCommitStatus,
         getCollaboratorPermissionLevel,
+        listCommitStatusesForRef,
       },
     },
   }
@@ -218,7 +228,13 @@ test('所有声明的 CI 控制面入口都受保护', async (t) => {
     '.github/main-branch-protection.json',
     '.gitleaks.toml',
     '.gitleaksignore',
+    '.cache',
+    '.cache/npm-tools',
+    '.cache/npm-tools/_npx/a/node_modules/.bin/redocly',
     '.env',
+    '.venv',
+    '.venv/bin/python',
+    '.venv/.requirements-test.txt',
     'GNUmakefile',
     'Makefile',
     'makefile',
@@ -235,6 +251,7 @@ test('所有声明的 CI 控制面入口都受保护', async (t) => {
     'server/vendor/modules.txt',
     'sdk/go/vendor/example/x.go',
     'sdk/python/.ruff.toml',
+    'sdk/typescript/node_modules/.bin/tsc',
     'web/Dockerfile.dev',
     'web/.env.production',
     'web/.npmrc',
@@ -243,6 +260,8 @@ test('所有声明的 CI 控制面入口都受保护', async (t) => {
     'web/postcss.config.cjs',
     'web/package.json',
     'web/package-lock.json',
+    'web/node_modules',
+    'web/node_modules/.bin/vite',
     'web/playwright.config.ts',
     'web/src/eslint.config.mjs',
     'web/vite.config.js',
@@ -270,11 +289,14 @@ test('所有声明的 CI 控制面入口都受保护', async (t) => {
 
 test('名称相似但不会被工具自动加载的普通文档仍可通过', async () => {
   const pull = createPull({
-    changedFiles: 1,
+    changedFiles: 2,
     headRepo: 'external-fork/chronodesk',
   })
   const result = await runPolicy({
-    files: [{ filename: 'docs/compose-guide.yml' }],
+    files: [
+      { filename: 'docs/compose-guide.yml' },
+      { filename: 'docs/.venv-guide.md' },
+    ],
     pull,
     pullSnapshots: [pull, pull],
   })
@@ -394,6 +416,105 @@ test('Dependabot pull_request_target 默认写 failure', async () => {
 
   assertStatus(result, 'failure')
   assert.deepEqual(result.calls.permissions, [])
+})
+
+test('同一 SHA 的可信 Dependabot 批准可归约延迟的默认 failure', async () => {
+  const pull = createPull({
+    author: 'dependabot[bot]',
+    authorType: 'Bot',
+    headRef: 'dependabot/github_actions/actions/checkout-7',
+  })
+  const result = await runPolicy({
+    commitStatuses: [
+      {
+        context: 'ci-policy',
+        creator: { login: 'github-actions[bot]' },
+        description: '机器人 PR 需要受控人工批准',
+        state: 'failure',
+        target_url:
+          'https://github.com/seaworld008/chronodesk/actions/runs/123457',
+      },
+      {
+        context: 'ci-policy',
+        creator: { login: 'github-actions[bot]' },
+        description:
+          'Dependabot GitHub Actions 精确 SHA 已由写入者批准',
+        state: 'success',
+        target_url:
+          'https://github.com/seaworld008/chronodesk/actions/runs/123456',
+      },
+    ],
+    files: [{ filename: '.github/workflows/smoke.yml' }],
+    pull,
+    pullSnapshots: [pull],
+    sender: 'dependabot[bot]',
+  })
+
+  assertStatus(result, 'success')
+  assert.equal(
+    result.calls.statuses[0].description,
+    'Dependabot GitHub Actions 精确 SHA 已由写入者批准',
+  )
+  assert.equal(result.calls.statusReads.length, 1)
+  assert.equal(result.calls.statusReads[0].ref, SHA_A)
+})
+
+test('伪造或过期的 Dependabot success 不阻止默认 failure', async (t) => {
+  const pull = createPull({
+    author: 'dependabot[bot]',
+    authorType: 'Bot',
+    headRef: 'dependabot/github_actions/actions/checkout-7',
+  })
+  const invalidStatuses = [
+    {
+      name: '错误描述',
+      status: {
+        context: 'ci-policy',
+        creator: { login: 'github-actions[bot]' },
+        description: 'PR 未修改受保护的 CI 控制面',
+        state: 'success',
+        target_url:
+          'https://github.com/seaworld008/chronodesk/actions/runs/123456',
+      },
+    },
+    {
+      name: '非 Actions 创建者',
+      status: {
+        context: 'ci-policy',
+        creator: { login: 'external-contributor' },
+        description:
+          'Dependabot GitHub Actions 精确 SHA 已由写入者批准',
+        state: 'success',
+        target_url:
+          'https://github.com/seaworld008/chronodesk/actions/runs/123456',
+      },
+    },
+    {
+      name: '外部 target URL',
+      status: {
+        context: 'ci-policy',
+        creator: { login: 'github-actions[bot]' },
+        description:
+          'Dependabot GitHub Actions 精确 SHA 已由写入者批准',
+        state: 'success',
+        target_url: 'https://example.test/actions/runs/123456',
+      },
+    },
+  ]
+
+  for (const { name, status } of invalidStatuses) {
+    await t.test(name, async () => {
+      const result = await runPolicy({
+        commitStatuses: [status],
+        files: [{ filename: '.github/workflows/smoke.yml' }],
+        pull,
+        pullSnapshots: [pull, pull],
+        sender: 'dependabot[bot]',
+      })
+
+      assertStatus(result, 'failure')
+    })
+  }
 })
 
 const dependabotDispatch = ({
@@ -660,6 +781,11 @@ test('文件数超过 3000 或清单计数不一致时均失败关闭', async (t
 })
 
 test('任一 GitHub API 错误都不能产生 success 状态', async (t) => {
+  const dependabotPull = createPull({
+    author: 'dependabot[bot]',
+    authorType: 'Bot',
+    headRef: 'dependabot/github_actions/actions/checkout-7',
+  })
   const failures = [
     {
       endpoint: 'pulls.get',
@@ -678,6 +804,15 @@ test('任一 GitHub API 错误都不能产生 success 状态', async (t) => {
     {
       endpoint: 'repos.createCommitStatus',
       options: {},
+    },
+    {
+      endpoint: 'repos.listCommitStatusesForRef',
+      options: {
+        files: [{ filename: '.github/workflows/smoke.yml' }],
+        pull: dependabotPull,
+        pullSnapshots: [dependabotPull],
+        sender: 'dependabot[bot]',
+      },
     },
   ]
 

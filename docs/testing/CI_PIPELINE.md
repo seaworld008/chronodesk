@@ -43,7 +43,8 @@ checks，要求 PR 基于最新目标分支后重新通过门禁。因此 squash
 - 受保护控制面包括 workflows、复合 Actions、Dependabot、CODEOWNERS、分支保护
   声明、Makefile 变体、Compose 基础/override/环境文件、Dockerfile/ignore、各生态
   package/lock、npm 配置、Go workspace/vendor、Playwright/pytest、Vite/ESLint/
-  PostCSS/Ruff 自动加载配置、Gitleaks 配置与由 CI 或测试直接执行的安全脚本。
+  PostCSS/Ruff 自动加载配置、Gitleaks 配置、仓库 `.venv`/`.cache` 可执行缓存、
+  任意 `node_modules` 路径与由 CI 或测试直接执行的安全脚本。
   policy 同时检查重命名前后的路径，并要求 `changed_files` 为不超过 3000 的完整
   清单；截断、计数不一致和 API 异常均失败关闭。Secrets 扫描禁用源码内
   `gitleaks:allow` 绕过，仅允许受保护的仓库级配置显式治理例外。
@@ -55,7 +56,9 @@ checks，要求 PR 基于最新目标分支后重新通过门禁。因此 squash
   40 位小写 head SHA、显式批准布尔值与原因。流程会再次验证 actor 权限、
   Dependabot 身份、同仓库、生态对应的完整文件清单和 SHA；成功只写给输入的精确
   SHA。标题或正文编辑不会覆盖这个 head 绑定的结果；PR 更新后旧批准不会继承，新
-  head 会恢复为默认 failure。
+  head 会恢复为默认 failure。同一 PR、同一 head SHA 的默认判定与人工批准进入
+  最大 100 个等待项的串行队列；延迟到达的旧判定会识别该 SHA 历史中本 workflow
+  创建的可信精确批准，并把 required 状态幂等归约为 success，不会反向覆盖。
 
 Playwright 在 CI、本地、共享和远端环境均使用单 worker，`fullyParallel` 固定为
 `false`，避免长链路导航、视觉截图、全局配置与账号会话在并发负载下产生假阴性。
