@@ -22,6 +22,7 @@ import (
 const (
 	defaultTracingServiceName = "chronodesk"
 	defaultExportTimeout      = 10 * time.Second
+	defaultOTLPTracePath      = "/v1/traces"
 )
 
 // TracingConfig configures the process-local OpenTelemetry trace runtime.
@@ -86,6 +87,7 @@ func NewTracingRuntime(ctx context.Context, config TracingConfig) (*TracingRunti
 	if err != nil {
 		return nil, err
 	}
+	parsedEndpoint = normalizeOTLPTraceEndpoint(parsedEndpoint)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -223,6 +225,16 @@ func validateOTLPEndpoint(endpoint string, allowInsecureHTTP bool) (*url.URL, er
 		return nil, errors.New("observability: OTLP endpoint scheme must be https or http")
 	}
 	return parsed, nil
+}
+
+func normalizeOTLPTraceEndpoint(endpoint *url.URL) *url.URL {
+	if endpoint == nil || endpoint.Path != "" && endpoint.Path != "/" {
+		return endpoint
+	}
+	normalized := *endpoint
+	normalized.Path = defaultOTLPTracePath
+	normalized.RawPath = ""
+	return &normalized
 }
 
 func validateOTLPHeaders(input map[string]string) (map[string]string, error) {
