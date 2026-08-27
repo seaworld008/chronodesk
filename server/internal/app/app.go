@@ -42,6 +42,49 @@ func ginAdapter(handler func(auth.HTTPContext)) gin.HandlerFunc {
 	}
 }
 
+type browserSessionAuthMiddleware struct {
+	originGate                 gin.HandlerFunc
+	anonymousIPRateLimit       gin.HandlerFunc
+	anonymousIdentityRateLimit gin.HandlerFunc
+	requireAuth                gin.HandlerFunc
+	authenticatedRateLimit     gin.HandlerFunc
+}
+
+type browserSessionAuthHandlers struct {
+	register  gin.HandlerFunc
+	login     gin.HandlerFunc
+	logout    gin.HandlerFunc
+	refresh   gin.HandlerFunc
+	logoutAll gin.HandlerFunc
+}
+
+// registerBrowserSessionAuthRoutes keeps the deployment-owned browser Origin
+// gate ahead of every limiter that protects a Cookie-issuing or
+// Cookie-revoking Human authentication write. This prevents an untrusted
+// sibling Origin from consuming a victim's rate-limit bucket.
+func registerBrowserSessionAuthRoutes(
+	routes *gin.RouterGroup,
+	middlewares browserSessionAuthMiddleware,
+	handlers browserSessionAuthHandlers,
+) {
+	publicWrites := routes.Group("")
+	publicWrites.Use(middlewares.originGate)
+	publicWrites.Use(
+		middlewares.anonymousIPRateLimit,
+		middlewares.anonymousIdentityRateLimit,
+	)
+	publicWrites.POST("/register", handlers.register)
+	publicWrites.POST("/login", handlers.login)
+	publicWrites.POST("/logout", handlers.logout)
+	publicWrites.POST("/refresh", handlers.refresh)
+
+	authenticatedWrites := routes.Group("")
+	authenticatedWrites.Use(middlewares.originGate)
+	authenticatedWrites.Use(middlewares.requireAuth)
+	authenticatedWrites.Use(middlewares.authenticatedRateLimit)
+	authenticatedWrites.POST("/logout-all", handlers.logoutAll)
+}
+
 const backupCodeRegenerationRateLimitNamespace = "backup-code-regeneration"
 
 func backupCodeRegenerationRateLimitKey(rawKey string) string {
@@ -962,12 +1005,32 @@ func Run() error {
 		// 认证路由
 		authGroup := api.Group("/auth")
 		{
+			registerBrowserSessionAuthRoutes(
+				authGroup,
+				browserSessionAuthMiddleware{
+					originGate: ginAdapter(
+						authModule.Handler.RequireAllowedBrowserOrigin,
+					),
+					anonymousIPRateLimit:       anonymousIPRateLimit,
+					anonymousIdentityRateLimit: anonymousIdentityRateLimit,
+					requireAuth: ginAdapter(
+						authModule.Handler.RequireAuth,
+					),
+					authenticatedRateLimit: authenticatedRateLimit,
+				},
+				browserSessionAuthHandlers{
+					register: ginAdapter(authModule.Handler.Register),
+					login:    ginAdapter(authModule.Handler.Login),
+					logout:   ginAdapter(authModule.Handler.Logout),
+					refresh:  ginAdapter(authModule.Handler.RefreshToken),
+					logoutAll: ginAdapter(
+						authModule.Handler.LogoutAll,
+					),
+				},
+			)
+
 			publicWrites := authGroup.Group("/")
 			publicWrites.Use(anonymousIPRateLimit, anonymousIdentityRateLimit)
-			publicWrites.POST("/register", ginAdapter(authModule.Handler.Register))
-			publicWrites.POST("/login", ginAdapter(authModule.Handler.Login))
-			publicWrites.POST("/logout", ginAdapter(authModule.Handler.Logout))
-			publicWrites.POST("/refresh", ginAdapter(authModule.Handler.RefreshToken))
 			publicWrites.POST("/forgot-password", ginAdapter(authModule.Handler.ForgotPassword))
 			publicWrites.POST("/reset-password", ginAdapter(authModule.Handler.ResetPassword))
 			publicWrites.POST("/verify-email", ginAdapter(authModule.Handler.VerifyEmail))
@@ -981,7 +1044,6 @@ func Run() error {
 				authenticated.GET("/me", ginAdapter(authModule.Handler.GetProfile))
 				authenticated.PUT("/profile", ginAdapter(authModule.Handler.UpdateProfile))
 				authenticated.POST("/change-password", ginAdapter(authModule.Handler.ChangePassword))
-				authenticated.POST("/logout-all", ginAdapter(authModule.Handler.LogoutAll))
 				authenticated.POST("/enable-otp", ginAdapter(authModule.Handler.EnableOTP))
 				authenticated.POST("/disable-otp", ginAdapter(authModule.Handler.DisableOTP))
 				authenticated.POST("/verify-otp", ginAdapter(authModule.Handler.VerifyOTP))
