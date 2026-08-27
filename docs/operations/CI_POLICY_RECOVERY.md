@@ -43,9 +43,9 @@ gh api "repos/$repo/commits/$head_sha/status" \
 
 ### 作者或 sender 权限不足
 
-受保护变更要求 PR 作者和触发当前事件的 sender 同时具有 `write`、`maintain` 或
-`admin` 权限。如果合法内部 PR 因临时 GitHub API 故障失败，可在故障恢复后从原
-运行执行 failed-job rerun：
+受保护变更要求 PR 作者和触发当前事件的 sender 同时具有 GitHub API 返回的
+`push`、`write`、`maintain` 或 `admin` 权限。如果合法内部 PR 因临时 GitHub API
+故障失败，可在故障恢复后从原运行执行 failed-job rerun：
 
 ```bash
 gh run rerun <run-id> --repo "$repo" --failed

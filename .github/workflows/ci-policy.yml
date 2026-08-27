@@ -60,25 +60,40 @@ jobs:
               'docker-compose.yml',
               'server/tests/test_python_toolchain.sh',
               'server/tests/validate_case_evidence_manifest.py',
+              'server/tests/utils/safety.py',
               'web/eslint.config.js',
+              'web/e2e/helpers/safety.ts',
               'web/vite.config.ts',
             ]);
             const protectedPrefixes = [
               '.github/actions/',
               '.github/workflows/',
+              'sdk/go/vendor/',
+              'server/vendor/',
               'web/patches/',
               'web/scripts/',
             ];
-            const packageControlNames = new Set([
+            const protectedBasenames = new Set([
+              '.gitleaks.toml',
+              '.gitleaksignore',
+              '.npmrc',
+              '.ruff.toml',
+              'GNUmakefile',
+              'Makefile',
               'bun.lock',
               'bun.lockb',
+              'conftest.py',
               'go.mod',
               'go.sum',
+              'go.work',
+              'go.work.sum',
+              'makefile',
               'npm-shrinkwrap.json',
               'package-lock.json',
               'package.json',
               'pnpm-lock.yaml',
               'pyproject.toml',
+              'ruff.toml',
               'yarn.lock',
             ]);
             const dependabotEcosystemPolicies = [
@@ -135,13 +150,24 @@ jobs:
               }
               const basename = pathname.split('/').at(-1);
               return (
-                packageControlNames.has(basename) ||
+                protectedBasenames.has(basename) ||
                 basename === 'CODEOWNERS' ||
                 basename === 'pytest.ini' ||
                 basename === '.spectral.yaml' ||
+                basename?.endsWith('.dockerignore') ||
                 basename?.startsWith('Dockerfile.') ||
                 basename === 'Dockerfile' ||
                 basename?.startsWith('playwright.config.') ||
+                /^\.env(?:\..+)?$/u.test(basename ?? '') ||
+                /^(?:docker-)?compose(?:\.override)?\.ya?ml$/u.test(
+                  basename ?? '',
+                ) ||
+                /^(?:eslint|vite)\.config\.[cm]?[jt]s$/u.test(
+                  basename ?? '',
+                ) ||
+                /^(?:postcss\.config\.[cm]?[jt]s|\.postcssrc(?:\.(?:json|ya?ml|[cm]?[jt]s))?)$/u.test(
+                  basename ?? '',
+                ) ||
                 /^requirements(?:-[A-Za-z0-9_.-]+)?\.txt$/u.test(
                   basename ?? '',
                 ) ||

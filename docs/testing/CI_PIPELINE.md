@@ -37,13 +37,16 @@ checks，要求 PR 基于最新目标分支后重新通过门禁。因此 squash
   普通 PR 的策略裁定。
 - 外部贡献者只修改普通业务或文档文件时可以通过。涉及 CI 控制面时，PR 必须保持
   开放、目标为本仓库 `main`、head 来自本仓库，而且 PR 作者与本次
-  `pull_request_target` 的 sender 在判定当时都必须具有 `write`、`maintain`
-  或 `admin` 权限。fork、机器人、只读作者或只读 sender 均不能自动获得可信状态。
+  `pull_request_target` 的 sender 在判定当时都必须具有 GitHub API 返回的
+  `push`、`write`、`maintain` 或 `admin` 权限。fork、机器人、只读作者或只读
+  sender 均不能自动获得可信状态。
 - 受保护控制面包括 workflows、复合 Actions、Dependabot、CODEOWNERS、分支保护
-  声明、Makefile、Compose、Dockerfile、各生态 package/lock、Playwright/pytest
-  与由 CI 直接执行的脚本。policy 同时检查重命名前后的路径，并要求
-  `changed_files` 为不超过 3000 的完整清单；截断、计数不一致和 API 异常均失败
-  关闭。
+  声明、Makefile 变体、Compose 基础/override/环境文件、Dockerfile/ignore、各生态
+  package/lock、npm 配置、Go workspace/vendor、Playwright/pytest、Vite/ESLint/
+  PostCSS/Ruff 自动加载配置、Gitleaks 配置与由 CI 或测试直接执行的安全脚本。
+  policy 同时检查重命名前后的路径，并要求 `changed_files` 为不超过 3000 的完整
+  清单；截断、计数不一致和 API 异常均失败关闭。Secrets 扫描禁用源码内
+  `gitleaks:allow` 绕过，仅允许受保护的仓库级配置显式治理例外。
 - 每次判定开始时固定 PR head SHA，写 status 前重新读取 PR。SHA 在评估期间发生
   变化时不向旧 SHA 或新 SHA 写入结果，等待 `synchronize` 对新 head 重新判定。
 - 机器人 PR 的创建、重新打开、就绪和 head 更新事件默认写

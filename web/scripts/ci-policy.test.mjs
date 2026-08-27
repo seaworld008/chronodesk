@@ -216,13 +216,36 @@ test('所有声明的 CI 控制面入口都受保护', async (t) => {
     '.github/CODEOWNERS',
     'CODEOWNERS',
     '.github/main-branch-protection.json',
+    '.gitleaks.toml',
+    '.gitleaksignore',
+    '.env',
+    'GNUmakefile',
     'Makefile',
+    'makefile',
+    'go.work',
+    'go.work.sum',
+    'compose.override.yaml',
+    'docker-compose.override.yml',
     'docker-compose.yml',
+    'server/.dockerignore',
     'server/Dockerfile',
+    'server/tests/conftest.py',
+    'server/tests/ruff.toml',
+    'server/tests/utils/safety.py',
+    'server/vendor/modules.txt',
+    'sdk/go/vendor/example/x.go',
+    'sdk/python/.ruff.toml',
     'web/Dockerfile.dev',
+    'web/.env.production',
+    'web/.npmrc',
+    'web/.postcssrc.yaml',
+    'web/e2e/helpers/safety.ts',
+    'web/postcss.config.cjs',
     'web/package.json',
     'web/package-lock.json',
     'web/playwright.config.ts',
+    'web/src/eslint.config.mjs',
+    'web/vite.config.js',
     'server/pytest.ini',
     'server/tests/test_python_toolchain.sh',
     'server/tests/validate_case_evidence_manifest.py',
@@ -243,6 +266,21 @@ test('所有声明的 CI 控制面入口都受保护', async (t) => {
       assertStatus(result, 'failure')
     })
   }
+})
+
+test('名称相似但不会被工具自动加载的普通文档仍可通过', async () => {
+  const pull = createPull({
+    changedFiles: 1,
+    headRepo: 'external-fork/chronodesk',
+  })
+  const result = await runPolicy({
+    files: [{ filename: 'docs/compose-guide.yml' }],
+    pull,
+    pullSnapshots: [pull, pull],
+  })
+
+  assertStatus(result, 'success')
+  assert.deepEqual(result.calls.permissions, [])
 })
 
 test('本仓库 PR 的作者和事件 sender 都有写权限时可修改控制面', async () => {
