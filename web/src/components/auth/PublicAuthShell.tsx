@@ -9,6 +9,7 @@ import { markHumanAuthQueryAuthenticated } from '@/lib/authQueryState'
 import {
     applyRemoteHumanSignOut,
     bootstrapHumanSession,
+    synchronizeHumanSessionAfterRemoteAuthentication,
 } from '@/lib/authProvider'
 import { subscribeHumanSessionMetadata } from '@/lib/humanSessionChannel'
 import { clearHumanAccessToken } from '@/lib/humanSessionRuntime'
@@ -331,7 +332,13 @@ const PublicAuthShell = ({
                 binding.subject === metadata.subject &&
                 binding.session_id === metadata.session_id
             ) {
-                markHumanAuthQueryAuthenticated(queryClient)
+                void synchronizeHumanSessionAfterRemoteAuthentication(
+                    metadata,
+                )
+                    .then(() => {
+                        markHumanAuthQueryAuthenticated(queryClient)
+                    })
+                    .catch(() => undefined)
                 return
             }
             clearHumanAccessToken()

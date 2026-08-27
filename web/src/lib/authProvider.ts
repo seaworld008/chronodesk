@@ -35,6 +35,7 @@ import {
 import {
     bindHumanTabSession,
     readCommittedHumanTabSessionToken,
+    type HumanSessionBinding,
 } from './humanTabSession'
 import {
     clearHumanAccessToken,
@@ -276,9 +277,10 @@ export const parseHumanRefreshSessionResponse = (
     return parseAuthSession(value.data)
 }
 
-const readStoredUser = (): HumanSessionUser | null => {
+const readStoredUserForBinding = (
+    binding: HumanSessionBinding | null,
+): HumanSessionUser | null => {
     const serialized = readHumanSessionMetadata('user')
-    const binding = readHumanSessionBinding()
     if (!serialized || !binding) return null
     try {
         const user = parseStoredHumanSessionUser(JSON.parse(serialized))
@@ -294,6 +296,9 @@ const readStoredUser = (): HumanSessionUser | null => {
         return null
     }
 }
+
+const readStoredUser = (): HumanSessionUser | null =>
+    readStoredUserForBinding(readHumanSessionBinding())
 
 export const clearAuthenticationState = (
     options: {
@@ -345,6 +350,7 @@ export const applyRemoteHumanSignOut = (
 const storeAuthSession = (
     session: AuthSession,
     preserveProjectScope: boolean,
+    publishToPeers = true,
 ): void => {
     remoteSignOutObserved = false
     const binding = readHumanSessionBinding(session.access_token)
@@ -365,11 +371,13 @@ const storeAuthSession = (
     )
     commitHumanAccessToken(session.access_token)
     bindHumanTabSession(session.access_token)
-    publishAuthenticatedHumanSession({
-        subject: binding.subject,
-        session_id: binding.session_id,
-        expires_at: binding.expires_at,
-    })
+    if (publishToPeers) {
+        publishAuthenticatedHumanSession({
+            subject: binding.subject,
+            session_id: binding.session_id,
+            expires_at: binding.expires_at,
+        })
+    }
 }
 
 export type RegistrationSessionOutcome =
@@ -412,16 +420,25 @@ export const consumeRegistrationResult = (
 
 let refreshSessionRequest: Promise<void> | null = null
 
-const performSessionRefresh = (): Promise<void> => {
+type SessionRefreshOptions = {
+    previousBinding?: HumanSessionBinding | null
+    publishToPeers?: boolean
+}
+
+const performSessionRefresh = (
+    options: SessionRefreshOptions = {},
+): Promise<void> => {
     // Capture the tab-local project binding before waiting for the cross-tab
     // lifecycle lock. Auth-gated UI may render while the refresh is queued,
     // but only the validated refresh response may decide whether it is safe
     // to retain this selection.
     const previousProjectBinding =
         captureStoredProjectSelectionBinding()
+    const previousBinding =
+        options.previousBinding === undefined
+            ? readHumanSessionBinding()
+            : options.previousBinding
     return withHumanSessionLifecycleLock(async () => {
-        const previousBinding = readHumanSessionBinding()
-
         const response = await safeFetch(
             buildUrl(humanApiRoutes.refreshHumanSession()),
             {
@@ -470,13 +487,16 @@ const performSessionRefresh = (): Promise<void> => {
                     previousProjectBinding,
                     nextBinding,
                 ),
+            options.publishToPeers !== false,
         )
     })
 }
 
-const refreshStoredSession = async (): Promise<void> => {
+const refreshStoredSession = async (
+    options: SessionRefreshOptions = {},
+): Promise<void> => {
     if (refreshSessionRequest) return refreshSessionRequest
-    const request = performSessionRefresh()
+    const request = performSessionRefresh(options)
     refreshSessionRequest = request
     try {
         await request
@@ -489,6 +509,49 @@ const refreshStoredSession = async (): Promise<void> => {
 
 export const bootstrapHumanSession = async (): Promise<void> => {
     await refreshStoredSession()
+}
+
+export const synchronizeHumanSessionAfterRemoteAuthentication = async (
+    metadata: Extract<HumanSessionMetadata, { type: 'authenticated' }>,
+): Promise<boolean> => {
+    const previousToken = readHumanAccessToken()
+    const previousBinding = readHumanSessionBinding(previousToken)
+    if (
+        previousToken === null ||
+        previousBinding === null ||
+        previousBinding.subject !== metadata.subject ||
+        previousBinding.session_id !== metadata.session_id ||
+        metadata.issued_at <= humanSessionCommittedAt()
+    ) {
+        return false
+    }
+
+    // Retire the old bearer synchronously so any response already in flight
+    // becomes stale before it can trigger a shared-cookie logout. The
+    // synchronization refresh deliberately stays local: rebroadcasting it
+    // would make same-session tabs rotate the shared cookie in a loop.
+    clearHumanAccessToken()
+    bindHumanTabSession(null)
+    try {
+        await refreshStoredSession({
+            previousBinding,
+            publishToPeers: false,
+        })
+        return true
+    } catch (error) {
+        // A transient refresh failure must not destroy an otherwise usable
+        // tab. Recommit the previous bearer with a new generation so already
+        // in-flight responses remain stale. Deterministic refresh failures
+        // clear the stored user and therefore cannot enter this branch.
+        if (
+            readHumanAccessToken() === null &&
+            readStoredUserForBinding(previousBinding) !== null
+        ) {
+            commitHumanAccessToken(previousToken)
+            bindHumanTabSession(previousToken)
+        }
+        throw error
+    }
 }
 
 const userIdentity = (user: HumanSessionUser): UserIdentity => {

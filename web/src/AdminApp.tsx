@@ -41,6 +41,8 @@ import { dataProvider } from './lib/dataProvider'
 import {
     applyRemoteHumanSignOut,
     authProvider,
+    clearAuthenticationState,
+    synchronizeHumanSessionAfterRemoteAuthentication,
 } from './lib/authProvider'
 import { readHumanAccessToken } from './lib/humanSessionRuntime'
 import { subscribeHumanSessionMetadata } from './lib/humanSessionChannel'
@@ -1306,6 +1308,7 @@ const AppRuntimeCoordinator = () => {
     const queryClient = useQueryClient()
     const navigate = useNavigate()
     const handlingSessionInvalidation = React.useRef(false)
+    const synchronizingRemoteSession = React.useRef(false)
 
     React.useEffect(() => {
         const clearRuntimeCaches = () => {
@@ -1335,13 +1338,27 @@ const AppRuntimeCoordinator = () => {
         const handleSessionInvalidated = () => {
             if (handlingSessionInvalidation.current) return
             handlingSessionInvalidation.current = true
+            clearAuthenticationState({ notifyPeers: false })
             clearRuntimeCaches()
-            void Promise.resolve(authProvider.logout({}))
-                .catch(() => undefined)
-                .finally(() => {
+            navigate('/login', { replace: true })
+            handlingSessionInvalidation.current = false
+        }
+        const handleRemoteSessionAuthentication = (
+            metadata: Extract<
+                Parameters<typeof synchronizeHumanSessionAfterRemoteAuthentication>[0],
+                { type: 'authenticated' }
+            >,
+        ) => {
+            if (synchronizingRemoteSession.current) return
+            synchronizingRemoteSession.current = true
+            void synchronizeHumanSessionAfterRemoteAuthentication(metadata)
+                .catch(() => {
+                    if (readHumanAccessToken()) return
                     clearRuntimeCaches()
                     navigate('/login', { replace: true })
-                    handlingSessionInvalidation.current = false
+                })
+                .finally(() => {
+                    synchronizingRemoteSession.current = false
                 })
         }
         const handleSessionReplaced = () => {
@@ -1377,6 +1394,10 @@ const AppRuntimeCoordinator = () => {
                     )
                 ) {
                     signalSessionReplaced()
+                    return
+                }
+                if (binding !== null) {
+                    handleRemoteSessionAuthentication(metadata)
                 }
             })
 

@@ -874,7 +874,7 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
     let logoutRequests = 0
     let profileGetRequests = 0
     let profileUpdateBearer = ''
-    let capturedRequestBearer = ''
+    let staleRequestBearer = ''
     let markRefreshRequestStarted: (() => void) | undefined
     const refreshRequestStarted = new Promise<void>((resolve) => {
         markRefreshRequestStarted = resolve
@@ -882,6 +882,14 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
     let releaseRefreshResponse: (() => void) | undefined
     const refreshResponseReleased = new Promise<void>((resolve) => {
         releaseRefreshResponse = resolve
+    })
+    let markStaleRequestStarted: (() => void) | undefined
+    const staleRequestStarted = new Promise<void>((resolve) => {
+        markStaleRequestStarted = resolve
+    })
+    let releaseStaleResponse: (() => void) | undefined
+    const staleResponseReleased = new Promise<void>((resolve) => {
+        releaseStaleResponse = resolve
     })
 
     await protectedPage.addInitScript(() => {
@@ -931,9 +939,18 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
             await fulfillJSON(route, { code: 0, data: user })
             return
         }
-        if (pathname === '/api/e2e/captured-rotation') {
-            capturedRequestBearer = authorization
-            await fulfillJSON(route, { code: 0, data: [] })
+        if (pathname === '/api/e2e/stale-same-session-401') {
+            staleRequestBearer = authorization
+            markStaleRequestStarted?.()
+            await staleResponseReleased
+            await fulfillJSON(
+                route,
+                {
+                    code: 'unauthorized',
+                    message: '旧标签 bearer 已失效',
+                },
+                401,
+            )
             return
         }
         if (pathname === '/api/auth/me') {
@@ -966,6 +983,23 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
         ),
     ).toBe('1')
 
+    const staleRequest = protectedPage.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        try {
+            await apiModule.apiFetch('/e2e/stale-same-session-401')
+            return null
+        } catch (error) {
+            return error instanceof Error
+                ? error.message
+                : String(error)
+        }
+    }, '/src/lib/apiClient.ts')
+    await staleRequestStarted
+
     const refreshPage = await context.newPage()
     await refreshPage.clock.install({
         time: Date.now() + 3 * 60 * 60 * 1000,
@@ -982,79 +1016,32 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
         '受保护标签未提交表单',
     )
 
-    const capturedRequest = protectedPage.evaluate(
-        async ({ accessToken, requestPath, modulePath }) => {
-            const requestHeaders = new Headers({
-                Authorization: `Bearer ${accessToken}`,
-            })
-            const tracedWindow = window as Window & {
-                __chronodeskCapturedRequestReady?: boolean
-            }
-            tracedWindow.__chronodeskCapturedRequestReady = true
-            await new Promise<void>((resolve) => {
-                window.addEventListener(
-                    'chronodesk-release-captured-request',
-                    () => resolve(),
-                    { once: true },
-                )
-            })
-            const apiClient = await import(
-                /* @vite-ignore */ modulePath
-            ) as {
-                sessionAwareFetch: (
-                    input: RequestInfo | URL,
-                    init?: RequestInit,
-                ) => Promise<Response>
-            }
-            const response = await apiClient.sessionAwareFetch(
-                requestPath,
-                { headers: requestHeaders },
-            )
-            return response.status
-        },
-        {
-            accessToken: oldToken,
-            requestPath: '/api/e2e/captured-rotation',
-            modulePath: '/src/lib/apiClient.ts',
-        },
-    )
-    await expect
-        .poll(() =>
-            protectedPage.evaluate(() => {
-                const tracedWindow = window as Window & {
-                    __chronodeskCapturedRequestReady?: boolean
-                }
-                return tracedWindow.__chronodeskCapturedRequestReady
-            }),
-        )
-        .toBe(true)
-
     releaseRefreshResponse?.()
     await refreshNavigation
-    await protectedPage.evaluate(async (modulePath) => {
-        const authModule = await import(
-            /* @vite-ignore */ modulePath
-        ) as {
-            bootstrapHumanSession: () => Promise<void>
-        }
-        await authModule.bootstrapHumanSession()
-    }, '/src/lib/authProvider.ts')
+    await expect
+        .poll(() =>
+            protectedPage.evaluate(async (modulePath) => {
+                const runtime = await import(
+                    /* @vite-ignore */ modulePath
+                ) as {
+                    readHumanAccessToken: () => string | null
+                }
+                return runtime.readHumanAccessToken()
+            }, '/src/lib/humanSessionRuntime.ts'),
+        )
+        .toBe(rotatedToken)
     await expect
         .poll(() =>
             protectedPage.evaluate(() => localStorage.getItem('token')),
         )
         .toBeNull()
-    await protectedPage.waitForTimeout(100)
-    await protectedPage.evaluate(() => {
-        window.dispatchEvent(
-            new Event('chronodesk-release-captured-request'),
-        )
-    })
-    expect(await capturedRequest).toBe(200)
+    releaseStaleResponse?.()
+    expect(await staleRequest).toContain('登录状态已失效')
+    await protectedPage.waitForTimeout(250)
 
-    expect(refreshRequests).toBeGreaterThanOrEqual(2)
+    expect(refreshRequests).toBe(2)
     expect(logoutRequests).toBe(0)
-    expect(capturedRequestBearer).toBe(`Bearer ${rotatedToken}`)
+    expect(staleRequestBearer).toBe(`Bearer ${oldToken}`)
     expect(profileGetRequests).toBe(profileGetRequestsBeforeRotation)
     await expect(protectedPage).toHaveURL(/\/#\/account\/profile$/u)
     await expect(protectedPage.getByLabel('名字')).toHaveValue(
@@ -1083,6 +1070,188 @@ test('同一 Human session 跨标签刷新不泄漏 bearer且本标签轮换后�
             ),
         ),
     ).toBe('1')
+})
+
+test('当前 bearer 401 只清本标签且不撤销共享 refresh 会话', async ({
+    page,
+}) => {
+    const identity = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-local-only-passive-401',
+        email: 'local-only-passive-401@example.test',
+    }
+    const access = authorizedProjectAccess(projectA, 'requester')
+    await installMockSession(page, identity, projectA)
+    let logoutRequests = 0
+
+    await page.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        if (pathname === '/api/e2e/current-session-401') {
+            await fulfillJSON(
+                route,
+                {
+                    code: 'unauthorized',
+                    message: '当前 bearer 已失效',
+                },
+                401,
+            )
+            return
+        }
+        if (
+            pathname === '/api/auth/logout' &&
+            request.method() === 'POST'
+        ) {
+            logoutRequests += 1
+            await fulfillJSON(route, {
+                success: true,
+                message: '已退出当前会话',
+            })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (pathname === `/api/projects/${projectA.key}/context`) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    await page.goto('/#/')
+    await expect(page.getByTestId('account-menu')).toBeVisible()
+    const errorMessage = await page.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        try {
+            await apiModule.apiFetch('/e2e/current-session-401')
+            return null
+        } catch (error) {
+            return error instanceof Error
+                ? error.message
+                : String(error)
+        }
+    }, '/src/lib/apiClient.ts')
+
+    expect(errorMessage).toContain('登录状态已失效')
+    await expect(page).toHaveURL(/\/#\/login$/u)
+    expect(logoutRequests).toBe(0)
+    await expect
+        .poll(() =>
+            page.evaluate(() => ({
+                user: sessionStorage.getItem('user'),
+                expiresAt: sessionStorage.getItem('tokenExpiresAt'),
+                project: sessionStorage.getItem(
+                    'chronodesk.activeProject',
+                ),
+            })),
+        )
+        .toEqual({
+            user: null,
+            expiresAt: null,
+            project: null,
+        })
+})
+
+test('同会话远端同步瞬态失败恢复原标签 bearer', async ({ page }) => {
+    const identity = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-remote-sync-transient-failure',
+        email: 'remote-sync-transient@example.test',
+    }
+    const access = authorizedProjectAccess(projectA, 'requester')
+    const token = await installMockSession(page, identity, projectA)
+    let refreshRequests = 0
+    let probeAuthorization = ''
+
+    await page.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        if (
+            pathname === '/api/auth/refresh' &&
+            request.method() === 'POST'
+        ) {
+            refreshRequests += 1
+            await fulfillJSON(
+                route,
+                {
+                    code: 'temporarily_unavailable',
+                    message: '刷新服务暂时不可用',
+                },
+                503,
+            )
+            return
+        }
+        if (pathname === '/api/e2e/remote-sync-probe') {
+            probeAuthorization =
+                request.headers().authorization ?? ''
+            await fulfillJSON(route, { code: 0, data: [] })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (pathname === `/api/projects/${projectA.key}/context`) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    await page.goto('/#/')
+    const synchronizationError = await page.evaluate(
+        async ({ modulePath, metadata }) => {
+            const authModule = await import(
+                /* @vite-ignore */ modulePath
+            ) as {
+                synchronizeHumanSessionAfterRemoteAuthentication: (
+                    value: typeof metadata,
+                ) => Promise<boolean>
+            }
+            try {
+                await authModule
+                    .synchronizeHumanSessionAfterRemoteAuthentication(
+                        metadata,
+                    )
+                return null
+            } catch (error) {
+                return error instanceof Error
+                    ? error.message
+                    : String(error)
+            }
+        },
+        {
+            modulePath: '/src/lib/authProvider.ts',
+            metadata: {
+                type: 'authenticated' as const,
+                subject: String(identity.id),
+                session_id: identity.sessionID,
+                expires_at: Date.now() + 3600_000,
+                issued_at: Date.now() + 1000,
+            },
+        },
+    )
+    expect(synchronizationError).toContain('刷新服务暂时不可用')
+
+    await page.evaluate(async (modulePath) => {
+        const apiModule = await import(
+            /* @vite-ignore */ modulePath
+        ) as {
+            apiFetch: (path: string) => Promise<unknown>
+        }
+        await apiModule.apiFetch('/e2e/remote-sync-probe')
+    }, '/src/lib/apiClient.ts')
+
+    expect(refreshRequests).toBe(1)
+    expect(probeAuthorization).toBe(`Bearer ${token}`)
+    await expect(page.getByTestId('account-menu')).toBeVisible()
+    await expect(page).toHaveURL(/\/#\/$/u)
 })
 
 const reloadProjectSelectionScenarios = [
