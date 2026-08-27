@@ -30,6 +30,7 @@ func TestSecurityWorkflowPreservesIndependentGoReleaseGates(t *testing.T) {
 	workflow := string(raw)
 
 	requiredFragments := []string{
+		"--ignore-gitleaks-allow",
 		"  go-unit:\n",
 		"run: go test ./... -count=1",
 		"  go-sdk:\n",
